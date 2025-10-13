@@ -48,13 +48,10 @@ async def lifespan(app: FastAPI):
         config.save(config_path)
         print(f"✓ Created default config at {config_path}")
     
-    # Check for pending deep analysis on startup
-    await check_pending_deep_analysis()
-    
-    # Start background fetcher
+    # Start background fetcher (pending analysis handled there)
     global background_task
     background_task = asyncio.create_task(background_fetcher())
-    print("🚀 Background fetcher started")
+    print("🚀 Server ready - background tasks started")
     
     yield
     
@@ -445,9 +442,13 @@ async def analyze_papers_task(papers: List[Paper], config: Config):
 
 async def background_fetcher():
     """
-    Background task: fetch + analyze loop.
-    Fetch and analyze run concurrently (non-blocking).
+    Background task: check pending analysis first, then fetch + analyze loop.
+    Everything runs asynchronously (non-blocking).
     """
+    # First run: check for pending deep analysis (non-blocking)
+    asyncio.create_task(check_pending_deep_analysis())
+    
+    # Main fetch loop
     while True:
         try:
             config = Config.load(config_path)

@@ -26,6 +26,6 @@ DEFAULT_CONFIG = {
     "model": "deepseek-chat",
     "temperature": 0.3,
     "max_tokens": 2000,
-    "concurrent_papers": 5,
+    "concurrent_papers": 10,
     "min_relevance_score_for_stage2": 6  # Minimum score to proceed to Stage 2 deep analysis
 }
