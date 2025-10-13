@@ -131,9 +131,17 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
     # Filter out hidden papers
     papers = [p for p in papers if not p.is_hidden]
     
-    # Sort
+    # Sort with priority: Starred > Has deep analysis > Relevance score
     if sort_by == "relevance":
-        papers.sort(key=lambda p: (p.relevance_score, p.is_starred), reverse=True)
+        # Multi-level sorting: 
+        # 1. Starred first (True > False)
+        # 2. Has deep analysis (True > False) 
+        # 3. Relevance score (high > low)
+        papers.sort(key=lambda p: (
+            p.is_starred,
+            bool(p.detailed_summary and p.detailed_summary.strip()),  # Has deep analysis
+            p.relevance_score
+        ), reverse=True)
     elif sort_by == "latest":
         papers.sort(key=lambda p: p.published_date or p.created_at, reverse=True)
     elif sort_by == "starred":
@@ -159,6 +167,7 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
             "is_hidden": p.is_hidden,
             "created_at": p.created_at,
             "has_qa": len(p.qa_pairs) > 0,
+            "detailed_summary": p.detailed_summary,  # For Stage 2 status detection
         }
         for p in papers
     ]
@@ -261,6 +270,7 @@ async def search_papers(q: str, limit: int = 50):
                 "is_hidden": paper.is_hidden,
                 "created_at": paper.created_at,
                 "has_qa": len(paper.qa_pairs) > 0,
+                "detailed_summary": paper.detailed_summary,  # For Stage 2 status detection
                 "search_score": searchable.count(q_lower),  # Simple scoring
             })
     

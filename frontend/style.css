@@ -688,6 +688,12 @@ body {
         font-size: 18px;
     }
     
+    /* Hide badges on mobile */
+    .paper-badges .relevance-badge-wrapper,
+    .paper-badges .paper-status {
+        display: none !important;
+    }
+    
     .paper-actions {
         flex-wrap: wrap;
     }

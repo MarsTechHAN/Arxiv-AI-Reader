@@ -124,7 +124,7 @@ function setupEventListeners() {
     
     // Fullscreen toggle for paper modal
     const fullscreenBtn = document.getElementById('fullscreenBtn');
-    if (fullscreenBtn) {
+    if (fullscreenBtn && paperModal) {
         fullscreenBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             paperModal.classList.toggle('fullscreen');
@@ -257,16 +257,19 @@ function createPaperCard(paper) {
         scoreBadge = `<span class="relevance-badge ${scoreClass}">${paper.relevance_score}/10</span>`;
     }
     
-    const statusClass = paper.is_relevant === null ? 'status-pending' : 
-                       paper.is_relevant ? 'status-relevant' : 'status-not-relevant';
-    const statusText = paper.is_relevant === null ? '⏳ 待分析' : 
-                      paper.is_relevant ? '✓ 相关' : '✗ 不相关';
+    // Only show status for non-relevant or pending papers
+    let statusBadge = '';
+    if (paper.is_relevant === null) {
+        statusBadge = '<span class="paper-status status-pending">⏳ 待分析</span>';
+    } else if (paper.is_relevant === false) {
+        statusBadge = '<span class="paper-status status-not-relevant">✗ 不相关</span>';
+    }
+    // Don't show "✓ 相关" for relevant papers
     
-    // Stage 2 status (deep analysis completion)
+    // Stage 2 status (only show "pending" for incomplete analysis)
     const hasDeepAnalysis = paper.detailed_summary && paper.detailed_summary.trim() !== '';
-    const stage2Badge = paper.is_relevant ? 
-        (hasDeepAnalysis ? '<span class="stage-badge stage-complete">📝 已深度分析</span>' : 
-                          '<span class="stage-badge stage-pending">⏳ 待深度分析</span>') : '';
+    const stage2Badge = (paper.is_relevant && !hasDeepAnalysis) ? 
+        '<span class="stage-badge stage-pending">⏳ 待深度分析</span>' : '';
     
     // Safe authors handling
     const authors = paper.authors || [];
@@ -281,9 +284,9 @@ function createPaperCard(paper) {
                 <h3 class="paper-title" onclick="openPaperModal('${paper.id}')" style="cursor: pointer;">${escapeHtml(paper.title || '无标题')}</h3>
                 <p class="paper-authors">${authorsText}</p>
             </div>
-            <div style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
-                ${scoreBadge}
-                <span class="paper-status ${statusClass}">${statusText}</span>
+            <div class="paper-badges" style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
+                <span class="relevance-badge-wrapper">${scoreBadge}</span>
+                ${statusBadge}
                 ${stage2Badge}
             </div>
         </div>
