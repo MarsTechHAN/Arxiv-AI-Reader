@@ -257,9 +257,9 @@ function createPaperCard(paper) {
         
         <div class="paper-actions" onclick="event.stopPropagation();">
             <button onclick="toggleStar('${paper.id}')" class="${paper.is_starred ? 'starred' : ''}">
-                ${paper.is_starred ? '★' : '☆'} ${paper.is_starred ? '已收藏' : '收藏'}
+                ${paper.is_starred ? '★' : '☆'} ${paper.is_starred ? 'Stared' : 'Star'}
             </button>
-            <button onclick="hidePaper('${paper.id}')">🚫 隐藏</button>
+            <button onclick="hidePaper('${paper.id}')">🚫 Hide</button>
         </div>
     `;
     
