@@ -40,25 +40,21 @@ class ArxivFetcher:
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         }
-        
-        # Track offset for each category to fetch different papers each time
-        self.category_offsets = {cat: 0 for cat in self.categories}
     
-    async def fetch_latest(self, max_papers: int = 50) -> List[Paper]:
+    async def fetch_latest(self, max_papers_per_category: int = 100) -> List[Paper]:
         """
-        Fetch papers from arXiv, cycling through different papers each time.
-        Uses offset to fetch different papers on each run.
+        Fetch latest papers from arXiv.
+        Always checks the most recent N papers (index 0 onwards) in each category.
+        Skips papers that already exist locally.
         Returns list of Paper objects.
         """
         papers = []
-        papers_per_category = max_papers // len(self.categories)
         
         async with httpx.AsyncClient(headers=self.headers, timeout=30.0, follow_redirects=True) as client:
             for category in self.categories:
                 # IMPORTANT: Use HTTPS, not HTTP (http returns 301 redirect with empty body)
                 rss_url = f"https://export.arxiv.org/rss/{category}"
-                offset = self.category_offsets[category]
-                print(f"  📂 Fetching category: {category} (offset: {offset})")
+                print(f"  📂 Fetching category: {category}")
                 
                 try:
                     response = await client.get(rss_url)
@@ -75,22 +71,11 @@ class ArxivFetcher:
                         print(f"  ⚠️  No entries found in {category}")
                         continue
                     
-                    # Calculate range for this fetch
-                    start_idx = offset
-                    end_idx = min(offset + papers_per_category, total_entries)
-                    
-                    # If we've exhausted this category, reset offset and start from beginning
-                    if start_idx >= total_entries:
-                        print(f"     Resetting offset for {category} (reached end)")
-                        self.category_offsets[category] = 0
-                        start_idx = 0
-                        end_idx = min(papers_per_category, total_entries)
-                    
+                    # Always check from index 0 (latest papers)
+                    check_count = min(max_papers_per_category, total_entries)
                     fetched_count = 0
-                    for idx in range(start_idx, end_idx):
-                        if idx >= total_entries:
-                            break
-                        
+                    
+                    for idx in range(check_count):
                         entry = feed.entries[idx]
                         
                         # Extract arXiv ID
@@ -136,9 +121,7 @@ class ArxivFetcher:
                         
                         print(f"     ✓ {arxiv_id} - {paper.title[:60]}...")
                     
-                    # Update offset for next fetch
-                    self.category_offsets[category] = end_idx
-                    print(f"     Fetched {fetched_count} papers, next offset: {self.category_offsets[category]}")
+                    print(f"     Fetched {fetched_count} new papers (checked latest {check_count})")
                 
                 except Exception as e:
                     print(f"  ✗ Error fetching {category}: {e}")
