@@ -7,6 +7,8 @@ let currentPaperId = null;
 let searchTimeout = null;
 let currentSortBy = 'relevance';
 let currentKeyword = null;
+let hasMorePapers = true;
+let isLoadingMore = false;
 
 // DOM Elements
 const timeline = document.getElementById('timeline');
@@ -140,8 +142,6 @@ function setupEventListeners() {
 
 // Infinite scroll
 function setupInfiniteScroll() {
-    let isLoadingMore = false;
-    
     window.addEventListener('scroll', async () => {
         // Check if near bottom
         const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
@@ -152,7 +152,8 @@ function setupInfiniteScroll() {
         const threshold = 200;
         const distanceFromBottom = documentHeight - (scrollTop + windowHeight);
         
-        if (distanceFromBottom < threshold && !isLoadingMore && !loading.style.display) {
+        // Only load if: not already loading, has more papers, and near bottom
+        if (distanceFromBottom < threshold && !isLoadingMore && hasMorePapers) {
             isLoadingMore = true;
             currentPage++;
             
@@ -166,7 +167,7 @@ function setupInfiniteScroll() {
 }
 
 // Load Papers
-async function loadPapers(page = 0) {
+async function loadPapers(page = 0, shouldScroll = true) {
     showLoading(true);
     
     try {
@@ -180,20 +181,38 @@ async function loadPapers(page = 0) {
         
         if (page === 0) {
             timeline.innerHTML = '';
-            window.scrollTo(0, 0);  // Scroll to top when refreshing
+            hasMorePapers = true;  // Reset state
+            hideEndMarker();
+            if (shouldScroll) {
+                window.scrollTo(0, 0);  // Only scroll when explicitly requested
+            }
         }
         
-        if (papers.length === 0 && page > 0) {
-            // No more papers
+        // Check if we've reached the end
+        if (papers.length === 0) {
+            hasMorePapers = false;
+            if (page > 0) {
+                return; // No more papers to add
+            }
+            // Page 0 with no papers - show empty state
+            timeline.innerHTML = '<p style="text-align: center; color: var(--text-muted); padding: 40px;">暂无论文</p>';
             return;
+        }
+        
+        if (papers.length < 20) {
+            // Last page
+            hasMorePapers = false;
         }
         
         papers.forEach(paper => {
             timeline.appendChild(createPaperCard(paper));
         });
         
-        // Hide "Load More" button when using infinite scroll
-        // loadMoreBtn.style.display = papers.length === 20 ? 'block' : 'none';
+        // Show end marker if no more papers
+        if (!hasMorePapers && page > 0) {
+            showEndMarker();
+        }
+        
         loadMoreBtn.style.display = 'none';
     } catch (error) {
         console.error('Error loading papers:', error);
@@ -207,6 +226,8 @@ async function loadPapers(page = 0) {
 async function searchPapers(query) {
     showLoading(true);
     currentPage = 0;  // Reset page
+    hasMorePapers = false;  // Disable infinite scroll for search results
+    hideEndMarker();
     
     try {
         const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50`);
@@ -221,6 +242,8 @@ async function searchPapers(query) {
             results.forEach(paper => {
                 timeline.appendChild(createPaperCard(paper));
             });
+            // Show end marker for search results
+            showEndMarker();
         }
         
         loadMoreBtn.style.display = 'none';
@@ -548,39 +571,38 @@ function filterByKeyword(keyword) {
 // Toggle star
 async function toggleStar(paperId) {
     try {
-        const response = await fetch(`${API_BASE}/papers/${paperId}/star`, {
+        await fetch(`${API_BASE}/papers/${paperId}/star`, {
             method: 'POST'
         });
-        const result = await response.json();
         
-        // Reload papers to show updated state
+        // Reload papers to show updated state (without scrolling)
         currentPage = 0;
-        loadPapers();
-        
-        showSuccess(result.message);
+        loadPapers(0, false);  // false = don't scroll
     } catch (error) {
         console.error('Error toggling star:', error);
-        showError('Failed to star/unstar paper');
     }
 }
 
 // Hide paper
 async function hidePaper(paperId) {
-    if (!confirm('确定要隐藏这篇论文吗？')) return;
-    
     try {
         await fetch(`${API_BASE}/papers/${paperId}/hide`, {
             method: 'POST'
         });
         
-        // Remove from timeline immediately
-        const card = document.querySelector(`[data-paper-id="${paperId}"]`);
-        if (card) card.remove();
-        
-        showSuccess('论文已隐藏');
+        // Remove from timeline with smooth fade out
+        const cards = timeline.querySelectorAll('.paper-card');
+        for (const card of cards) {
+            const titleEl = card.querySelector('.paper-title');
+            if (titleEl && titleEl.getAttribute('onclick')?.includes(paperId)) {
+                card.style.transition = 'opacity 0.3s ease-out';
+                card.style.opacity = '0';
+                setTimeout(() => card.remove(), 300);
+                break;
+            }
+        }
     } catch (error) {
         console.error('Error hiding paper:', error);
-        showError('Failed to hide paper');
     }
 }
 
@@ -588,5 +610,28 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// End marker functions
+function showEndMarker() {
+    // Remove existing marker if any
+    hideEndMarker();
+    
+    const marker = document.createElement('div');
+    marker.id = 'endMarker';
+    marker.className = 'end-marker';
+    marker.innerHTML = `
+        <div class="end-marker-line"></div>
+        <div class="end-marker-text">🎉 已加载全部论文</div>
+        <div class="end-marker-line"></div>
+    `;
+    timeline.appendChild(marker);
+}
+
+function hideEndMarker() {
+    const existing = document.getElementById('endMarker');
+    if (existing) {
+        existing.remove();
+    }
 }
 

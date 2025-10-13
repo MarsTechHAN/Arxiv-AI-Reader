@@ -627,6 +627,29 @@ body {
     padding: 40px 20px;
 }
 
+/* End Marker */
+.end-marker {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 60px 20px;
+    margin: 40px 0;
+}
+
+.end-marker-line {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--border), transparent);
+}
+
+.end-marker-text {
+    color: var(--text-muted);
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
 /* Paper Details */
 .detail-section {
     margin-bottom: 24px;
