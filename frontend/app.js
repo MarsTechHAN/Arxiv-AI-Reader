@@ -69,11 +69,17 @@ function setupEventListeners() {
     fetchBtn.addEventListener('click', () => triggerFetch());
     
     // Config modal
-    configModal.querySelector('.close').addEventListener('click', () => closeModal(configModal));
+    configModal.querySelector('.close').addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeModal(configModal);
+    });
     document.getElementById('saveConfig').addEventListener('click', () => saveConfig());
     
-    // Paper modal
-    paperModal.querySelector('.close').addEventListener('click', () => closeModal(paperModal));
+    // Paper modal - Enhanced close button handling
+    paperModal.querySelector('.close').addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeModal(paperModal);
+    });
     
     // Ask question
     document.getElementById('askInput').addEventListener('keypress', (e) => {
@@ -82,7 +88,7 @@ function setupEventListeners() {
         }
     });
     
-    // Close modals on outside click
+    // Close modals on outside click or ESC key
     [configModal, paperModal].forEach(modal => {
         modal.addEventListener('click', (e) => {
             if (e.target === modal) {
@@ -90,6 +96,26 @@ function setupEventListeners() {
             }
         });
     });
+    
+    // ESC key to close modals
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            if (paperModal.classList.contains('active')) {
+                closeModal(paperModal);
+            } else if (configModal.classList.contains('active')) {
+                closeModal(configModal);
+            }
+        }
+    });
+    
+    // Fullscreen toggle for paper modal
+    const fullscreenBtn = document.getElementById('fullscreenBtn');
+    if (fullscreenBtn) {
+        fullscreenBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            paperModal.classList.toggle('fullscreen');
+        });
+    }
     
     // Load more
     loadMoreBtn.addEventListener('click', () => {
