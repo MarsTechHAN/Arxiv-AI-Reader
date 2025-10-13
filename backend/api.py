@@ -48,6 +48,9 @@ async def lifespan(app: FastAPI):
         config.save(config_path)
         print(f"✓ Created default config at {config_path}")
     
+    # Check for pending deep analysis on startup
+    await check_pending_deep_analysis()
+    
     # Start background fetcher
     global background_task
     background_task = asyncio.create_task(background_fetcher())
@@ -389,6 +392,42 @@ async def get_stats():
 
 
 # ============ Background Tasks ============
+
+async def check_pending_deep_analysis():
+    """
+    Check for papers marked as relevant but lacking deep analysis (Stage 2).
+    Only process papers with score >= min_relevance_score_for_stage2.
+    Process these papers with priority on startup.
+    """
+    try:
+        config = Config.load(config_path)
+        all_papers = fetcher.list_papers(limit=10000)
+        
+        min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+        
+        # Find papers: is_relevant=True, score >= min_score, but detailed_summary is empty
+        pending_papers = [
+            p for p in all_papers 
+            if p.is_relevant is True 
+            and p.relevance_score >= min_score
+            and (not p.detailed_summary or p.detailed_summary.strip() == '')
+        ]
+        
+        if pending_papers:
+            print(f"\n🔍 Found {len(pending_papers)} papers pending deep analysis (score >= {min_score})")
+            print(f"📚 Prioritizing deep analysis for these papers...")
+            
+            # Process with skip_stage1=True since they're already marked as relevant
+            await analyzer.process_papers(pending_papers, config, skip_stage1=True)
+            print(f"✓ Completed pending deep analysis for {len(pending_papers)} papers")
+        else:
+            print(f"✓ No pending deep analysis required (min score: {min_score})")
+            
+    except Exception as e:
+        print(f"✗ Error checking pending deep analysis: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 async def analyze_papers_task(papers: List[Paper], config: Config):
     """

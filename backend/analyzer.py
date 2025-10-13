@@ -219,25 +219,44 @@ Paper Content:
     async def process_papers(
         self,
         papers: List[Paper],
-        config: Config
+        config: Config,
+        skip_stage1: bool = False
     ) -> List[Paper]:
         """
         Process multiple papers concurrently.
         
         Stage 1: Filter all papers (fast, all concurrent)
         Stage 2: Deep analysis only for relevant papers (batched by config.concurrent_papers)
+        
+        Args:
+            papers: List of papers to process
+            config: Configuration
+            skip_stage1: If True, skip Stage 1 and go directly to Stage 2 for all papers
         """
         if not papers:
             return papers
-            
-        # Stage 1: Filter all papers concurrently
-        print(f"\n🔍 Stage 1: Filtering {len(papers)} papers...")
-        stage1_tasks = [self.stage1_filter(paper, config) for paper in papers]
-        papers = await asyncio.gather(*stage1_tasks)
         
-        # Find relevant papers
-        relevant_papers = [p for p in papers if p.is_relevant]
-        print(f"✓ Found {len(relevant_papers)} relevant papers")
+        # Stage 1: Filter papers (unless skipped)
+        if not skip_stage1:
+            print(f"\n🔍 Stage 1: Filtering {len(papers)} papers...")
+            stage1_tasks = [self.stage1_filter(paper, config) for paper in papers]
+            papers = await asyncio.gather(*stage1_tasks)
+            
+            # Find relevant papers with score >= min_relevance_score_for_stage2
+            min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+            relevant_papers = [
+                p for p in papers 
+                if p.is_relevant and p.relevance_score >= min_score
+            ]
+            
+            low_score_count = len([p for p in papers if p.is_relevant and p.relevance_score < min_score])
+            print(f"✓ Found {len(relevant_papers)} papers with score >= {min_score} for deep analysis")
+            if low_score_count > 0:
+                print(f"  Skipped {low_score_count} relevant papers with score < {min_score}")
+        else:
+            # Skip Stage 1, treat all papers as relevant for Stage 2
+            print(f"\n🔍 Skipping Stage 1, directly processing {len(papers)} papers for Stage 2...")
+            relevant_papers = papers
         
         # Stage 2: Deep analysis for relevant papers
         if relevant_papers:

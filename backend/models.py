@@ -87,6 +87,7 @@ class Config:
     temperature: float = 0.3
     max_tokens: int = 2000
     concurrent_papers: int = 3  # Number of papers to analyze concurrently
+    min_relevance_score_for_stage2: float = 6.0  # Minimum relevance score for Stage 2 deep analysis
     
     def to_dict(self) -> dict:
         return asdict(self)
