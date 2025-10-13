@@ -162,22 +162,95 @@ Paper Content:
     ) -> str:
         """
         Ask a custom question about a paper.
-        Reuses KV cache from stage 2.
+        Supports cross-paper comparison by detecting arXiv IDs in question (e.g., [2510.09212]).
+        Referenced papers will be fetched and included in context.
         """
-        cache_prefix = f"""Paper Title: {paper.title}
+        import re
+        
+        # Extract arXiv IDs from question (format: [2510.09212] or [2510.09212v1])
+        arxiv_id_pattern = r'\[(\d{4}\.\d{4,5}(?:v\d+)?)\]'
+        referenced_ids = re.findall(arxiv_id_pattern, question)
+        
+        # If references found, fetch and analyze them
+        referenced_papers = []
+        id_to_title = {}  # Map ID to short title for replacement
+        
+        if referenced_ids:
+            print(f"🔗 Detected {len(referenced_ids)} referenced papers: {referenced_ids}")
+            
+            from fetcher import ArxivFetcher
+            fetcher = ArxivFetcher()
+            
+            for ref_id in referenced_ids:
+                try:
+                    # Fetch paper (or load if exists)
+                    ref_paper = await fetcher.fetch_single_paper(ref_id)
+                    
+                    # Ensure it's analyzed (Stage 1 + 2)
+                    if ref_paper.is_relevant is None:
+                        print(f"   📊 Analyzing {ref_id}...")
+                        await self.stage1_filter(ref_paper, config)
+                    
+                    if ref_paper.is_relevant and not ref_paper.detailed_summary:
+                        print(f"   📚 Deep analysis for {ref_id}...")
+                        await self.stage2_qa(ref_paper, config)
+                    
+                    referenced_papers.append(ref_paper)
+                    
+                    # Create short title (first 60 chars)
+                    short_title = ref_paper.title[:60] + "..." if len(ref_paper.title) > 60 else ref_paper.title
+                    id_to_title[ref_id] = short_title
+                    print(f"   ✓ {ref_id}: {short_title}")
+                
+                except Exception as e:
+                    print(f"   ✗ Failed to load {ref_id}: {e}")
+                    # Continue with available papers
+        
+        # Build enhanced context
+        if referenced_papers:
+            # Replace IDs with titles in question
+            enhanced_question = question
+            for ref_id, title in id_to_title.items():
+                enhanced_question = enhanced_question.replace(f"[{ref_id}]", f'"{title}"')
+            
+            # Build context: current paper + referenced papers
+            context_parts = [
+                "=== CURRENT PAPER ===",
+                f"Title: {paper.title}",
+                f"Content:\n{paper.html_content or paper.abstract}",
+                ""
+            ]
+            
+            for idx, ref_paper in enumerate(referenced_papers, 1):
+                context_parts.extend([
+                    f"=== REFERENCE PAPER {idx} ===",
+                    f"Title: {ref_paper.title}",
+                    f"Content:\n{ref_paper.html_content or ref_paper.abstract}",
+                    ""
+                ])
+            
+            cache_prefix = "\n".join(context_parts)
+            final_question = enhanced_question
+            # Use combined ID for cache (disable cache for multi-paper queries to avoid confusion)
+            cache_id = f"{paper.id}_with_refs"
+        else:
+            # Standard single-paper question
+            cache_prefix = f"""Paper Title: {paper.title}
 
 Paper Content:
 {paper.html_content or paper.abstract}
 """
+            final_question = question
+            cache_id = paper.id
         
         answer = await self._ask_question(
             cache_prefix=cache_prefix,
-            question=question,
+            question=final_question,
             config=config,
-            cache_id=paper.id
+            cache_id=cache_id
         )
         
-        # Save to paper
+        # Save to paper (save original question)
         paper.qa_pairs.append(QAPair(
             question=question,
             answer=answer
