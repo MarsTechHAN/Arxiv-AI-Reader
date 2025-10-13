@@ -188,10 +188,18 @@ body {
 }
 
 .paper-summary {
-    font-size: 16px;
+    font-size: 15px;
     color: var(--text);
     margin-bottom: 12px;
-    font-weight: 500;
+    line-height: 1.7;
+}
+
+.paper-summary.markdown-content p {
+    margin-bottom: 8px;
+}
+
+.paper-summary.markdown-content p:last-child {
+    margin-bottom: 0;
 }
 
 .paper-abstract {
@@ -281,6 +289,26 @@ body {
     font-size: 13px;
     color: var(--text-muted);
     margin-bottom: 4px;
+}
+
+/* Stage 2 analysis badge */
+.stage-badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.stage-complete {
+    background: rgba(59, 130, 246, 0.2);
+    color: var(--primary);
+}
+
+.stage-pending {
+    background: rgba(251, 191, 36, 0.2);
+    color: #fbbf24;
 }
 
 /* Buttons */

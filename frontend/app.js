@@ -62,24 +62,38 @@ function setupEventListeners() {
         loadPapers();
     });
     
-    // Config button
-    configBtn.addEventListener('click', () => openConfigModal());
+    // Config button (if exists)
+    if (configBtn) {
+        configBtn.addEventListener('click', () => openConfigModal());
+    }
     
-    // Fetch button
-    fetchBtn.addEventListener('click', () => triggerFetch());
+    // Fetch button (if exists)
+    if (fetchBtn) {
+        fetchBtn.addEventListener('click', () => triggerFetch());
+    }
     
-    // Config modal
-    configModal.querySelector('.close').addEventListener('click', (e) => {
-        e.stopPropagation();
-        closeModal(configModal);
-    });
-    document.getElementById('saveConfig').addEventListener('click', () => saveConfig());
+    // Config modal (if exists)
+    const configModalClose = configModal?.querySelector('.close');
+    if (configModalClose) {
+        configModalClose.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closeModal(configModal);
+        });
+    }
+    
+    const saveConfigBtn = document.getElementById('saveConfig');
+    if (saveConfigBtn) {
+        saveConfigBtn.addEventListener('click', () => saveConfig());
+    }
     
     // Paper modal - Enhanced close button handling
-    paperModal.querySelector('.close').addEventListener('click', (e) => {
-        e.stopPropagation();
-        closeModal(paperModal);
-    });
+    const paperModalClose = paperModal?.querySelector('.close');
+    if (paperModalClose) {
+        paperModalClose.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closeModal(paperModal);
+        });
+    }
     
     // Ask question
     document.getElementById('askInput').addEventListener('keypress', (e) => {
@@ -89,7 +103,7 @@ function setupEventListeners() {
     });
     
     // Close modals on outside click or ESC key
-    [configModal, paperModal].forEach(modal => {
+    [configModal, paperModal].filter(Boolean).forEach(modal => {
         modal.addEventListener('click', (e) => {
             if (e.target === modal) {
                 closeModal(modal);
@@ -100,9 +114,9 @@ function setupEventListeners() {
     // ESC key to close modals
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
-            if (paperModal.classList.contains('active')) {
+            if (paperModal?.classList.contains('active')) {
                 closeModal(paperModal);
-            } else if (configModal.classList.contains('active')) {
+            } else if (configModal?.classList.contains('active')) {
                 closeModal(configModal);
             }
         }
@@ -248,6 +262,12 @@ function createPaperCard(paper) {
     const statusText = paper.is_relevant === null ? '⏳ 待分析' : 
                       paper.is_relevant ? '✓ 相关' : '✗ 不相关';
     
+    // Stage 2 status (deep analysis completion)
+    const hasDeepAnalysis = paper.detailed_summary && paper.detailed_summary.trim() !== '';
+    const stage2Badge = paper.is_relevant ? 
+        (hasDeepAnalysis ? '<span class="stage-badge stage-complete">📝 已深度分析</span>' : 
+                          '<span class="stage-badge stage-pending">⏳ 待深度分析</span>') : '';
+    
     // Safe authors handling
     const authors = paper.authors || [];
     const authorsText = authors.length > 0 
@@ -264,11 +284,12 @@ function createPaperCard(paper) {
             <div style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
                 ${scoreBadge}
                 <span class="paper-status ${statusClass}">${statusText}</span>
+                ${stage2Badge}
             </div>
         </div>
         
         ${paper.one_line_summary ? `
-            <p class="paper-summary">${escapeHtml(paper.one_line_summary)}</p>
+            <div class="paper-summary markdown-content">${marked.parse(paper.one_line_summary)}</div>
         ` : `
             <p class="paper-abstract">${escapeHtml(paper.abstract || '摘要缺失')}</p>
         `}
@@ -316,7 +337,7 @@ async function openPaperModal(paperId) {
             ` : paper.one_line_summary ? `
                 <div class="detail-section">
                     <h3>AI 总结</h3>
-                    <p style="font-size: 16px; line-height: 1.8;">${escapeHtml(paper.one_line_summary)}</p>
+                    <div class="markdown-content" style="font-size: 16px;">${marked.parse(paper.one_line_summary)}</div>
                 </div>
             ` : `
                 <div class="detail-section">
@@ -478,6 +499,8 @@ async function triggerFetch() {
 
 // Load Stats
 async function loadStats() {
+    if (!statsEl) return; // Stats element doesn't exist in current UI
+    
     try {
         const response = await fetch(`${API_BASE}/stats`);
         const stats = await response.json();
