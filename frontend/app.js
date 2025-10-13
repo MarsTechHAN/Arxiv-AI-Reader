@@ -315,7 +315,7 @@ function createPaperCard(paper) {
         </div>
         
         ${paper.one_line_summary ? `
-            <div class="paper-summary markdown-content">${marked.parse(paper.one_line_summary)}</div>
+            <div class="paper-summary markdown-content">${renderMarkdown(paper.one_line_summary)}</div>
         ` : `
             <p class="paper-abstract">${escapeHtml(paper.abstract || '摘要缺失')}</p>
         `}
@@ -358,12 +358,12 @@ async function openPaperModal(paperId) {
             ${paper.detailed_summary ? `
                 <div class="detail-section">
                     <h3>AI 详细摘要</h3>
-                    <div class="markdown-content">${marked.parse(paper.detailed_summary)}</div>
+                    <div class="markdown-content">${renderMarkdown(paper.detailed_summary)}</div>
                 </div>
             ` : paper.one_line_summary ? `
                 <div class="detail-section">
                     <h3>AI 总结</h3>
-                    <div class="markdown-content" style="font-size: 16px;">${marked.parse(paper.one_line_summary)}</div>
+                    <div class="markdown-content" style="font-size: 16px;">${renderMarkdown(paper.one_line_summary)}</div>
                 </div>
             ` : `
                 <div class="detail-section">
@@ -396,13 +396,26 @@ async function openPaperModal(paperId) {
             paper.qa_pairs.map(qa => `
                 <div class="qa-item">
                     <div class="qa-question">Q: ${escapeHtml(qa.question)}</div>
-                    <div class="qa-answer markdown-content">${marked.parse(qa.answer)}</div>
+                    <div class="qa-answer markdown-content">${renderMarkdown(qa.answer)}</div>
                 </div>
             `).join('') : 
             '<p style="color: var(--text-muted);">暂无问答。请在下方输入问题！</p>';
         
         document.getElementById('qaList').innerHTML = qaHtml;
         document.getElementById('askInput').value = '';
+        
+        // Show relevance editor for non-relevant papers
+        const relevanceEditor = document.getElementById('relevanceEditor');
+        const currentRelevanceScore = document.getElementById('currentRelevanceScore');
+        const relevanceScoreInput = document.getElementById('relevanceScoreInput');
+        
+        if (paper.is_relevant === false) {
+            relevanceEditor.style.display = 'block';
+            currentRelevanceScore.textContent = paper.relevance_score || 0;
+            relevanceScoreInput.value = paper.relevance_score || 5;
+        } else {
+            relevanceEditor.style.display = 'none';
+        }
         
         paperModal.classList.add('active');
     } catch (error) {
@@ -434,7 +447,7 @@ async function askQuestion(paperId, question) {
         qaItem.className = 'qa-item';
         qaItem.innerHTML = `
             <div class="qa-question">Q: ${escapeHtml(question)}</div>
-            <div class="qa-answer markdown-content">${marked.parse(result.answer)}</div>
+            <div class="qa-answer markdown-content">${renderMarkdown(result.answer)}</div>
         `;
         qaList.appendChild(qaItem);
         
@@ -610,6 +623,51 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// Safe markdown rendering with fallback
+function renderMarkdown(text) {
+    if (!text || text.trim() === '') {
+        return '';
+    }
+    try {
+        // Parse markdown
+        const html = marked.parse(text);
+        return html;
+    } catch (error) {
+        console.error('Markdown parsing error:', error);
+        // Fallback: escape HTML and preserve line breaks
+        return escapeHtml(text).replace(/\n/g, '<br>');
+    }
+}
+
+// Update relevance
+async function updateRelevance(paperId) {
+    const scoreInput = document.getElementById('relevanceScoreInput');
+    const score = parseFloat(scoreInput.value);
+    
+    if (isNaN(score) || score < 0 || score > 10) {
+        alert('请输入0-10之间的评分');
+        return;
+    }
+    
+    try {
+        await fetch(`${API_BASE}/papers/${paperId}/update_relevance`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                is_relevant: true,
+                relevance_score: score
+            })
+        });
+        
+        // Close modal and refresh list
+        closeModal(paperModal);
+        currentPage = 0;
+        loadPapers(0, false);  // Don't scroll
+    } catch (error) {
+        console.error('Error updating relevance:', error);
+    }
 }
 
 // End marker functions

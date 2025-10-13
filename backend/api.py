@@ -98,6 +98,11 @@ class UpdateConfigRequest(BaseModel):
     system_prompt: Optional[str] = None
 
 
+class UpdateRelevanceRequest(BaseModel):
+    is_relevant: bool
+    relevance_score: float
+
+
 # ============ Frontend & Endpoints ============
 
 @app.get("/", include_in_schema=False)
@@ -340,6 +345,24 @@ async def star_paper(paper_id: str):
         paper.is_starred = not paper.is_starred  # Toggle
         fetcher.save_paper(paper)
         return {"message": "论文已收藏" if paper.is_starred else "取消收藏", "is_starred": paper.is_starred}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Paper not found")
+
+
+@app.post("/papers/{paper_id}/update_relevance")
+async def update_relevance(paper_id: str, request: UpdateRelevanceRequest):
+    """Update paper relevance status and score manually"""
+    try:
+        paper = fetcher.load_paper(paper_id)
+        paper.is_relevant = request.is_relevant
+        paper.relevance_score = max(0, min(10, request.relevance_score))  # Clamp 0-10
+        paper.updated_at = datetime.now().isoformat()
+        fetcher.save_paper(paper)
+        return {
+            "message": "论文相关性已更新",
+            "is_relevant": paper.is_relevant,
+            "relevance_score": paper.relevance_score
+        }
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
 
