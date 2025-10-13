@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>arXiv Paper Fetcher</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <!-- Marked.js for Markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <h1>📚 arXiv Paper Fetcher</h1>
+            <div class="header-actions">
+                <button id="configBtn" class="btn btn-secondary">⚙️ Config</button>
+                <button id="fetchBtn" class="btn btn-primary">🔄 Fetch Now</button>
+                <div class="stats" id="stats"></div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Search Bar & Controls -->
+    <div class="search-container">
+        <div class="container">
+            <div class="search-bar-wrapper">
+                <input 
+                    type="text" 
+                    id="searchInput" 
+                    class="search-input" 
+                    placeholder="搜索论文..."
+                >
+                <select id="sortSelect" class="sort-select">
+                    <option value="relevance">按相关性排序</option>
+                    <option value="latest">按最新排序</option>
+                    <option value="starred">按收藏排序</option>
+                </select>
+                <button id="clearKeywordBtn" class="btn btn-secondary" style="display: none;">清除筛选</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Timeline -->
+    <main class="container">
+        <div id="timeline" class="timeline">
+            <!-- Papers will be loaded here -->
+        </div>
+        
+        <div id="loading" class="loading" style="display: none;">
+            <div class="spinner"></div>
+            <p>Loading papers...</p>
+        </div>
+        
+        <div id="loadMore" class="load-more" style="display: none;">
+            <button class="btn btn-secondary">Load More</button>
+        </div>
+    </main>
+
+    <!-- Config Modal -->
+    <div id="configModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Configuration</h2>
+                <button class="close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Filter Keywords (comma separated)</label>
+                    <input type="text" id="filterKeywords" class="input" 
+                           placeholder="machine learning, computer vision, NLP">
+                </div>
+                
+                <div class="form-group">
+                    <label>Preset Questions (one per line)</label>
+                    <textarea id="presetQuestions" class="textarea" rows="8"
+                              placeholder="What is the main contribution?&#10;What are the key innovations?"></textarea>
+                </div>
+                
+                <div class="form-group">
+                    <label>System Prompt</label>
+                    <textarea id="systemPrompt" class="textarea" rows="4"
+                              placeholder="You are a helpful AI assistant..."></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="saveConfig" class="btn btn-primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Paper Detail Modal -->
+    <div id="paperModal" class="modal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h2 id="paperTitle"></h2>
+                <button class="close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="paperDetails"></div>
+                
+                <div class="qa-section">
+                    <h3>💬 Questions & Answers</h3>
+                    <div id="qaList"></div>
+                    
+                    <div class="ask-input-container">
+                        <input 
+                            type="text" 
+                            id="askInput" 
+                            class="input" 
+                            placeholder="Ask a question about this paper... (Press Enter)"
+                        >
+                        <div id="askLoading" class="ask-loading" style="display: none;">
+                            <div class="spinner-small"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
+

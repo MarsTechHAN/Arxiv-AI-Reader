@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# arXiv Paper Fetcher - Start Script
+
+echo "🚀 Starting arXiv Paper Fetcher..."
+
+# Check if DEEPSEEK_API_KEY is set
+if [ -z "$DEEPSEEK_API_KEY" ]; then
+    echo "⚠️  DEEPSEEK_API_KEY not set"
+    echo "Please run: export DEEPSEEK_API_KEY='your-api-key'"
+    exit 1
+fi
+
+# Create data directory
+mkdir -p data/papers
+
+# Check if running with Docker
+if [ "$1" == "docker" ]; then
+    echo "🐳 Starting with Docker..."
+    docker-compose up --build
+else
+    echo "✅ Starting backend server..."
+    echo "📍 URL: http://localhost:8000"
+    echo "📖 Features:"
+    echo "   - Markdown 渲染 Q&A"
+    echo "   - 中文回答"
+    echo "   - 相关性打分 (0-10)"
+    echo "   - 按相关性/最新/收藏排序"
+    echo "   - Hide/Star 功能"
+    echo "   - Keyword 筛选"
+    echo ""
+    cd backend && python api.py
+fi
+

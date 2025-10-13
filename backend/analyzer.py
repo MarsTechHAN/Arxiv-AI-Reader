@@ -1,0 +1,282 @@
+"""
+DeepSeek analyzer - two-stage filtering with KV cache optimization.
+
+Stage 1: Quick filter using preview (abstract + first 2000 chars)
+Stage 2: Deep analysis with Q&A (reuses KV cache)
+"""
+
+import asyncio
+from openai import AsyncOpenAI
+from typing import List, Optional
+import json
+import os
+from pathlib import Path
+
+from models import Paper, QAPair, Config
+
+
+class DeepSeekAnalyzer:
+    """
+    Two-stage analysis with KV cache optimization.
+    
+    Key insight: Keep "system_prompt + content" fixed,
+    only change the question to maximize cache hits.
+    """
+    
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        if not self.api_key:
+            raise ValueError("DEEPSEEK_API_KEY not set")
+        
+        self.client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url="https://api.deepseek.com"
+        )
+        
+        self.data_dir = Path("data/papers")
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+    
+    async def stage1_filter(self, paper: Paper, config: Config) -> Paper:
+        """
+        Stage 1: Quick filter.
+        Determines if paper is relevant based on keywords.
+        """
+        prompt = f"""分析这篇论文预览，判断它与以下关键词的相关性：
+
+关键词：{', '.join(config.filter_keywords)}
+
+论文标题：{paper.title}
+论文预览：
+{paper.preview_text}
+
+请用 JSON 格式回答：
+{{
+    "is_relevant": true/false,
+    "relevance_score": 0-10的分数（0=完全不相关，10=高度相关），
+    "extracted_keywords": ["关键词1", "关键词2", ...],
+    "one_line_summary": "一句话总结（中文）"
+}}
+"""
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model=config.model,
+                messages=[
+                    {"role": "system", "content": config.system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=config.temperature,
+                max_tokens=500,
+                response_format={"type": "json_object"}
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            paper.is_relevant = result.get("is_relevant", False)
+            paper.relevance_score = float(result.get("relevance_score", 0))
+            paper.extracted_keywords = result.get("extracted_keywords", [])
+            paper.one_line_summary = result.get("one_line_summary", "")
+            
+            # Save updated paper
+            self._save_paper(paper)
+            
+            score_display = f"({paper.relevance_score}/10)" if paper.relevance_score > 0 else ""
+            print(f"  Stage 1: {'✓ Relevant' if paper.is_relevant else '✗ Not relevant'} {score_display} - {paper.id}")
+        
+        except Exception as e:
+            print(f"  Stage 1 error for {paper.id}: {e}")
+            paper.is_relevant = False
+        
+        return paper
+    
+    async def stage2_qa(self, paper: Paper, config: Config) -> Paper:
+        """
+        Stage 2: Deep Q&A analysis.
+        First generates detailed summary, then answers preset questions.
+        Uses KV cache by keeping system + content fixed.
+        """
+        if not paper.is_relevant:
+            return paper
+        
+        # Build cache prefix (system prompt + paper content)
+        # This stays the same for all questions -> KV cache hit
+        cache_prefix = f"""Paper Title: {paper.title}
+
+Paper Content:
+{paper.html_content or paper.abstract}
+"""
+        
+        # 1. Generate detailed summary first
+        try:
+            detailed_summary_question = """请用中文生成这篇论文的详细摘要（约200-300字），包括：
+1. 研究背景和动机
+2. 核心方法和技术创新
+3. 主要实验结果
+4. 研究意义和价值
+
+使用 Markdown 格式，让摘要清晰易读。"""
+            
+            detailed_summary = await self._ask_question(
+                cache_prefix=cache_prefix,
+                question=detailed_summary_question,
+                config=config,
+                cache_id=paper.id
+            )
+            
+            paper.detailed_summary = detailed_summary
+            print(f"  Stage 2: Generated detailed summary for {paper.id}")
+        
+        except Exception as e:
+            print(f"  Stage 2 error generating summary for {paper.id}: {e}")
+        
+        # 2. Ask each preset question
+        for question in config.preset_questions:
+            try:
+                answer = await self._ask_question(
+                    cache_prefix=cache_prefix,
+                    question=question,
+                    config=config,
+                    cache_id=paper.id
+                )
+                
+                paper.qa_pairs.append(QAPair(
+                    question=question,
+                    answer=answer
+                ))
+                
+                print(f"  Stage 2: Answered '{question[:40]}...' for {paper.id}")
+            
+            except Exception as e:
+                print(f"  Stage 2 error for {paper.id}, Q: {question[:40]}: {e}")
+        
+        # Save updated paper
+        self._save_paper(paper)
+        
+        return paper
+    
+    async def ask_custom_question(
+        self,
+        paper: Paper,
+        question: str,
+        config: Config
+    ) -> str:
+        """
+        Ask a custom question about a paper.
+        Reuses KV cache from stage 2.
+        """
+        cache_prefix = f"""Paper Title: {paper.title}
+
+Paper Content:
+{paper.html_content or paper.abstract}
+"""
+        
+        answer = await self._ask_question(
+            cache_prefix=cache_prefix,
+            question=question,
+            config=config,
+            cache_id=paper.id
+        )
+        
+        # Save to paper
+        paper.qa_pairs.append(QAPair(
+            question=question,
+            answer=answer
+        ))
+        self._save_paper(paper)
+        
+        return answer
+    
+    async def _ask_question(
+        self,
+        cache_prefix: str,
+        question: str,
+        config: Config,
+        cache_id: str
+    ) -> str:
+        """
+        Ask a question with KV cache optimization.
+        
+        Key: cache_prefix stays the same, only question changes.
+        """
+        response = await self.client.chat.completions.create(
+            model=config.model,
+            messages=[
+                {"role": "system", "content": config.system_prompt},
+                {"role": "user", "content": f"{cache_prefix}\n\nQuestion: {question}"}
+            ],
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+        )
+        
+        return response.choices[0].message.content
+    
+    def _save_paper(self, paper: Paper):
+        """Save paper to JSON file"""
+        file_path = self.data_dir / f"{paper.id}.json"
+        with open(file_path, 'w') as f:
+            json.dump(paper.to_dict(), f, indent=2, ensure_ascii=False)
+    
+    async def process_papers(
+        self,
+        papers: List[Paper],
+        config: Config
+    ) -> List[Paper]:
+        """
+        Process multiple papers concurrently.
+        
+        Stage 1: Filter all papers (fast, all concurrent)
+        Stage 2: Deep analysis only for relevant papers (batched by config.concurrent_papers)
+        """
+        if not papers:
+            return papers
+            
+        # Stage 1: Filter all papers concurrently
+        print(f"\n🔍 Stage 1: Filtering {len(papers)} papers...")
+        stage1_tasks = [self.stage1_filter(paper, config) for paper in papers]
+        papers = await asyncio.gather(*stage1_tasks)
+        
+        # Find relevant papers
+        relevant_papers = [p for p in papers if p.is_relevant]
+        print(f"✓ Found {len(relevant_papers)} relevant papers")
+        
+        # Stage 2: Deep analysis for relevant papers
+        if relevant_papers:
+            concurrent = config.concurrent_papers
+            print(f"\n📚 Stage 2: Deep analysis of {len(relevant_papers)} papers (concurrent={concurrent})...")
+            
+            # Process in batches to control concurrency
+            for i in range(0, len(relevant_papers), concurrent):
+                batch = relevant_papers[i:i + concurrent]
+                print(f"   Processing batch {i//concurrent + 1}/{(len(relevant_papers) + concurrent - 1)//concurrent} ({len(batch)} papers)")
+                stage2_tasks = [self.stage2_qa(paper, config) for paper in batch]
+                await asyncio.gather(*stage2_tasks)
+        
+        return papers
+
+
+async def analyze_new_papers():
+    """
+    Analyze any papers that haven't been analyzed yet.
+    Run this periodically after the fetcher.
+    """
+    from fetcher import ArxivFetcher
+    
+    config = Config.load("data/config.json")
+    fetcher = ArxivFetcher()
+    analyzer = DeepSeekAnalyzer()
+    
+    # Find unanalyzed papers (is_relevant is None)
+    all_papers = fetcher.list_papers(limit=1000)
+    unanalyzed = [p for p in all_papers if p.is_relevant is None]
+    
+    if unanalyzed:
+        print(f"📊 Analyzing {len(unanalyzed)} unanalyzed papers...")
+        await analyzer.process_papers(unanalyzed, config)
+    else:
+        print("✓ All papers already analyzed")
+
+
+if __name__ == "__main__":
+    # Test analyzer
+    asyncio.run(analyze_new_papers())
+

@@ -205,3 +205,32 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data and logs
+*.log
+*.sqlite
+*.db
+backend/data/papers/*.json
+backend/data/papers/*.pdf
+data/papers/*.json
+data/papers/*.pdf
+
+# Config (keep template, ignore local)
+backend/data/config.json
+
+# Docker
+.dockerignore
+
+# Temporary files
+*.tmp
+*.bak
+.cache/
