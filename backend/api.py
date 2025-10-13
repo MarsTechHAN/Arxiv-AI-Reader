@@ -241,9 +241,52 @@ async def update_config(request: UpdateConfigRequest):
 @app.get("/search")
 async def search_papers(q: str, limit: int = 50):
     """
-    Search papers by keyword or full-text.
-    Simple grep-style search.
+    Search papers by keyword, full-text, or arXiv ID.
+    If query looks like arXiv ID (e.g., 2510.09212), fetch if not exists.
     """
+    import re
+    
+    # Check if query is an arXiv ID (format: YYMM.NNNNN or YYMM.NNNNNvN)
+    arxiv_id_pattern = r'^\d{4}\.\d{4,5}(v\d+)?$'
+    if re.match(arxiv_id_pattern, q.strip()):
+        arxiv_id = q.strip()
+        print(f"🔍 Detected arXiv ID: {arxiv_id}")
+        
+        try:
+            # Fetch or load the paper
+            paper = await fetcher.fetch_single_paper(arxiv_id)
+            
+            # Trigger analysis in background if not analyzed yet
+            if paper.is_relevant is None:
+                config = Config.load(config_path)
+                asyncio.create_task(analyzer.process_papers([paper], config))
+                print(f"📊 Started background analysis for {arxiv_id}")
+            
+            # Return the paper
+            return [{
+                "id": paper.id,
+                "title": paper.title,
+                "authors": paper.authors,
+                "abstract": paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract,
+                "url": paper.url,
+                "is_relevant": paper.is_relevant,
+                "relevance_score": paper.relevance_score,
+                "extracted_keywords": paper.extracted_keywords,
+                "one_line_summary": paper.one_line_summary,
+                "published_date": paper.published_date,
+                "is_starred": paper.is_starred,
+                "is_hidden": paper.is_hidden,
+                "created_at": paper.created_at,
+                "has_qa": len(paper.qa_pairs) > 0,
+                "detailed_summary": paper.detailed_summary,
+                "search_score": 1000,  # High score for direct ID match
+            }]
+        
+        except Exception as e:
+            print(f"✗ Failed to fetch arXiv paper {arxiv_id}: {e}")
+            raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found on arXiv")
+    
+    # Normal keyword search
     papers = fetcher.list_papers(limit=1000)
     q_lower = q.lower()
     

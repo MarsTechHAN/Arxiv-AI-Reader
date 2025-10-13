@@ -176,6 +176,66 @@ class ArxivFetcher:
             return [entry.author]
         return []
     
+    async def fetch_single_paper(self, arxiv_id: str) -> Paper:
+        """
+        Fetch a single paper by arXiv ID.
+        Uses arXiv API to get metadata, then downloads HTML.
+        Returns Paper object.
+        Raises exception if paper not found or fetch fails.
+        """
+        # Check if already exists
+        if self._paper_exists(arxiv_id):
+            return self.load_paper(arxiv_id)
+        
+        async with httpx.AsyncClient(headers=self.headers, timeout=30.0, follow_redirects=True) as client:
+            # Use arXiv API to get paper metadata
+            api_url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
+            
+            try:
+                response = await client.get(api_url)
+                if response.status_code != 200:
+                    raise Exception(f"arXiv API returned {response.status_code}")
+                
+                # Parse Atom feed
+                feed = feedparser.parse(response.text)
+                
+                if not feed.entries or len(feed.entries) == 0:
+                    raise Exception(f"Paper {arxiv_id} not found on arXiv")
+                
+                entry = feed.entries[0]
+                
+                # Download HTML version
+                html_content = await self._fetch_html(client, arxiv_id)
+                
+                # Extract preview text
+                preview_text = self._extract_preview(html_content, entry.summary)
+                
+                # Extract published date
+                published_date = getattr(entry, 'published', '')
+                
+                # Create Paper object
+                paper = Paper(
+                    id=arxiv_id,
+                    title=entry.title,
+                    authors=self._extract_authors(entry),
+                    abstract=entry.summary,
+                    url=entry.link,
+                    html_url=f"https://arxiv.org/html/{arxiv_id}",
+                    html_content=html_content,
+                    preview_text=preview_text,
+                    published_date=published_date,
+                )
+                
+                # Save immediately
+                self.save_paper(paper)
+                print(f"✓ Fetched single paper: {arxiv_id} - {paper.title[:60]}...")
+                
+                return paper
+            
+            except Exception as e:
+                print(f"✗ Error fetching paper {arxiv_id}: {e}")
+                raise
+    
     def _paper_exists(self, arxiv_id: str) -> bool:
         """Check if paper already exists"""
         return (self.data_dir / f"{arxiv_id}.json").exists()
