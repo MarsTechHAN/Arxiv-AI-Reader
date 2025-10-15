@@ -801,19 +801,44 @@ function sharePaper(paperId) {
     
     const shareUrl = `${window.location.origin}${window.location.pathname}?paper=${paperId}`;
     
-    // Copy to clipboard
-    navigator.clipboard.writeText(shareUrl).then(() => {
-        showSuccess('分享链接已复制到剪贴板！');
-    }).catch(() => {
-        // Fallback for older browsers
-        const tempInput = document.createElement('input');
-        tempInput.value = shareUrl;
-        document.body.appendChild(tempInput);
-        tempInput.select();
-        document.execCommand('copy');
-        document.body.removeChild(tempInput);
-        showSuccess('分享链接已复制到剪贴板！');
-    });
+    // Copy to clipboard (with proper fallback)
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        // Modern browsers with clipboard API
+        navigator.clipboard.writeText(shareUrl).then(() => {
+            showSuccess('分享链接已复制到剪贴板！');
+        }).catch((err) => {
+            console.error('Clipboard API failed:', err);
+            fallbackCopy(shareUrl);
+        });
+    } else {
+        // Fallback for older browsers or non-HTTPS
+        fallbackCopy(shareUrl);
+    }
+}
+
+// Fallback copy method
+function fallbackCopy(text) {
+    const tempInput = document.createElement('input');
+    tempInput.value = text;
+    tempInput.style.position = 'fixed';
+    tempInput.style.opacity = '0';
+    document.body.appendChild(tempInput);
+    tempInput.select();
+    tempInput.setSelectionRange(0, 99999); // For mobile devices
+    
+    try {
+        const successful = document.execCommand('copy');
+        if (successful) {
+            showSuccess('分享链接已复制到剪贴板！');
+        } else {
+            showError('复制失败，请手动复制链接');
+        }
+    } catch (err) {
+        console.error('Fallback copy failed:', err);
+        showError('复制失败，请手动复制链接');
+    }
+    
+    document.body.removeChild(tempInput);
 }
 
 // Check deep link - open paper if URL has ?paper=ID parameter
