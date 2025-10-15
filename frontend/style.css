@@ -942,12 +942,177 @@ body {
     min-height: 20px;
 }
 
+/* Markdown Content Styling */
+.markdown-content {
+    line-height: 1.8;
+    color: var(--text);
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+    margin-top: 24px;
+    margin-bottom: 16px;
+    font-weight: 600;
+    line-height: 1.25;
+    color: var(--text);
+}
+
+.markdown-content h1 { font-size: 2em; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.markdown-content h2 { font-size: 1.5em; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.markdown-content h3 { font-size: 1.25em; }
+.markdown-content h4 { font-size: 1em; }
+
+.markdown-content p {
+    margin-bottom: 16px;
+}
+
+.markdown-content ul,
+.markdown-content ol {
+    margin-bottom: 16px;
+    padding-left: 24px;
+}
+
+.markdown-content li {
+    margin-bottom: 8px;
+}
+
+.markdown-content code {
+    background: var(--bg-lighter);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 0.9em;
+    color: #e06c75;
+}
+
+.markdown-content pre {
+    background: var(--bg-lighter);
+    padding: 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin-bottom: 16px;
+    border: 1px solid var(--border);
+}
+
+.markdown-content pre code {
+    background: none;
+    padding: 0;
+    color: var(--text);
+}
+
+.markdown-content blockquote {
+    border-left: 4px solid var(--primary);
+    padding-left: 16px;
+    margin: 16px 0;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.markdown-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    background: var(--bg-lighter);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.markdown-content table th,
+.markdown-content table td {
+    padding: 12px 16px;
+    text-align: left;
+    border: 1px solid var(--border);
+}
+
+.markdown-content table th {
+    background: var(--bg);
+    font-weight: 600;
+    color: var(--primary);
+    border-bottom: 2px solid var(--primary);
+}
+
+.markdown-content table tr:hover {
+    background: rgba(59, 130, 246, 0.05);
+}
+
+.markdown-content table tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.markdown-content a {
+    color: var(--primary);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.2s;
+}
+
+.markdown-content a:hover {
+    border-bottom-color: var(--primary);
+}
+
+.markdown-content img {
+    max-width: 100%;
+    height: auto;
+    border-radius: 8px;
+    margin: 16px 0;
+}
+
+.markdown-content hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 24px 0;
+}
+
+/* KaTeX (LaTeX) styling */
+.markdown-content .katex {
+    font-size: 1.1em;
+}
+
+.markdown-content .katex-display {
+    margin: 16px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
 /* PDF Viewer */
 .paper-links {
     display: flex;
     gap: 12px;
     align-items: center;
+    flex-wrap: wrap;
     margin-bottom: 16px;
+}
+
+.pdf-download-link {
+    color: var(--primary);
+    text-decoration: none;
+    font-size: 14px;
+    word-break: break-all;
+    flex: 1;
+    min-width: 0;
+    padding: 8px 12px;
+    background: var(--bg-lighter);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    transition: all 0.2s;
+}
+
+.pdf-download-link:hover {
+    background: var(--bg);
+    border-color: var(--primary);
+    transform: translateX(2px);
+}
+
+.btn-compact {
+    padding: 8px 16px;
+    font-size: 14px;
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 
 .pdf-viewer-container {
@@ -956,6 +1121,7 @@ body {
     border-radius: 8px;
     overflow: hidden;
     background: var(--bg-lighter);
+    animation: slideDown 0.3s ease-out;
 }
 
 .pdf-viewer-container iframe {

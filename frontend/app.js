@@ -444,12 +444,12 @@ async function openPaperModal(paperId) {
             `}
             
             <div class="detail-section">
-                <h3>链接</h3>
+                <h3>PDF</h3>
                 <div class="paper-links">
-                    <a href="${getPdfUrl(paper.url)}" target="_blank" class="btn btn-primary" style="display: inline-block; margin-right: 12px;">
-                        📄 下载 PDF
+                    <a href="${getPdfUrl(paper.url)}" target="_blank" class="pdf-download-link">
+                        📄 ${getPdfUrl(paper.url)}
                     </a>
-                    <button onclick="togglePdfViewer('${escapeHtml(paper.id)}')" class="btn btn-secondary">
+                    <button onclick="togglePdfViewer('${escapeHtml(paper.id)}')" class="btn btn-secondary btn-compact">
                         👁️ 在线预览
                     </button>
                 </div>
@@ -812,9 +812,35 @@ function renderMarkdown(text) {
         return '';
     }
     try {
+        // Clean up markdown wrapper artifacts
+        let cleanedText = text;
+        
+        // Remove wrapping ```markdown...``` blocks
+        cleanedText = cleanedText.replace(/^```markdown\s*\n([\s\S]*?)\n```$/gm, '$1');
+        cleanedText = cleanedText.replace(/^```\s*\n([\s\S]*?)\n```$/gm, '$1');
+        
         // Parse markdown
-        const html = marked.parse(text);
-        return html;
+        const html = marked.parse(cleanedText);
+        
+        // Create temporary div to render LaTeX
+        const tempDiv = document.createElement('div');
+        tempDiv.innerHTML = html;
+        
+        // Render LaTeX with KaTeX
+        if (typeof renderMathInElement !== 'undefined') {
+            renderMathInElement(tempDiv, {
+                delimiters: [
+                    {left: '$$', right: '$$', display: true},
+                    {left: '$', right: '$', display: false},
+                    {left: '\\[', right: '\\]', display: true},
+                    {left: '\\(', right: '\\)', display: false}
+                ],
+                throwOnError: false,
+                errorColor: '#cc0000'
+            });
+        }
+        
+        return tempDiv.innerHTML;
     } catch (error) {
         console.error('Markdown parsing error:', error);
         // Fallback: escape HTML and preserve line breaks
