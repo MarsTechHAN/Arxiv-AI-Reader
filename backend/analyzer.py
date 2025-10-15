@@ -40,7 +40,22 @@ class DeepSeekAnalyzer:
         """
         Stage 1: Quick filter.
         Determines if paper is relevant based on keywords.
+        First checks negative keywords - if matched, score=1 (irrelevant).
         """
+        # Check negative keywords first (fast path for rejection)
+        if config.negative_keywords:
+            searchable_text = f"{paper.title} {paper.preview_text}".lower()
+            for neg_kw in config.negative_keywords:
+                if neg_kw.lower() in searchable_text:
+                    paper.is_relevant = False
+                    paper.relevance_score = 1.0
+                    paper.extracted_keywords = [f"❌ {neg_kw}"]
+                    paper.one_line_summary = f"论文包含负面关键词「{neg_kw}」，自动标记为不相关"
+                    self._save_paper(paper)
+                    print(f"  Stage 1: ✗ Negative keyword '{neg_kw}' matched - {paper.id}")
+                    return paper
+        
+        # Normal analysis if no negative keywords matched
         prompt = f"""分析这篇论文预览，判断它与以下关键词的相关性：
 
 关键词：{', '.join(config.filter_keywords)}
@@ -154,6 +169,98 @@ Paper Content:
         
         return paper
     
+    async def ask_custom_question_stream(
+        self,
+        paper: Paper,
+        question: str,
+        config: Config
+    ):
+        """
+        Ask a custom question about a paper with streaming response.
+        Yields chunks of the answer as they arrive.
+        """
+        import re
+        
+        # Extract arXiv IDs from question (format: [2510.09212] or [2510.09212v1])
+        arxiv_id_pattern = r'\[(\d{4}\.\d{4,5}(?:v\d+)?)\]'
+        referenced_ids = re.findall(arxiv_id_pattern, question)
+        
+        # If references found, fetch and analyze them
+        referenced_papers = []
+        id_to_title = {}
+        
+        if referenced_ids:
+            print(f"🔗 Detected {len(referenced_ids)} referenced papers: {referenced_ids}")
+            
+            from fetcher import ArxivFetcher
+            fetcher = ArxivFetcher()
+            
+            for ref_id in referenced_ids:
+                try:
+                    ref_paper = await fetcher.fetch_single_paper(ref_id)
+                    
+                    if ref_paper.is_relevant is None:
+                        print(f"   📊 Analyzing {ref_id}...")
+                        await self.stage1_filter(ref_paper, config)
+                    
+                    if ref_paper.is_relevant and not ref_paper.detailed_summary:
+                        print(f"   📚 Deep analysis for {ref_id}...")
+                        await self.stage2_qa(ref_paper, config)
+                    
+                    referenced_papers.append(ref_paper)
+                    short_title = ref_paper.title[:60] + "..." if len(ref_paper.title) > 60 else ref_paper.title
+                    id_to_title[ref_id] = short_title
+                    print(f"   ✓ {ref_id}: {short_title}")
+                
+                except Exception as e:
+                    print(f"   ✗ Failed to load {ref_id}: {e}")
+        
+        # Build enhanced context
+        if referenced_papers:
+            enhanced_question = question
+            for ref_id, title in id_to_title.items():
+                enhanced_question = enhanced_question.replace(f"[{ref_id}]", f'"{title}"')
+            
+            context_parts = [
+                "=== CURRENT PAPER ===",
+                f"Title: {paper.title}",
+                f"Content:\n{paper.html_content or paper.abstract}",
+                ""
+            ]
+            
+            for idx, ref_paper in enumerate(referenced_papers, 1):
+                context_parts.extend([
+                    f"=== REFERENCE PAPER {idx} ===",
+                    f"Title: {ref_paper.title}",
+                    f"Content:\n{ref_paper.html_content or ref_paper.abstract}",
+                    ""
+                ])
+            
+            cache_prefix = "\n".join(context_parts)
+            final_question = enhanced_question
+            cache_id = f"{paper.id}_with_refs"
+        else:
+            cache_prefix = f"""Paper Title: {paper.title}
+
+Paper Content:
+{paper.html_content or paper.abstract}
+"""
+            final_question = question
+            cache_id = paper.id
+        
+        # Stream the answer
+        full_answer = ""
+        async for chunk in self._ask_question_stream(cache_prefix, final_question, config, cache_id):
+            full_answer += chunk
+            yield chunk
+        
+        # Save to paper (save original question)
+        paper.qa_pairs.append(QAPair(
+            question=question,
+            answer=full_answer
+        ))
+        self._save_paper(paper)
+    
     async def ask_custom_question(
         self,
         paper: Paper,
@@ -258,6 +365,32 @@ Paper Content:
         self._save_paper(paper)
         
         return answer
+    
+    async def _ask_question_stream(
+        self,
+        cache_prefix: str,
+        question: str,
+        config: Config,
+        cache_id: str
+    ):
+        """
+        Ask a question with streaming response.
+        Yields chunks as they arrive from the API.
+        """
+        response = await self.client.chat.completions.create(
+            model=config.model,
+            messages=[
+                {"role": "system", "content": config.system_prompt},
+                {"role": "user", "content": f"{cache_prefix}\n\nQuestion: {question}"}
+            ],
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            stream=True,
+        )
+        
+        async for chunk in response:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
     
     async def _ask_question(
         self,

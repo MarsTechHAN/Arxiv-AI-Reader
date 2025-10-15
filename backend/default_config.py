@@ -11,6 +11,13 @@ DEFAULT_CONFIG = {
         "diffusion language model",
         "autoregressive diffusion model",
     ],
+    "negative_keywords": [
+        "medical",
+        "healthcare",
+        "clinical",
+        "protein",
+        "molecule",
+    ],
     "preset_questions": [
         "这篇论文的核心创新点是什么，他想解决什么问题，怎么解决的？",
         "基于他的前作，梳理这个方向的整个发展脉络，每一步相比于之前的工作都改进了什么，着重于几个不同的发展方向。",

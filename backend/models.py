@@ -75,6 +75,7 @@ class Config:
     User controls everything here.
     """
     filter_keywords: List[str] = field(default_factory=list)
+    negative_keywords: List[str] = field(default_factory=list)
     preset_questions: List[str] = field(default_factory=list)
     system_prompt: str = "You are a helpful AI assistant analyzing academic papers."
     

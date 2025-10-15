@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
@@ -94,6 +94,7 @@ class AskQuestionRequest(BaseModel):
 
 class UpdateConfigRequest(BaseModel):
     filter_keywords: Optional[List[str]] = None
+    negative_keywords: Optional[List[str]] = None
     preset_questions: Optional[List[str]] = None
     system_prompt: Optional[str] = None
 
@@ -214,6 +215,44 @@ async def ask_question(paper_id: str, request: AskQuestionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/papers/{paper_id}/ask_stream")
+async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
+    """
+    Ask a custom question about a paper with streaming response.
+    Uses Server-Sent Events (SSE) for real-time streaming.
+    """
+    try:
+        paper = fetcher.load_paper(paper_id)
+        config = Config.load(config_path)
+        
+        async def event_generator():
+            """Generate SSE events with streamed answer"""
+            try:
+                async for chunk in analyzer.ask_custom_question_stream(paper, request.question, config):
+                    # Send chunk as SSE format
+                    yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                
+                # Send completion event
+                yield f"data: {json.dumps({'done': True})}\n\n"
+            
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            }
+        )
+    
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/config")
 async def get_config():
     """Get current configuration"""
@@ -228,6 +267,8 @@ async def update_config(request: UpdateConfigRequest):
     
     if request.filter_keywords is not None:
         config.filter_keywords = request.filter_keywords
+    if request.negative_keywords is not None:
+        config.negative_keywords = request.negative_keywords
     if request.preset_questions is not None:
         config.preset_questions = request.preset_questions
     if request.system_prompt is not None:

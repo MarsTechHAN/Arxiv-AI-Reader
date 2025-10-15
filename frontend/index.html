@@ -12,7 +12,7 @@
     <!-- Header -->
     <header class="header">
         <div class="container">
-            <h1>arXiv Fast Paper Reader</h1>
+            <h1 id="headerTitle" style="cursor: pointer;">arXiv Fast Paper Reader</h1>
             <!--
             <div class="header-actions">
                 <button id="configBtn" class="btn btn-secondary">⚙️ Config</button>
@@ -22,6 +22,13 @@
             -->
         </div>
     </header>
+
+    <!-- Update notification -->
+    <div id="updateNotification" class="update-notification" style="display: none;">
+        <span>🎉 有新的论文更新！</span>
+        <button onclick="refreshPapers()" class="btn-small">刷新查看</button>
+        <button onclick="dismissUpdate()" class="btn-small btn-dismiss">×</button>
+    </div>
 
     <!-- Search Bar & Controls -->
     <div class="search-container">
@@ -76,6 +83,12 @@
                 </div>
                 
                 <div class="form-group">
+                    <label>Negative Keywords (comma separated) - Auto-reject papers containing these</label>
+                    <input type="text" id="negativeKeywords" class="input" 
+                           placeholder="medical, protein, clinical">
+                </div>
+                
+                <div class="form-group">
                     <label>Preset Questions (one per line)</label>
                     <textarea id="presetQuestions" class="textarea" rows="8"
                               placeholder="What is the main contribution?&#10;What are the key innovations?"></textarea>
@@ -99,6 +112,7 @@
             <div class="modal-header">
                 <h2 id="paperTitle"></h2>
                 <div class="modal-header-actions">
+                    <button id="shareBtn" class="icon-btn" title="Share">🔗</button>
                     <button id="fullscreenBtn" class="icon-btn" title="Toggle Fullscreen">⛶</button>
                     <button class="close" title="Close">&times;</button>
                 </div>

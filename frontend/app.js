@@ -9,6 +9,8 @@ let currentSortBy = 'relevance';
 let currentKeyword = null;
 let hasMorePapers = true;
 let isLoadingMore = false;
+let lastPaperCount = 0;
+let lastAnalyzedCount = 0;
 
 // DOM Elements
 const timeline = document.getElementById('timeline');
@@ -29,14 +31,18 @@ document.addEventListener('DOMContentLoaded', () => {
     loadStats();
     setupEventListeners();
     setupInfiniteScroll();
+    checkDeepLink();  // Check if URL has paper ID parameter
     
     // Auto-refresh stats every 30s
     setInterval(loadStats, 30000);
+    
+    // Check for updates every 30s
+    setInterval(checkForUpdates, 30000);
 });
 
 // Event Listeners
 function setupEventListeners() {
-    // Search
+    // Search - input event (with debounce)
     searchInput.addEventListener('input', (e) => {
         clearTimeout(searchTimeout);
         searchTimeout = setTimeout(() => {
@@ -47,6 +53,20 @@ function setupEventListeners() {
                 loadPapers();
             }
         }, 500);
+    });
+    
+    // Search - Enter key (immediate search)
+    searchInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            clearTimeout(searchTimeout);  // Cancel debounced search
+            const query = e.target.value.trim();
+            if (query) {
+                searchPapers(query);
+            } else {
+                currentPage = 0;
+                loadPapers();
+            }
+        }
     });
     
     // Sort
@@ -124,6 +144,15 @@ function setupEventListeners() {
         }
     });
     
+    // Share button for paper modal
+    const shareBtn = document.getElementById('shareBtn');
+    if (shareBtn && paperModal) {
+        shareBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            sharePaper(currentPaperId);
+        });
+    }
+    
     // Fullscreen toggle for paper modal
     const fullscreenBtn = document.getElementById('fullscreenBtn');
     if (fullscreenBtn && paperModal) {
@@ -138,6 +167,22 @@ function setupEventListeners() {
         currentPage++;
         loadPapers(currentPage);
     });
+    
+    // Header title click - clear search and refresh
+    const headerTitle = document.getElementById('headerTitle');
+    if (headerTitle) {
+        headerTitle.addEventListener('click', () => {
+            // Clear search input
+            searchInput.value = '';
+            // Clear keyword filter
+            currentKeyword = null;
+            clearKeywordBtn.style.display = 'none';
+            // Reset to first page
+            currentPage = 0;
+            // Reload papers
+            loadPapers();
+        });
+    }
 }
 
 // Infinite scroll
@@ -183,6 +228,10 @@ async function loadPapers(page = 0, shouldScroll = true) {
             timeline.innerHTML = '';
             hasMorePapers = true;  // Reset state
             hideEndMarker();
+            
+            // Add starred papers section at the top
+            await addStarredPapersSection();
+            
             if (shouldScroll) {
                 window.scrollTo(0, 0);  // Only scroll when explicitly requested
             }
@@ -347,6 +396,12 @@ async function openPaperModal(paperId) {
         const response = await fetch(`${API_BASE}/papers/${paperId}`);
         const paper = await response.json();
         
+        // Reset scroll to top when opening modal
+        const modalBody = paperModal.querySelector('.modal-body');
+        if (modalBody) {
+            modalBody.scrollTop = 0;
+        }
+        
         document.getElementById('paperTitle').textContent = paper.title;
         
         const detailsHtml = `
@@ -424,7 +479,7 @@ async function openPaperModal(paperId) {
     }
 }
 
-// Ask Question
+// Ask Question (with streaming)
 async function askQuestion(paperId, question) {
     const askInput = document.getElementById('askInput');
     const askLoading = document.getElementById('askLoading');
@@ -433,28 +488,68 @@ async function askQuestion(paperId, question) {
     askInput.disabled = true;
     askLoading.style.display = 'block';
     
+    // Create placeholder Q&A item
+    const qaItem = document.createElement('div');
+    qaItem.className = 'qa-item';
+    qaItem.innerHTML = `
+        <div class="qa-question">Q: ${escapeHtml(question)}</div>
+        <div class="qa-answer markdown-content streaming-answer"></div>
+    `;
+    qaList.appendChild(qaItem);
+    
+    const answerDiv = qaItem.querySelector('.qa-answer');
+    let fullAnswer = '';
+    
     try {
-        const response = await fetch(`${API_BASE}/papers/${paperId}/ask`, {
+        const response = await fetch(`${API_BASE}/papers/${paperId}/ask_stream`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ question })
         });
         
-        const result = await response.json();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
         
-        // Add to Q&A list (with Markdown rendering)
-        const qaItem = document.createElement('div');
-        qaItem.className = 'qa-item';
-        qaItem.innerHTML = `
-            <div class="qa-question">Q: ${escapeHtml(question)}</div>
-            <div class="qa-answer markdown-content">${renderMarkdown(result.answer)}</div>
-        `;
-        qaList.appendChild(qaItem);
+        while (true) {
+            const { done, value } = await reader.read();
+            
+            if (done) break;
+            
+            // Decode chunk
+            const chunk = decoder.decode(value, { stream: true });
+            
+            // Parse SSE format (data: {...}\n\n)
+            const lines = chunk.split('\n');
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        
+                        if (data.chunk) {
+                            fullAnswer += data.chunk;
+                            // Update display with streaming effect
+                            answerDiv.innerHTML = renderMarkdown(fullAnswer) + '<span class="cursor-blink">▊</span>';
+                        } else if (data.done) {
+                            // Remove cursor and finalize
+                            answerDiv.innerHTML = renderMarkdown(fullAnswer);
+                        } else if (data.error) {
+                            answerDiv.innerHTML = `<span style="color: var(--danger);">Error: ${escapeHtml(data.error)}</span>`;
+                        }
+                    } catch (e) {
+                        // Ignore JSON parse errors for partial chunks
+                    }
+                }
+            }
+        }
         
+        // Finalize answer
+        answerDiv.innerHTML = renderMarkdown(fullAnswer);
+        answerDiv.classList.remove('streaming-answer');
         askInput.value = '';
+        
     } catch (error) {
         console.error('Error asking question:', error);
-        showError('Failed to get answer');
+        answerDiv.innerHTML = `<span style="color: var(--danger);">Failed to get answer: ${escapeHtml(error.message)}</span>`;
     } finally {
         askInput.disabled = false;
         askLoading.style.display = 'none';
@@ -468,6 +563,7 @@ async function openConfigModal() {
         const config = await response.json();
         
         document.getElementById('filterKeywords').value = config.filter_keywords.join(', ');
+        document.getElementById('negativeKeywords').value = (config.negative_keywords || []).join(', ');
         document.getElementById('presetQuestions').value = config.preset_questions.join('\n');
         document.getElementById('systemPrompt').value = config.system_prompt;
         
@@ -480,6 +576,11 @@ async function openConfigModal() {
 
 async function saveConfig() {
     const keywords = document.getElementById('filterKeywords').value
+        .split(',')
+        .map(k => k.trim())
+        .filter(k => k);
+    
+    const negativeKeywords = document.getElementById('negativeKeywords').value
         .split(',')
         .map(k => k.trim())
         .filter(k => k);
@@ -497,6 +598,7 @@ async function saveConfig() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 filter_keywords: keywords,
+                negative_keywords: negativeKeywords,
                 preset_questions: questions,
                 system_prompt: systemPrompt
             })
@@ -691,5 +793,137 @@ function hideEndMarker() {
     if (existing) {
         existing.remove();
     }
+}
+
+// Share paper - copy URL with paper ID
+function sharePaper(paperId) {
+    if (!paperId) return;
+    
+    const shareUrl = `${window.location.origin}${window.location.pathname}?paper=${paperId}`;
+    
+    // Copy to clipboard
+    navigator.clipboard.writeText(shareUrl).then(() => {
+        showSuccess('分享链接已复制到剪贴板！');
+    }).catch(() => {
+        // Fallback for older browsers
+        const tempInput = document.createElement('input');
+        tempInput.value = shareUrl;
+        document.body.appendChild(tempInput);
+        tempInput.select();
+        document.execCommand('copy');
+        document.body.removeChild(tempInput);
+        showSuccess('分享链接已复制到剪贴板！');
+    });
+}
+
+// Check deep link - open paper if URL has ?paper=ID parameter
+function checkDeepLink() {
+    const urlParams = new URLSearchParams(window.location.search);
+    const paperId = urlParams.get('paper');
+    
+    if (paperId) {
+        // Open paper modal after a short delay to ensure page is ready
+        setTimeout(() => {
+            openPaperModal(paperId);
+        }, 500);
+    }
+}
+
+// Add starred papers collapsible section
+async function addStarredPapersSection() {
+    try {
+        // Fetch all starred papers
+        const response = await fetch(`${API_BASE}/papers?skip=0&limit=1000&sort_by=starred`);
+        const allPapers = await response.json();
+        const starredPapers = allPapers.filter(p => p.is_starred);
+        
+        if (starredPapers.length === 0) return;
+        
+        // Create collapsible section
+        const section = document.createElement('div');
+        section.className = 'starred-section';
+        section.innerHTML = `
+            <div class="starred-header" onclick="toggleStarredSection()">
+                <h3>⭐ 收藏的论文 (${starredPapers.length})</h3>
+                <span class="toggle-icon" id="starredToggle">▼</span>
+            </div>
+            <div class="starred-content" id="starredContent" style="display: none;">
+                ${starredPapers.map(paper => `
+                    <div class="starred-item" onclick="openPaperModal('${paper.id}')">
+                        <span class="starred-title">${escapeHtml(paper.title)}</span>
+                        <span class="starred-score">${paper.relevance_score}/10</span>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+        
+        timeline.appendChild(section);
+    } catch (error) {
+        console.error('Error loading starred papers:', error);
+    }
+}
+
+// Toggle starred section
+function toggleStarredSection() {
+    const content = document.getElementById('starredContent');
+    const toggle = document.getElementById('starredToggle');
+    
+    if (content.style.display === 'none') {
+        content.style.display = 'block';
+        toggle.textContent = '▲';
+    } else {
+        content.style.display = 'none';
+        toggle.textContent = '▼';
+    }
+}
+
+// Check for updates (new papers or completed analysis)
+async function checkForUpdates() {
+    try {
+        const response = await fetch(`${API_BASE}/stats`);
+        const stats = await response.json();
+        
+        // Initialize on first check
+        if (lastPaperCount === 0) {
+            lastPaperCount = stats.total_papers;
+            lastAnalyzedCount = stats.analyzed_papers;
+            return;
+        }
+        
+        // Check if there are updates
+        const hasNewPapers = stats.total_papers > lastPaperCount;
+        const hasNewAnalysis = stats.analyzed_papers > lastAnalyzedCount;
+        
+        if (hasNewPapers || hasNewAnalysis) {
+            showUpdateNotification();
+            lastPaperCount = stats.total_papers;
+            lastAnalyzedCount = stats.analyzed_papers;
+        }
+    } catch (error) {
+        console.error('Error checking for updates:', error);
+    }
+}
+
+// Show update notification
+function showUpdateNotification() {
+    const notification = document.getElementById('updateNotification');
+    if (notification) {
+        notification.style.display = 'flex';
+    }
+}
+
+// Dismiss update notification
+function dismissUpdate() {
+    const notification = document.getElementById('updateNotification');
+    if (notification) {
+        notification.style.display = 'none';
+    }
+}
+
+// Refresh papers (triggered by update notification)
+function refreshPapers() {
+    dismissUpdate();
+    currentPage = 0;
+    loadPapers();
 }
 
