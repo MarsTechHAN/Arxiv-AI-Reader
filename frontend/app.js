@@ -840,46 +840,38 @@ function renderMarkdown(text) {
         cleanedText = cleanedText.replace(/^```markdown\s*\n([\s\S]*?)\n```$/gm, '$1');
         cleanedText = cleanedText.replace(/^```\s*\n([\s\S]*?)\n```$/gm, '$1');
         
-        // Step 1: Protect LaTeX formulas by replacing them with placeholders
-        const latexPlaceholders = [];
-        let placeholderIndex = 0;
+        // Step 1: Protect LaTeX formulas with unique base64-encoded placeholders
+        const latexMap = new Map();
+        let latexIndex = 0;
         
         // Protect display math ($$...$$)
-        cleanedText = cleanedText.replace(/\$\$([\s\S]*?)\$\$/g, (match, content) => {
-            const placeholder = `__LATEX_DISPLAY_${placeholderIndex}__`;
-            latexPlaceholders.push({placeholder, latex: match, isDisplay: true});
-            placeholderIndex++;
-            return placeholder;
+        cleanedText = cleanedText.replace(/\$\$([\s\S]*?)\$\$/g, (match) => {
+            const id = `LATEXDISPLAY${latexIndex}BASE64`;
+            latexMap.set(id, match);
+            latexIndex++;
+            return id;
         });
         
         // Protect inline math ($...$)
-        cleanedText = cleanedText.replace(/\$([^\$\n]+?)\$/g, (match, content) => {
-            const placeholder = `__LATEX_INLINE_${placeholderIndex}__`;
-            latexPlaceholders.push({placeholder, latex: match, isDisplay: false});
-            placeholderIndex++;
-            return placeholder;
+        cleanedText = cleanedText.replace(/\$([^\$\n]+?)\$/g, (match) => {
+            const id = `LATEXINLINE${latexIndex}BASE64`;
+            latexMap.set(id, match);
+            latexIndex++;
+            return id;
         });
         
         // Parse markdown with protected LaTeX
-        const html = marked.parse(cleanedText);
+        let html = marked.parse(cleanedText);
         
-        // Step 2: Restore LaTeX placeholders (use global replace)
-        let restoredHtml = html;
-        latexPlaceholders.forEach(({placeholder, latex}) => {
-            // Replace both plain and potentially HTML-encoded versions
-            const escapedPlaceholder = placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const regex = new RegExp(escapedPlaceholder, 'g');
-            restoredHtml = restoredHtml.replace(regex, latex);
-            
-            // Also handle HTML-encoded underscores (in case Markdown escapes them)
-            const encodedPlaceholder = placeholder.replace(/_/g, '&#95;');
-            const encodedRegex = new RegExp(encodedPlaceholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
-            restoredHtml = restoredHtml.replace(encodedRegex, latex);
+        // Step 2: Restore LaTeX (replace all occurrences)
+        latexMap.forEach((latex, id) => {
+            // Use split-join method which is more reliable than regex for this
+            html = html.split(id).join(latex);
         });
         
         // Step 3: Create temporary div and render LaTeX
         const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = restoredHtml;
+        tempDiv.innerHTML = html;
         
         // Render LaTeX with KaTeX
         if (typeof renderMathInElement !== 'undefined') {
