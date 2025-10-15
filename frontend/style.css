@@ -1027,6 +1027,8 @@ body {
     padding: 12px 16px;
     text-align: left;
     border: 1px solid var(--border);
+    vertical-align: top;
+    line-height: 1.8;
 }
 
 .markdown-content table th {
@@ -1034,6 +1036,17 @@ body {
     font-weight: 600;
     color: var(--primary);
     border-bottom: 2px solid var(--primary);
+}
+
+/* LaTeX in tables */
+.markdown-content table .katex {
+    font-size: 1em;
+    white-space: normal;
+}
+
+.markdown-content table .katex-display {
+    margin: 8px 0;
+    text-align: left;
 }
 
 .markdown-content table tr:hover {
@@ -1071,12 +1084,23 @@ body {
 /* KaTeX (LaTeX) styling */
 .markdown-content .katex {
     font-size: 1.1em;
+    word-wrap: break-word;
 }
 
 .markdown-content .katex-display {
     margin: 16px 0;
     overflow-x: auto;
     overflow-y: hidden;
+    padding: 8px 0;
+}
+
+/* Prevent LaTeX from breaking layout */
+.markdown-content .katex-html {
+    white-space: normal;
+}
+
+.markdown-content .katex .base {
+    white-space: normal;
 }
 
 /* PDF Viewer */

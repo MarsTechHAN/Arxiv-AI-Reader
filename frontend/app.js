@@ -819,12 +819,38 @@ function renderMarkdown(text) {
         cleanedText = cleanedText.replace(/^```markdown\s*\n([\s\S]*?)\n```$/gm, '$1');
         cleanedText = cleanedText.replace(/^```\s*\n([\s\S]*?)\n```$/gm, '$1');
         
-        // Parse markdown
+        // Step 1: Protect LaTeX formulas by replacing them with placeholders
+        const latexPlaceholders = [];
+        let placeholderIndex = 0;
+        
+        // Protect display math ($$...$$)
+        cleanedText = cleanedText.replace(/\$\$([\s\S]*?)\$\$/g, (match, content) => {
+            const placeholder = `__LATEX_DISPLAY_${placeholderIndex}__`;
+            latexPlaceholders.push({placeholder, latex: match, isDisplay: true});
+            placeholderIndex++;
+            return placeholder;
+        });
+        
+        // Protect inline math ($...$)
+        cleanedText = cleanedText.replace(/\$([^\$\n]+?)\$/g, (match, content) => {
+            const placeholder = `__LATEX_INLINE_${placeholderIndex}__`;
+            latexPlaceholders.push({placeholder, latex: match, isDisplay: false});
+            placeholderIndex++;
+            return placeholder;
+        });
+        
+        // Parse markdown with protected LaTeX
         const html = marked.parse(cleanedText);
         
-        // Create temporary div to render LaTeX
+        // Step 2: Restore LaTeX placeholders
+        let restoredHtml = html;
+        latexPlaceholders.forEach(({placeholder, latex}) => {
+            restoredHtml = restoredHtml.replace(placeholder, latex);
+        });
+        
+        // Step 3: Create temporary div and render LaTeX
         const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = html;
+        tempDiv.innerHTML = restoredHtml;
         
         // Render LaTeX with KaTeX
         if (typeof renderMathInElement !== 'undefined') {
@@ -836,7 +862,8 @@ function renderMarkdown(text) {
                     {left: '\\(', right: '\\)', display: false}
                 ],
                 throwOnError: false,
-                errorColor: '#cc0000'
+                errorColor: '#cc0000',
+                strict: false
             });
         }
         
