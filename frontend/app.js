@@ -325,6 +325,12 @@ function createPaperCard(paper) {
     const card = document.createElement('div');
     card.className = `paper-card ${paper.is_relevant ? 'relevant' : paper.is_relevant === false ? 'not-relevant' : ''}`;
     
+    // Add click event to entire card
+    card.style.cursor = 'pointer';
+    card.addEventListener('click', () => {
+        openPaperModal(paper.id);
+    });
+    
     // Format date
     let dateStr = '';
     if (paper.published_date) {
@@ -369,7 +375,7 @@ function createPaperCard(paper) {
         <div class="paper-header">
             <div style="flex: 1;">
                 ${dateStr ? `<p class="paper-date">📅 ${dateStr}</p>` : ''}
-                <h3 class="paper-title" onclick="openPaperModal('${paper.id}')" style="cursor: pointer;">${escapeHtml(paper.title || '无标题')}</h3>
+                <h3 class="paper-title">${escapeHtml(paper.title || '无标题')}</h3>
                 <p class="paper-authors">${authorsText}</p>
             </div>
             <div class="paper-badges" style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
@@ -411,12 +417,6 @@ async function openPaperModal(paperId) {
     try {
         const response = await fetch(`${API_BASE}/papers/${paperId}`);
         const paper = await response.json();
-        
-        // Reset scroll to top when opening modal
-        const modalBody = paperModal.querySelector('.modal-body');
-        if (modalBody) {
-            modalBody.scrollTop = 0;
-        }
         
         document.getElementById('paperTitle').textContent = paper.title;
         
@@ -507,6 +507,14 @@ async function openPaperModal(paperId) {
         }
         
         paperModal.classList.add('active');
+        
+        // Reset scroll to top after modal is active
+        setTimeout(() => {
+            const modalBody = paperModal.querySelector('.modal-body');
+            if (modalBody) {
+                modalBody.scrollTop = 0;
+            }
+        }, 0);
     } catch (error) {
         console.error('Error loading paper:', error);
         showError('Failed to load paper details');

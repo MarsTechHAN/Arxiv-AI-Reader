@@ -413,9 +413,7 @@ body {
 
 /* Share button - smaller size */
 #shareBtn {
-    width: 30px;
-    height: 30px;
-    font-size: 18px;
+    font-size: 33px;
 }
 
 .close {
