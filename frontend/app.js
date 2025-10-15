@@ -507,6 +507,7 @@ async function openPaperModal(paperId) {
         }
         
         paperModal.classList.add('active');
+        document.body.classList.add('modal-open');
         
         // Reset scroll to top after modal is active
         setTimeout(() => {
@@ -702,6 +703,7 @@ async function loadStats() {
 // Utilities
 function closeModal(modal) {
     modal.classList.remove('active');
+    document.body.classList.remove('modal-open');
 }
 
 function showLoading(show) {
