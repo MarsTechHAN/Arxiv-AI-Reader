@@ -742,22 +742,43 @@ async function toggleStar(paperId) {
                     }
                 }
                 
-                // If starred, remove from timeline (will appear in starred section on next refresh)
-                // If unstarred, keep it visible
+                // If starred, remove from timeline (will appear in starred section)
                 if (isStarred) {
                     card.style.transition = 'opacity 0.3s ease-out';
                     card.style.opacity = '0';
                     setTimeout(() => {
                         card.remove();
-                        // Refresh starred section only
+                        // Refresh starred section
                         refreshStarredSection();
                     }, 300);
+                } else {
+                    // If unstarred, also refresh starred section to remove it
+                    refreshStarredSection();
                 }
                 break;
             }
         }
+        
+        // Also update starred items in the starred section
+        updateStarredItemButton(paperId, isStarred);
+        
     } catch (error) {
         console.error('Error toggling star:', error);
+    }
+}
+
+// Update star button in starred section (if viewing from there)
+function updateStarredItemButton(paperId, isStarred) {
+    // If we're in the starred section and unstar, remove the item
+    if (!isStarred) {
+        const starredItems = document.querySelectorAll('.starred-item');
+        starredItems.forEach(item => {
+            if (item.getAttribute('onclick')?.includes(paperId)) {
+                item.style.transition = 'opacity 0.3s ease-out';
+                item.style.opacity = '0';
+                setTimeout(() => item.remove(), 300);
+            }
+        });
     }
 }
 
@@ -842,10 +863,18 @@ function renderMarkdown(text) {
         // Parse markdown with protected LaTeX
         const html = marked.parse(cleanedText);
         
-        // Step 2: Restore LaTeX placeholders
+        // Step 2: Restore LaTeX placeholders (use global replace)
         let restoredHtml = html;
         latexPlaceholders.forEach(({placeholder, latex}) => {
-            restoredHtml = restoredHtml.replace(placeholder, latex);
+            // Replace both plain and potentially HTML-encoded versions
+            const escapedPlaceholder = placeholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const regex = new RegExp(escapedPlaceholder, 'g');
+            restoredHtml = restoredHtml.replace(regex, latex);
+            
+            // Also handle HTML-encoded underscores (in case Markdown escapes them)
+            const encodedPlaceholder = placeholder.replace(/_/g, '&#95;');
+            const encodedRegex = new RegExp(encodedPlaceholder.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+            restoredHtml = restoredHtml.replace(encodedRegex, latex);
         });
         
         // Step 3: Create temporary div and render LaTeX
