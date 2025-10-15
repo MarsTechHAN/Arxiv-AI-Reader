@@ -27,6 +27,9 @@ const statsEl = document.getElementById('stats');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
+    // Restore search state from URL or sessionStorage
+    restoreSearchState();
+    
     loadPapers();
     loadStats();
     setupEventListeners();
@@ -177,6 +180,8 @@ function setupEventListeners() {
             // Clear keyword filter
             currentKeyword = null;
             clearKeywordBtn.style.display = 'none';
+            // Clear search state
+            clearSearchState();
             // Reset to first page
             currentPage = 0;
             // Reload papers
@@ -214,6 +219,11 @@ function setupInfiniteScroll() {
 // Load Papers
 async function loadPapers(page = 0, shouldScroll = true) {
     showLoading(true);
+    
+    // Clear search state when loading normal papers list
+    if (page === 0) {
+        clearSearchState();
+    }
     
     try {
         let url = `${API_BASE}/papers?skip=${page * 20}&limit=20&sort_by=${currentSortBy}`;
@@ -253,7 +263,10 @@ async function loadPapers(page = 0, shouldScroll = true) {
             hasMorePapers = false;
         }
         
-        papers.forEach(paper => {
+        // Filter out starred papers (they're shown in the starred section)
+        const nonStarredPapers = papers.filter(p => !p.is_starred);
+        
+        nonStarredPapers.forEach(paper => {
             timeline.appendChild(createPaperCard(paper));
         });
         
@@ -277,6 +290,9 @@ async function searchPapers(query) {
     currentPage = 0;  // Reset page
     hasMorePapers = false;  // Disable infinite scroll for search results
     hideEndMarker();
+    
+    // Save search state
+    saveSearchState(query);
     
     try {
         const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50`);
@@ -429,7 +445,17 @@ async function openPaperModal(paperId) {
             
             <div class="detail-section">
                 <h3>链接</h3>
-                <p><a href="${paper.url}" target="_blank" style="color: var(--primary);">${paper.url}</a></p>
+                <div class="paper-links">
+                    <a href="${getPdfUrl(paper.url)}" target="_blank" class="btn btn-primary" style="display: inline-block; margin-right: 12px;">
+                        📄 下载 PDF
+                    </a>
+                    <button onclick="togglePdfViewer('${escapeHtml(paper.id)}')" class="btn btn-secondary">
+                        👁️ 在线预览
+                    </button>
+                </div>
+                <div id="pdfViewerContainer" class="pdf-viewer-container" style="display: none;">
+                    <iframe id="pdfViewer" src="" frameborder="0"></iframe>
+                </div>
             </div>
             
             ${paper.extracted_keywords && paper.extracted_keywords.length > 0 ? `
@@ -458,6 +484,14 @@ async function openPaperModal(paperId) {
         
         document.getElementById('qaList').innerHTML = qaHtml;
         document.getElementById('askInput').value = '';
+        
+        // Reset PDF viewer
+        const pdfContainer = document.getElementById('pdfViewerContainer');
+        const pdfViewer = document.getElementById('pdfViewer');
+        if (pdfContainer && pdfViewer) {
+            pdfContainer.style.display = 'none';
+            pdfViewer.src = '';
+        }
         
         // Show relevance editor for non-relevant papers
         const relevanceEditor = document.getElementById('relevanceEditor');
@@ -686,15 +720,60 @@ function filterByKeyword(keyword) {
 // Toggle star
 async function toggleStar(paperId) {
     try {
-        await fetch(`${API_BASE}/papers/${paperId}/star`, {
+        const response = await fetch(`${API_BASE}/papers/${paperId}/star`, {
             method: 'POST'
         });
+        const result = await response.json();
+        const isStarred = result.is_starred;
         
-        // Reload papers to show updated state (without scrolling)
-        currentPage = 0;
-        loadPapers(0, false);  // false = don't scroll
+        // Update UI: find all star buttons for this paper and toggle them
+        const cards = document.querySelectorAll('.paper-card');
+        for (const card of cards) {
+            const titleEl = card.querySelector('.paper-title');
+            if (titleEl && titleEl.getAttribute('onclick')?.includes(paperId)) {
+                const starBtn = card.querySelector('button[onclick*="toggleStar"]');
+                if (starBtn) {
+                    if (isStarred) {
+                        starBtn.classList.add('starred');
+                        starBtn.innerHTML = '★ Stared';
+                    } else {
+                        starBtn.classList.remove('starred');
+                        starBtn.innerHTML = '☆ Star';
+                    }
+                }
+                
+                // If starred, remove from timeline (will appear in starred section on next refresh)
+                // If unstarred, keep it visible
+                if (isStarred) {
+                    card.style.transition = 'opacity 0.3s ease-out';
+                    card.style.opacity = '0';
+                    setTimeout(() => {
+                        card.remove();
+                        // Refresh starred section only
+                        refreshStarredSection();
+                    }, 300);
+                }
+                break;
+            }
+        }
     } catch (error) {
         console.error('Error toggling star:', error);
+    }
+}
+
+// Refresh only the starred section (without reloading timeline)
+async function refreshStarredSection() {
+    try {
+        // Remove existing starred section
+        const existingSection = document.querySelector('.starred-section');
+        if (existingSection) {
+            existingSection.remove();
+        }
+        
+        // Re-add starred section at the top of timeline
+        await addStarredPapersSection();
+    } catch (error) {
+        console.error('Error refreshing starred section:', error);
     }
 }
 
@@ -864,18 +943,23 @@ async function addStarredPapersSection() {
         
         if (starredPapers.length === 0) return;
         
-        // Create collapsible section
+        // Create collapsible section (collapsed by default)
         const section = document.createElement('div');
         section.className = 'starred-section';
         section.innerHTML = `
             <div class="starred-header" onclick="toggleStarredSection()">
                 <h3>⭐ 收藏的论文 (${starredPapers.length})</h3>
-                <span class="toggle-icon" id="starredToggle">▼</span>
+                <span class="toggle-icon" id="starredToggle">▶</span>
             </div>
             <div class="starred-content" id="starredContent" style="display: none;">
                 ${starredPapers.map(paper => `
                     <div class="starred-item" onclick="openPaperModal('${paper.id}')">
-                        <span class="starred-title">${escapeHtml(paper.title)}</span>
+                        <div class="starred-item-content">
+                            <div class="starred-title">${escapeHtml(paper.title)}</div>
+                            ${paper.one_line_summary ? `
+                                <div class="starred-summary">${escapeHtml(paper.one_line_summary)}</div>
+                            ` : ''}
+                        </div>
                         <span class="starred-score">${paper.relevance_score}/10</span>
                     </div>
                 `).join('')}
@@ -895,10 +979,10 @@ function toggleStarredSection() {
     
     if (content.style.display === 'none') {
         content.style.display = 'block';
-        toggle.textContent = '▲';
+        toggle.textContent = '▼';
     } else {
         content.style.display = 'none';
-        toggle.textContent = '▼';
+        toggle.textContent = '▶';
     }
 }
 
@@ -949,6 +1033,72 @@ function dismissUpdate() {
 function refreshPapers() {
     dismissUpdate();
     currentPage = 0;
-    loadPapers();
+    
+    // Check if there's a search query
+    const searchQuery = searchInput.value.trim();
+    if (searchQuery) {
+        searchPapers(searchQuery);
+    } else {
+        loadPapers();
+    }
+}
+
+// Save search state to sessionStorage
+function saveSearchState(query) {
+    if (query) {
+        sessionStorage.setItem('arxiv_search_query', query);
+    } else {
+        sessionStorage.removeItem('arxiv_search_query');
+    }
+}
+
+// Clear search state
+function clearSearchState() {
+    sessionStorage.removeItem('arxiv_search_query');
+}
+
+// Restore search state on page load
+function restoreSearchState() {
+    const savedQuery = sessionStorage.getItem('arxiv_search_query');
+    if (savedQuery && searchInput) {
+        searchInput.value = savedQuery;
+        // Don't auto-trigger search on restore, let user decide
+    }
+}
+
+// Convert arXiv abstract URL to PDF URL
+function getPdfUrl(url) {
+    if (!url) return '';
+    
+    // Convert http://arxiv.org/abs/XXXX to http://arxiv.org/pdf/XXXX.pdf
+    if (url.includes('arxiv.org/abs/')) {
+        return url.replace('/abs/', '/pdf/') + '.pdf';
+    }
+    
+    return url;
+}
+
+// Toggle PDF viewer
+function togglePdfViewer(paperId) {
+    const container = document.getElementById('pdfViewerContainer');
+    const viewer = document.getElementById('pdfViewer');
+    
+    if (container.style.display === 'none') {
+        // Get paper URL and convert to PDF
+        fetch(`${API_BASE}/papers/${paperId}`)
+            .then(res => res.json())
+            .then(paper => {
+                const pdfUrl = getPdfUrl(paper.url);
+                viewer.src = pdfUrl;
+                container.style.display = 'block';
+            })
+            .catch(err => {
+                console.error('Error loading PDF:', err);
+                showError('无法加载 PDF');
+            });
+    } else {
+        container.style.display = 'none';
+        viewer.src = ''; // Clear iframe to stop loading
+    }
 }
 
