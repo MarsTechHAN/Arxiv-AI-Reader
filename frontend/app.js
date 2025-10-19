@@ -263,10 +263,8 @@ async function loadPapers(page = 0, shouldScroll = true) {
             hasMorePapers = false;
         }
         
-        // Filter out starred papers (they're shown in the starred section)
-        const nonStarredPapers = papers.filter(p => !p.is_starred);
-        
-        nonStarredPapers.forEach(paper => {
+        // Add papers to timeline (API already excludes starred papers)
+        papers.forEach(paper => {
             timeline.appendChild(createPaperCard(paper));
         });
         
@@ -324,6 +322,7 @@ async function searchPapers(query) {
 function createPaperCard(paper) {
     const card = document.createElement('div');
     card.className = `paper-card ${paper.is_relevant ? 'relevant' : paper.is_relevant === false ? 'not-relevant' : ''}`;
+    card.setAttribute('data-paper-id', paper.id);  // Add paper ID for easy lookup
     
     // Add click event to entire card
     card.style.cursor = 'pointer';
@@ -736,36 +735,32 @@ async function toggleStar(paperId) {
         const result = await response.json();
         const isStarred = result.is_starred;
         
-        // Update UI: find all star buttons for this paper and toggle them
-        const cards = document.querySelectorAll('.paper-card');
-        for (const card of cards) {
-            const titleEl = card.querySelector('.paper-title');
-            if (titleEl && titleEl.getAttribute('onclick')?.includes(paperId)) {
-                const starBtn = card.querySelector('button[onclick*="toggleStar"]');
-                if (starBtn) {
-                    if (isStarred) {
-                        starBtn.classList.add('starred');
-                        starBtn.innerHTML = '★ Stared';
-                    } else {
-                        starBtn.classList.remove('starred');
-                        starBtn.innerHTML = '☆ Star';
-                    }
-                }
-                
-                // If starred, remove from timeline (will appear in starred section)
+        // Update UI: find card by data-paper-id attribute
+        const card = document.querySelector(`.paper-card[data-paper-id="${paperId}"]`);
+        if (card) {
+            const starBtn = card.querySelector('button[onclick*="toggleStar"]');
+            if (starBtn) {
                 if (isStarred) {
-                    card.style.transition = 'opacity 0.3s ease-out';
-                    card.style.opacity = '0';
-                    setTimeout(() => {
-                        card.remove();
-                        // Refresh starred section
-                        refreshStarredSection();
-                    }, 300);
+                    starBtn.classList.add('starred');
+                    starBtn.innerHTML = '★ Stared';
                 } else {
-                    // If unstarred, also refresh starred section to remove it
-                    refreshStarredSection();
+                    starBtn.classList.remove('starred');
+                    starBtn.innerHTML = '☆ Star';
                 }
-                break;
+            }
+            
+            // If starred, remove from timeline (will appear in starred section)
+            if (isStarred) {
+                card.style.transition = 'opacity 0.3s ease-out';
+                card.style.opacity = '0';
+                setTimeout(() => {
+                    card.remove();
+                    // Refresh starred section
+                    refreshStarredSection();
+                }, 300);
+            } else {
+                // If unstarred, also refresh starred section to remove it
+                refreshStarredSection();
             }
         }
         
@@ -781,14 +776,12 @@ async function toggleStar(paperId) {
 function updateStarredItemButton(paperId, isStarred) {
     // If we're in the starred section and unstar, remove the item
     if (!isStarred) {
-        const starredItems = document.querySelectorAll('.starred-item');
-        starredItems.forEach(item => {
-            if (item.getAttribute('onclick')?.includes(paperId)) {
-                item.style.transition = 'opacity 0.3s ease-out';
-                item.style.opacity = '0';
-                setTimeout(() => item.remove(), 300);
-            }
-        });
+        const starredItem = document.querySelector(`.starred-item[data-paper-id="${paperId}"]`);
+        if (starredItem) {
+            starredItem.style.transition = 'opacity 0.3s ease-out';
+            starredItem.style.opacity = '0';
+            setTimeout(() => starredItem.remove(), 300);
+        }
     }
 }
 
@@ -815,16 +808,20 @@ async function hidePaper(paperId) {
             method: 'POST'
         });
         
-        // Remove from timeline with smooth fade out
-        const cards = timeline.querySelectorAll('.paper-card');
-        for (const card of cards) {
-            const titleEl = card.querySelector('.paper-title');
-            if (titleEl && titleEl.getAttribute('onclick')?.includes(paperId)) {
-                card.style.transition = 'opacity 0.3s ease-out';
-                card.style.opacity = '0';
-                setTimeout(() => card.remove(), 300);
-                break;
-            }
+        // Remove from timeline with smooth fade out using data-paper-id
+        const card = document.querySelector(`.paper-card[data-paper-id="${paperId}"]`);
+        if (card) {
+            card.style.transition = 'opacity 0.3s ease-out';
+            card.style.opacity = '0';
+            setTimeout(() => card.remove(), 300);
+        }
+        
+        // Also remove from starred section if present
+        const starredItem = document.querySelector(`.starred-item[data-paper-id="${paperId}"]`);
+        if (starredItem) {
+            starredItem.style.transition = 'opacity 0.3s ease-out';
+            starredItem.style.opacity = '0';
+            setTimeout(() => starredItem.remove(), 300);
         }
     } catch (error) {
         console.error('Error hiding paper:', error);
@@ -1020,10 +1017,9 @@ function checkDeepLink() {
 // Add starred papers collapsible section
 async function addStarredPapersSection() {
     try {
-        // Fetch all starred papers
-        const response = await fetch(`${API_BASE}/papers?skip=0&limit=1000&sort_by=starred`);
-        const allPapers = await response.json();
-        const starredPapers = allPapers.filter(p => p.is_starred);
+        // Fetch only starred papers (optimized request)
+        const response = await fetch(`${API_BASE}/papers?skip=0&limit=100&starred_only=true`);
+        const starredPapers = await response.json();
         
         if (starredPapers.length === 0) return;
         
@@ -1037,7 +1033,7 @@ async function addStarredPapersSection() {
             </div>
             <div class="starred-content" id="starredContent" style="display: none;">
                 ${starredPapers.map(paper => `
-                    <div class="starred-item" onclick="openPaperModal('${paper.id}')">
+                    <div class="starred-item" data-paper-id="${paper.id}" onclick="openPaperModal('${paper.id}')">
                         <div class="starred-item-content">
                             <div class="starred-title">${escapeHtml(paper.title)}</div>
                             ${paper.one_line_summary ? `

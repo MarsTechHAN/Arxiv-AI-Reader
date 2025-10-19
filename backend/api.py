@@ -14,6 +14,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -76,6 +77,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# GZip compression for all responses (reduce bandwidth usage)
+app.add_middleware(GZipMiddleware, minimum_size=256)
+
 # Global instances
 fetcher = ArxivFetcher()
 analyzer = DeepSeekAnalyzer()
@@ -122,36 +126,40 @@ async def health_check():
 
 
 @app.get("/papers", response_model=List[dict])
-async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None):
+async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: bool = False):
     """
     List papers for timeline.
-    sort_by: 'relevance' (default), 'latest', 'starred'
+    sort_by: 'relevance' (default), 'latest'
     keyword: filter by keyword
+    starred_only: if True, only return starred papers; if False, exclude starred papers from results
     """
     papers = fetcher.list_papers(skip=0, limit=1000)  # Load all first
+    
+    # Filter out hidden papers first
+    papers = [p for p in papers if not p.is_hidden]
+    
+    # Filter by starred status
+    if starred_only:
+        papers = [p for p in papers if p.is_starred]
+    else:
+        # For normal timeline, exclude starred papers (they're shown separately)
+        papers = [p for p in papers if not p.is_starred]
     
     # Filter by keyword if provided
     if keyword:
         papers = [p for p in papers if keyword.lower() in ' '.join(p.extracted_keywords).lower()]
     
-    # Filter out hidden papers
-    papers = [p for p in papers if not p.is_hidden]
-    
-    # Sort with priority: Starred > Has deep analysis > Relevance score
+    # Sort by relevance or latest
     if sort_by == "relevance":
         # Multi-level sorting: 
-        # 1. Starred first (True > False)
-        # 2. Has deep analysis (True > False) 
-        # 3. Relevance score (high > low)
+        # 1. Has deep analysis (True > False) 
+        # 2. Relevance score (high > low)
         papers.sort(key=lambda p: (
-            p.is_starred,
             bool(p.detailed_summary and p.detailed_summary.strip()),  # Has deep analysis
             p.relevance_score
         ), reverse=True)
     elif sort_by == "latest":
         papers.sort(key=lambda p: p.published_date or p.created_at, reverse=True)
-    elif sort_by == "starred":
-        papers.sort(key=lambda p: (p.is_starred, p.relevance_score), reverse=True)
     
     # Paginate
     papers = papers[skip:skip + limit]
@@ -264,6 +272,7 @@ async def get_config():
 async def update_config(request: UpdateConfigRequest):
     """Update configuration"""
     config = Config.load(config_path)
+    old_negative_keywords = set(config.negative_keywords or [])
     
     if request.filter_keywords is not None:
         config.filter_keywords = request.filter_keywords
@@ -275,6 +284,16 @@ async def update_config(request: UpdateConfigRequest):
         config.system_prompt = request.system_prompt
     
     config.save(config_path)
+    
+    # Check if negative keywords changed
+    new_negative_keywords = set(config.negative_keywords or [])
+    if new_negative_keywords != old_negative_keywords:
+        # Trigger background task to recheck papers with new negative keywords
+        asyncio.create_task(recheck_negative_keywords(config, new_negative_keywords))
+        return {
+            "message": "Config updated. Re-checking papers with new negative keywords in background...",
+            "config": config.to_dict()
+        }
     
     return {"message": "Config updated", "config": config.to_dict()}
 
@@ -473,6 +492,53 @@ async def get_stats():
 
 
 # ============ Background Tasks ============
+
+async def recheck_negative_keywords(config: Config, negative_keywords: set):
+    """
+    Re-check papers with new negative keywords.
+    Update papers that match new negative keywords to be marked as not relevant.
+    Only check papers with relevance_score >= min_relevance_score_for_stage2.
+    """
+    try:
+        min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+        all_papers = fetcher.list_papers(limit=10000)
+        
+        # Filter papers: is_relevant=True and score >= threshold
+        relevant_papers = [
+            p for p in all_papers 
+            if p.is_relevant is True and p.relevance_score >= min_score
+        ]
+        
+        if not relevant_papers:
+            print("✓ No papers to recheck")
+            return
+        
+        print(f"\n🔍 Rechecking {len(relevant_papers)} papers with new negative keywords: {negative_keywords}")
+        
+        updated_count = 0
+        for paper in relevant_papers:
+            # Check if paper matches any negative keyword
+            searchable_text = f"{paper.title} {paper.preview_text}".lower()
+            
+            for neg_kw in negative_keywords:
+                if neg_kw.lower() in searchable_text:
+                    # Update paper to not relevant
+                    paper.is_relevant = False
+                    paper.relevance_score = 1.0
+                    paper.extracted_keywords = [f"❌ {neg_kw}"] + paper.extracted_keywords
+                    paper.one_line_summary = f"论文包含负面关键词「{neg_kw}」，自动标记为不相关"
+                    fetcher.save_paper(paper)
+                    updated_count += 1
+                    print(f"  ✗ Updated {paper.id}: matched negative keyword '{neg_kw}'")
+                    break  # Only need to match one negative keyword
+        
+        print(f"✓ Recheck complete: {updated_count} papers updated to not relevant")
+    
+    except Exception as e:
+        print(f"✗ Error rechecking negative keywords: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 async def check_pending_deep_analysis():
     """
