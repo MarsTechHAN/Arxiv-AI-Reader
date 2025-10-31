@@ -258,7 +258,10 @@ class ArxivFetcher:
             return Paper.from_dict(json.load(f))
     
     def list_papers(self, skip: int = 0, limit: int = 20) -> List[Paper]:
-        """List papers with pagination"""
+        """
+        List papers with pagination.
+        If limit is None or <= 0, load all papers.
+        """
         paper_files = sorted(
             self.data_dir.glob("*.json"),
             key=lambda p: p.stat().st_mtime,
@@ -266,9 +269,20 @@ class ArxivFetcher:
         )
         
         papers = []
-        for file_path in paper_files[skip:skip + limit]:
-            with open(file_path) as f:
-                papers.append(Paper.from_dict(json.load(f)))
+        
+        # If limit is None or <= 0, load all papers
+        if limit is None or limit <= 0:
+            file_range = paper_files[skip:]
+        else:
+            file_range = paper_files[skip:skip + limit]
+        
+        for file_path in file_range:
+            try:
+                with open(file_path) as f:
+                    papers.append(Paper.from_dict(json.load(f)))
+            except Exception as e:
+                print(f"Warning: Failed to load paper {file_path.name}: {e}")
+                continue
         
         return papers
 

@@ -150,13 +150,20 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
     keyword: filter by keyword
     starred_only: 'true' to return only starred papers, 'false' to exclude starred papers
     """
-    papers = fetcher.list_papers(skip=0, limit=1000)  # Load all first
+    # When loading starred papers, we need ALL papers, not just the latest 1000
+    # Otherwise old starred papers might be missed
+    starred_only_bool = starred_only.lower() == 'true'
+    if starred_only_bool:
+        # Load all papers when fetching starred papers
+        papers = fetcher.list_papers(skip=0, limit=0)  # limit=0 means load all
+    else:
+        # For normal timeline, only load recent papers
+        papers = fetcher.list_papers(skip=0, limit=1000)
     
     # Filter out hidden papers first
     papers = [p for p in papers if not p.is_hidden]
     
-    # Filter by starred status (handle string 'true'/'false' from query param)
-    starred_only_bool = starred_only.lower() == 'true'
+    # Filter by starred status
     if starred_only_bool:
         papers = [p for p in papers if p.is_starred]
     else:
