@@ -120,10 +120,10 @@ function setupEventListeners() {
         });
     }
     
-    // Ask question
+    // Ask question (main input)
     document.getElementById('askInput').addEventListener('keypress', (e) => {
         if (e.key === 'Enter' && e.target.value.trim()) {
-            askQuestion(currentPaperId, e.target.value.trim());
+            askQuestion(currentPaperId, e.target.value.trim(), null);  // null = new question, not follow-up
         }
     });
     
@@ -547,6 +547,9 @@ async function askQuestion(paperId, question, parentQaId = null) {
     // Check if it's reasoning mode
     const isReasoning = question.toLowerCase().startsWith('think:');
     
+    // Calculate the index for this new QA item (will be added at the end)
+    const currentQaIndex = qaList.children.length;
+    
     // Create placeholder Q&A item
     const qaItem = document.createElement('div');
     qaItem.className = 'qa-item';
@@ -563,7 +566,7 @@ async function askQuestion(paperId, question, parentQaId = null) {
         ` : ''}
         <div class="qa-answer markdown-content streaming-answer"></div>
         <div class="qa-actions">
-            <button class="btn-follow-up" onclick="startFollowUp(event, ${parentQaId !== null ? parentQaId : 'qaList.children.length - 1'})">
+            <button class="btn-follow-up" onclick="startFollowUp(event, ${currentQaIndex})">
                 ↩️ Follow-up
             </button>
         </div>
@@ -642,6 +645,10 @@ async function askQuestion(paperId, question, parentQaId = null) {
                         } else if (data.type === 'content' && data.chunk) {
                             fullAnswer += data.chunk;
                             updateDisplay();
+                        } else if (data.type === 'error' && data.chunk) {
+                            // Display error/retry messages inline
+                            fullAnswer += data.chunk;
+                            updateDisplay(true);  // Force immediate update for errors
                         } else if (data.done) {
                             // Finalize - remove cursors
                             if (thinkingDiv && fullThinking) {
@@ -657,6 +664,7 @@ async function askQuestion(paperId, question, parentQaId = null) {
                                 answerDiv.classList.remove('streaming-answer');
                             }
                         } else if (data.error) {
+                            // Legacy error format
                             answerDiv.innerHTML = `<span style="color: var(--danger);">Error: ${escapeHtml(data.error)}</span>`;
                         }
                     } catch (e) {

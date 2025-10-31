@@ -11,6 +11,7 @@ from typing import List, Optional
 import json
 import os
 from pathlib import Path
+import time
 
 from models import Paper, QAPair, Config
 
@@ -41,6 +42,9 @@ class DeepSeekAnalyzer:
         Stage 1: Quick filter.
         Determines if paper is relevant based on keywords.
         First checks negative keywords - if matched, score=1 (irrelevant).
+        
+        Retry logic: Up to 3 attempts with exponential backoff.
+        Failed records are NOT saved.
         """
         # Check negative keywords first (fast path for rejection)
         if config.negative_keywords:
@@ -73,34 +77,46 @@ class DeepSeekAnalyzer:
 }}
 """
         
-        try:
-            response = await self.client.chat.completions.create(
-                model=config.model,
-                messages=[
-                    {"role": "system", "content": config.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=config.temperature,
-                max_tokens=500,
-                response_format={"type": "json_object"}
-            )
+        # Retry logic: up to 3 attempts
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=config.model,
+                    messages=[
+                        {"role": "system", "content": config.system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=config.temperature,
+                    max_tokens=500,
+                    response_format={"type": "json_object"}
+                )
+                
+                result = json.loads(response.choices[0].message.content)
+                
+                paper.is_relevant = result.get("is_relevant", False)
+                paper.relevance_score = float(result.get("relevance_score", 0))
+                paper.extracted_keywords = result.get("extracted_keywords", [])
+                paper.one_line_summary = result.get("one_line_summary", "")
+                
+                # Save updated paper ONLY on success
+                self._save_paper(paper)
+                
+                score_display = f"({paper.relevance_score}/10)" if paper.relevance_score > 0 else ""
+                print(f"  Stage 1: {'✓ Relevant' if paper.is_relevant else '✗ Not relevant'} {score_display} - {paper.id}")
+                
+                return paper
             
-            result = json.loads(response.choices[0].message.content)
-            
-            paper.is_relevant = result.get("is_relevant", False)
-            paper.relevance_score = float(result.get("relevance_score", 0))
-            paper.extracted_keywords = result.get("extracted_keywords", [])
-            paper.one_line_summary = result.get("one_line_summary", "")
-            
-            # Save updated paper
-            self._save_paper(paper)
-            
-            score_display = f"({paper.relevance_score}/10)" if paper.relevance_score > 0 else ""
-            print(f"  Stage 1: {'✓ Relevant' if paper.is_relevant else '✗ Not relevant'} {score_display} - {paper.id}")
-        
-        except Exception as e:
-            print(f"  Stage 1 error for {paper.id}: {e}")
-            paper.is_relevant = False
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 1s, 2s
+                    wait_time = 2 ** attempt
+                    print(f"  Stage 1 retry {attempt + 1}/{max_retries} for {paper.id} after {wait_time}s: {e}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Final failure - do NOT save
+                    print(f"  Stage 1 FAILED after {max_retries} attempts for {paper.id}: {e}")
+                    paper.is_relevant = None  # Mark as unprocessed
         
         return paper
     
@@ -122,50 +138,57 @@ Paper Content:
 """
         
         # 1. Generate detailed summary first
-        try:
-            detailed_summary_question = """请用中文生成这篇论文的详细摘要（约200-300字），包括：
+        detailed_summary_question = """请用中文生成这篇论文的详细摘要（约200-300字），包括：
 1. 研究背景和动机
 2. 核心方法和技术创新
 3. 主要实验结果
 4. 研究意义和价值
 
 使用 Markdown 格式，让摘要清晰易读。"""
-            
-            detailed_summary = await self._ask_question(
+        
+        detailed_summary = await self._ask_question_with_retry(
+            cache_prefix=cache_prefix,
+            question=detailed_summary_question,
+            config=config,
+            cache_id=paper.id
+        )
+        
+        if detailed_summary is None:
+            # Failed after retries - do NOT save
+            print(f"  Stage 2 FAILED to generate summary for {paper.id}")
+            return paper
+        
+        paper.detailed_summary = detailed_summary
+        print(f"  Stage 2: Generated detailed summary for {paper.id}")
+        
+        # 2. Ask each preset question
+        all_success = True
+        for question in config.preset_questions:
+            answer = await self._ask_question_with_retry(
                 cache_prefix=cache_prefix,
-                question=detailed_summary_question,
+                question=question,
                 config=config,
                 cache_id=paper.id
             )
             
-            paper.detailed_summary = detailed_summary
-            print(f"  Stage 2: Generated detailed summary for {paper.id}")
-        
-        except Exception as e:
-            print(f"  Stage 2 error generating summary for {paper.id}: {e}")
-        
-        # 2. Ask each preset question
-        for question in config.preset_questions:
-            try:
-                answer = await self._ask_question(
-                    cache_prefix=cache_prefix,
-                    question=question,
-                    config=config,
-                    cache_id=paper.id
-                )
-                
-                paper.qa_pairs.append(QAPair(
-                    question=question,
-                    answer=answer
-                ))
-                
-                print(f"  Stage 2: Answered '{question[:40]}...' for {paper.id}")
+            if answer is None:
+                # Failed after retries
+                print(f"  Stage 2 FAILED for {paper.id}, Q: {question[:40]}")
+                all_success = False
+                break
             
-            except Exception as e:
-                print(f"  Stage 2 error for {paper.id}, Q: {question[:40]}: {e}")
+            paper.qa_pairs.append(QAPair(
+                question=question,
+                answer=answer
+            ))
+            
+            print(f"  Stage 2: Answered '{question[:40]}...' for {paper.id}")
         
-        # Save updated paper
-        self._save_paper(paper)
+        # Save updated paper ONLY if all succeeded
+        if all_success:
+            self._save_paper(paper)
+        else:
+            print(f"  Stage 2: Skipping save for {paper.id} due to failures")
         
         return paper
     
@@ -275,45 +298,69 @@ Paper Content:
             final_question = question
             cache_id = paper.id
         
-        # Stream the answer (with reasoning support)
+        # Stream the answer (with reasoning support and retry)
         full_answer = ""
         full_thinking = ""
         
         # Choose model based on reasoning mode
         model = "deepseek-reasoner" if is_reasoning else config.model
         
-        async for chunk in self._ask_question_stream(
-            cache_prefix, 
-            final_question, 
-            config, 
-            cache_id,
-            model=model,
-            is_reasoning=is_reasoning,
-            conversation_history=conversation_history if parent_qa_id is not None else None
-        ):
-            # Yield chunks with type annotation
-            if isinstance(chunk, dict):
-                # Reasoning mode: {"thinking": ..., "content": ...}
-                if "thinking" in chunk:
-                    full_thinking += chunk["thinking"]
-                    yield {"type": "thinking", "chunk": chunk["thinking"]}
-                if "content" in chunk:
-                    full_answer += chunk["content"]
-                    yield {"type": "content", "chunk": chunk["content"]}
-            else:
-                # Normal mode: just text
-                full_answer += chunk
-                yield {"type": "content", "chunk": chunk}
+        # Retry logic for streaming (up to 3 attempts)
+        max_retries = 3
+        success = False
         
-        # Save to paper (save original question with "think:" prefix if used)
-        paper.qa_pairs.append(QAPair(
-            question=original_question,
-            answer=full_answer,
-            thinking=full_thinking if is_reasoning else None,
-            is_reasoning=is_reasoning,
-            parent_qa_id=parent_qa_id
-        ))
-        self._save_paper(paper)
+        for attempt in range(max_retries):
+            try:
+                full_answer = ""
+                full_thinking = ""
+                
+                async for chunk in self._ask_question_stream(
+                    cache_prefix, 
+                    final_question, 
+                    config, 
+                    cache_id,
+                    model=model,
+                    is_reasoning=is_reasoning,
+                    conversation_history=conversation_history if parent_qa_id is not None else None
+                ):
+                    # Yield chunks with type annotation
+                    if isinstance(chunk, dict):
+                        # Reasoning mode: {"thinking": ..., "content": ...}
+                        if "thinking" in chunk:
+                            full_thinking += chunk["thinking"]
+                            yield {"type": "thinking", "chunk": chunk["thinking"]}
+                        if "content" in chunk:
+                            full_answer += chunk["content"]
+                            yield {"type": "content", "chunk": chunk["content"]}
+                    else:
+                        # Normal mode: just text
+                        full_answer += chunk
+                        yield {"type": "content", "chunk": chunk}
+                
+                success = True
+                break  # Success, exit retry loop
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"  Stream retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
+                    yield {"type": "error", "chunk": f"⚠️ Connection error, retrying in {wait_time}s...\n"}
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"  Stream FAILED after {max_retries} attempts: {e}")
+                    yield {"type": "error", "chunk": f"❌ Failed after {max_retries} attempts: {str(e)}"}
+                    return  # Don't save on failure
+        
+        # Save to paper ONLY if successful
+        if success and (full_answer or full_thinking):
+            paper.qa_pairs.append(QAPair(
+                question=original_question,
+                answer=full_answer,
+                thinking=full_thinking if is_reasoning else None,
+                is_reasoning=is_reasoning,
+                parent_qa_id=parent_qa_id
+            ))
+            self._save_paper(paper)
     
     async def ask_custom_question(
         self,
@@ -499,6 +546,30 @@ Paper Content:
         )
         
         return response.choices[0].message.content
+    
+    async def _ask_question_with_retry(
+        self,
+        cache_prefix: str,
+        question: str,
+        config: Config,
+        cache_id: str,
+        max_retries: int = 3
+    ) -> Optional[str]:
+        """
+        Ask a question with retry logic.
+        Returns None if all retries fail.
+        """
+        for attempt in range(max_retries):
+            try:
+                return await self._ask_question(cache_prefix, question, config, cache_id)
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"  Retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"  FAILED after {max_retries} attempts: {e}")
+                    return None
     
     def _save_paper(self, paper: Paper):
         """Save paper to JSON file"""
