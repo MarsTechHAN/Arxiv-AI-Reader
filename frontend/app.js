@@ -612,6 +612,9 @@ async function askQuestion(paperId, question, parentQaId = null) {
     };
     
     try {
+        console.log(`[Stream] Starting request: ${API_BASE}/papers/${paperId}/ask_stream`);
+        console.log(`[Stream] Question: ${question.substring(0, 50)}..., parentQaId: ${parentQaId}`);
+        
         const response = await fetch(`${API_BASE}/papers/${paperId}/ask_stream`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -621,23 +624,57 @@ async function askQuestion(paperId, question, parentQaId = null) {
             })
         });
         
+        console.log(`[Stream] Response status: ${response.status}, headers:`, response.headers);
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`[Stream] Response error: ${response.status} - ${errorText}`);
+            answerDiv.innerHTML = `<span style="color: var(--danger);">HTTP Error ${response.status}: ${escapeHtml(errorText)}</span>`;
+            return;
+        }
+        
+        if (!response.body) {
+            console.error('[Stream] Response body is null!');
+            answerDiv.innerHTML = `<span style="color: var(--danger);">No response body</span>`;
+            return;
+        }
+        
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
+        
+        let buffer = '';
+        let chunkCount = 0;
         
         while (true) {
             const { done, value } = await reader.read();
             
-            if (done) break;
+            if (done) {
+                console.log(`[Stream] Stream done, processed ${chunkCount} chunks`);
+                break;
+            }
             
-            // Decode chunk
-            const chunk = decoder.decode(value, { stream: true });
+            // Decode chunk and append to buffer (handle partial SSE messages)
+            buffer += decoder.decode(value, { stream: true });
             
-            // Parse SSE format (data: {...}\n\n)
-            const lines = chunk.split('\n');
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
+            // Process complete SSE messages (data: {...}\n\n)
+            let newlineIndex;
+            while ((newlineIndex = buffer.indexOf('\n\n')) !== -1) {
+                const message = buffer.substring(0, newlineIndex);
+                buffer = buffer.substring(newlineIndex + 2);
+                
+                // Skip empty messages
+                if (!message.trim()) continue;
+                
+                // Parse SSE format: "data: {...}"
+                if (message.startsWith('data: ')) {
                     try {
-                        const data = JSON.parse(line.slice(6));
+                        const jsonStr = message.slice(6);
+                        const data = JSON.parse(jsonStr);
+                        
+                        chunkCount++;
+                        if (chunkCount <= 5 || chunkCount % 20 == 0) {
+                            console.log(`[Stream] Chunk ${chunkCount}:`, data.type, data.chunk?.substring(0, 30));
+                        }
                         
                         if (data.type === 'thinking' && data.chunk) {
                             fullThinking += data.chunk;
@@ -651,6 +688,7 @@ async function askQuestion(paperId, question, parentQaId = null) {
                             updateDisplay(true);  // Force immediate update for errors
                         } else if (data.done) {
                             // Finalize - remove cursors
+                            console.log('[Stream] Received done signal');
                             if (thinkingDiv && fullThinking) {
                                 thinkingDiv.innerHTML = renderMarkdown(fullThinking);
                                 thinkingDiv.classList.remove('streaming-answer');
@@ -665,11 +703,15 @@ async function askQuestion(paperId, question, parentQaId = null) {
                             }
                         } else if (data.error) {
                             // Legacy error format
+                            console.error('[Stream] Error:', data.error);
                             answerDiv.innerHTML = `<span style="color: var(--danger);">Error: ${escapeHtml(data.error)}</span>`;
                         }
                     } catch (e) {
-                        // Ignore JSON parse errors for partial chunks
+                        console.warn(`[Stream] JSON parse error:`, e, `Message:`, message.substring(0, 100));
+                        // Continue processing - might be partial chunk
                     }
+                } else {
+                    console.warn(`[Stream] Unexpected SSE format:`, message.substring(0, 100));
                 }
             }
         }

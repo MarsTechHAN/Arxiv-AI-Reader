@@ -266,6 +266,9 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
         async def event_generator():
             """Generate SSE events with streamed answer"""
             try:
+                print(f"[Stream] Starting stream for paper {paper_id}, question: {request.question[:50]}...")
+                chunk_count = 0
+                
                 async for chunk_data in analyzer.ask_custom_question_stream(
                     paper, 
                     request.question, 
@@ -273,12 +276,20 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
                     parent_qa_id=request.parent_qa_id
                 ):
                     # chunk_data is now a dict: {"type": "thinking"/"content", "chunk": "..."}
+                    chunk_count += 1
+                    if chunk_count <= 5 or chunk_count % 10 == 0:
+                        print(f"[Stream] Chunk {chunk_count}: type={chunk_data.get('type')}, len={len(chunk_data.get('chunk', ''))}")
+                    
                     yield f"data: {json.dumps(chunk_data)}\n\n"
                 
+                print(f"[Stream] Stream complete, total chunks: {chunk_count}")
                 # Send completion event
                 yield f"data: {json.dumps({'done': True})}\n\n"
             
             except Exception as e:
+                import traceback
+                error_msg = f"Stream error: {str(e)}\n{traceback.format_exc()}"
+                print(f"[Stream] ERROR: {error_msg}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
         
         return StreamingResponse(

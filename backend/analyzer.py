@@ -323,19 +323,13 @@ Paper Content:
                     is_reasoning=is_reasoning,
                     conversation_history=conversation_history if parent_qa_id is not None else None
                 ):
-                    # Yield chunks with type annotation
-                    if isinstance(chunk, dict):
-                        # Reasoning mode: {"thinking": ..., "content": ...}
-                        if "thinking" in chunk:
-                            full_thinking += chunk["thinking"]
-                            yield {"type": "thinking", "chunk": chunk["thinking"]}
-                        if "content" in chunk:
-                            full_answer += chunk["content"]
-                            yield {"type": "content", "chunk": chunk["content"]}
-                    else:
-                        # Normal mode: just text
-                        full_answer += chunk
-                        yield {"type": "content", "chunk": chunk}
+                    # All chunks are now dicts: {"thinking": ...} or {"content": ...}
+                    if "thinking" in chunk:
+                        full_thinking += chunk["thinking"]
+                        yield {"type": "thinking", "chunk": chunk["thinking"]}
+                    if "content" in chunk:
+                        full_answer += chunk["content"]
+                        yield {"type": "content", "chunk": chunk["content"]}
                 
                 success = True
                 break  # Success, exit retry loop
@@ -519,9 +513,9 @@ Paper Content:
                 if delta.content:
                     yield {"content": delta.content}
             else:
-                # Normal mode: just content
+                # Normal mode: yield as dict for consistency
                 if delta.content:
-                    yield delta.content
+                    yield {"content": delta.content}
     
     async def _ask_question(
         self,
