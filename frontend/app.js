@@ -579,14 +579,20 @@ async function askQuestion(paperId, question, parentQaId = null) {
     
     let fullAnswer = '';
     let fullThinking = '';
-    let lastUpdateTime = 0;
     let pendingUpdate = null;
+    let needsUpdate = false;
     
-    // Throttled update function (max 60fps)
+    // Throttled update function using requestAnimationFrame for smooth streaming
     const updateDisplay = (immediate = false) => {
-        const now = performance.now();
+        // Mark that we need an update
+        needsUpdate = true;
         
-        if (immediate || now - lastUpdateTime >= 16) {
+        if (immediate) {
+            // Force immediate update, cancel pending animation frame
+            if (pendingUpdate !== null) {
+                cancelAnimationFrame(pendingUpdate);
+                pendingUpdate = null;
+            }
             // Update immediately
             if (thinkingDiv && fullThinking) {
                 thinkingDiv.innerHTML = renderMarkdown(fullThinking) + '<span class="cursor-blink">▊</span>';
@@ -594,20 +600,22 @@ async function askQuestion(paperId, question, parentQaId = null) {
             if (fullAnswer) {
                 answerDiv.innerHTML = renderMarkdown(fullAnswer) + '<span class="cursor-blink">▊</span>';
             }
-            lastUpdateTime = now;
-            pendingUpdate = null;
-        } else if (!pendingUpdate) {
-            // Schedule update
-            pendingUpdate = setTimeout(() => {
-                if (thinkingDiv && fullThinking) {
-                    thinkingDiv.innerHTML = renderMarkdown(fullThinking) + '<span class="cursor-blink">▊</span>';
+            needsUpdate = false;
+        } else if (pendingUpdate === null) {
+            // Schedule update using requestAnimationFrame (smoother than setTimeout)
+            pendingUpdate = requestAnimationFrame(() => {
+                if (needsUpdate) {
+                    // Update both thinking and content if they exist
+                    if (thinkingDiv && fullThinking) {
+                        thinkingDiv.innerHTML = renderMarkdown(fullThinking) + '<span class="cursor-blink">▊</span>';
+                    }
+                    if (fullAnswer) {
+                        answerDiv.innerHTML = renderMarkdown(fullAnswer) + '<span class="cursor-blink">▊</span>';
+                    }
+                    needsUpdate = false;
                 }
-                if (fullAnswer) {
-                    answerDiv.innerHTML = renderMarkdown(fullAnswer) + '<span class="cursor-blink">▊</span>';
-                }
-                lastUpdateTime = performance.now();
                 pendingUpdate = null;
-            }, 16);
+            });
         }
     };
     
@@ -716,8 +724,13 @@ async function askQuestion(paperId, question, parentQaId = null) {
             }
         }
         
-        // Final cleanup
-        if (pendingUpdate) clearTimeout(pendingUpdate);
+        // Final cleanup - force final update
+        if (pendingUpdate !== null) {
+            cancelAnimationFrame(pendingUpdate);
+            pendingUpdate = null;
+        }
+        
+        // Final render without cursor
         if (thinkingDiv && fullThinking) {
             thinkingDiv.innerHTML = renderMarkdown(fullThinking);
             thinkingDiv.classList.remove('streaming-answer');

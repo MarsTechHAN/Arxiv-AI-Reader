@@ -504,10 +504,17 @@ Paper Content:
         
         # Stream response
         async for chunk in response:
+            # Check if chunk has choices and delta
+            if not chunk.choices or len(chunk.choices) == 0:
+                continue
+            
             delta = chunk.choices[0].delta
+            if not delta:
+                continue
             
             if is_reasoning:
                 # Reasoning mode: handle both reasoning_content and content
+                # Note: deepseek-reasoner may yield both in the same chunk or separately
                 if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
                     yield {"thinking": delta.reasoning_content}
                 if delta.content:

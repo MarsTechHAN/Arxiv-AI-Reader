@@ -15,6 +15,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -77,8 +79,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# GZip compression for all responses (reduce bandwidth usage)
-app.add_middleware(GZipMiddleware, minimum_size=256)
+# GZip compression - BUT exclude streaming endpoints to prevent buffering
+# FastAPI's GZipMiddleware buffers StreamingResponse, which breaks SSE real-time delivery
+# Solution: Use custom middleware that skips /ask_stream paths
+class SelectiveGZipMiddleware(BaseHTTPMiddleware):
+    """GZip middleware that skips streaming endpoints"""
+    async def dispatch(self, request: Request, call_next):
+        # Skip compression for streaming endpoints (critical for real-time SSE)
+        if "/ask_stream" in str(request.url.path):
+            response = await call_next(request)
+            return response
+        
+        # Apply GZip for all other endpoints
+        gzip_middleware = GZipMiddleware(minimum_size=256)
+        return await gzip_middleware.dispatch(request, call_next)
+
+app.add_middleware(SelectiveGZipMiddleware)
 
 # Global instances
 fetcher = ArxivFetcher()
@@ -268,6 +284,7 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
             try:
                 print(f"[Stream] Starting stream for paper {paper_id}, question: {request.question[:50]}...")
                 chunk_count = 0
+                last_yield_time = None
                 
                 async for chunk_data in analyzer.ask_custom_question_stream(
                     paper, 
@@ -277,10 +294,17 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
                 ):
                     # chunk_data is now a dict: {"type": "thinking"/"content", "chunk": "..."}
                     chunk_count += 1
-                    if chunk_count <= 5 or chunk_count % 10 == 0:
-                        print(f"[Stream] Chunk {chunk_count}: type={chunk_data.get('type')}, len={len(chunk_data.get('chunk', ''))}")
                     
-                    yield f"data: {json.dumps(chunk_data)}\n\n"
+                    if chunk_count <= 5 or chunk_count % 10 == 0:
+                        import time
+                        current_time = time.time()
+                        time_since_last = current_time - last_yield_time if last_yield_time else 0
+                        print(f"[Stream] Chunk {chunk_count}: type={chunk_data.get('type')}, len={len(chunk_data.get('chunk', ''))}, time_since_last={time_since_last:.3f}s")
+                        last_yield_time = current_time
+                    
+                    # Yield immediately - don't buffer
+                    sse_data = f"data: {json.dumps(chunk_data)}\n\n"
+                    yield sse_data
                 
                 print(f"[Stream] Stream complete, total chunks: {chunk_count}")
                 # Send completion event
@@ -298,6 +322,8 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Disable nginx/proxy buffering
+                "Transfer-Encoding": "chunked",  # Explicit chunked encoding
             }
         )
     
