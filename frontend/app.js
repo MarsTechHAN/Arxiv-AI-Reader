@@ -471,12 +471,26 @@ async function openPaperModal(paperId) {
         
         document.getElementById('paperDetails').innerHTML = detailsHtml;
         
-        // Load Q&A (with Markdown rendering)
+        // Load Q&A (with Markdown rendering, thinking support, and follow-up buttons)
         const qaHtml = paper.qa_pairs && paper.qa_pairs.length > 0 ? 
-            paper.qa_pairs.map(qa => `
+            paper.qa_pairs.map((qa, index) => `
                 <div class="qa-item">
-                    <div class="qa-question">Q: ${escapeHtml(qa.question)}</div>
+                    <div class="qa-question">
+                        Q: ${escapeHtml(qa.question)}
+                        ${qa.parent_qa_id !== null && qa.parent_qa_id !== undefined ? '<span class="follow-up-badge">↩️ Follow-up</span>' : ''}
+                    </div>
+                    ${qa.thinking ? `
+                        <details class="thinking-section">
+                            <summary>🤔 Thinking process</summary>
+                            <div class="thinking-content markdown-content">${renderMarkdown(qa.thinking)}</div>
+                        </details>
+                    ` : ''}
                     <div class="qa-answer markdown-content">${renderMarkdown(qa.answer)}</div>
+                    <div class="qa-actions">
+                        <button class="btn-follow-up" onclick="startFollowUp(event, ${index})">
+                            ↩️ Follow-up
+                        </button>
+                    </div>
                 </div>
             `).join('') : 
             '<p style="color: var(--text-muted);">暂无问答。请在下方输入问题！</p>';
@@ -521,8 +535,8 @@ async function openPaperModal(paperId) {
     }
 }
 
-// Ask Question (with streaming)
-async function askQuestion(paperId, question) {
+// Ask Question (with streaming, reasoning, and follow-up support)
+async function askQuestion(paperId, question, parentQaId = null) {
     const askInput = document.getElementById('askInput');
     const askLoading = document.getElementById('askLoading');
     const qaList = document.getElementById('qaList');
@@ -530,23 +544,78 @@ async function askQuestion(paperId, question) {
     askInput.disabled = true;
     askLoading.style.display = 'block';
     
+    // Check if it's reasoning mode
+    const isReasoning = question.toLowerCase().startsWith('think:');
+    
     // Create placeholder Q&A item
     const qaItem = document.createElement('div');
     qaItem.className = 'qa-item';
     qaItem.innerHTML = `
-        <div class="qa-question">Q: ${escapeHtml(question)}</div>
+        <div class="qa-question">
+            Q: ${escapeHtml(question)}
+            ${parentQaId !== null ? '<span class="follow-up-badge">↩️ Follow-up</span>' : ''}
+        </div>
+        ${isReasoning ? `
+            <details class="thinking-section" open>
+                <summary>🤔 Thinking process...</summary>
+                <div class="thinking-content markdown-content streaming-answer"></div>
+            </details>
+        ` : ''}
         <div class="qa-answer markdown-content streaming-answer"></div>
+        <div class="qa-actions">
+            <button class="btn-follow-up" onclick="startFollowUp(event, ${parentQaId !== null ? parentQaId : 'qaList.children.length - 1'})">
+                ↩️ Follow-up
+            </button>
+        </div>
     `;
     qaList.appendChild(qaItem);
     
+    const thinkingDiv = qaItem.querySelector('.thinking-content');
     const answerDiv = qaItem.querySelector('.qa-answer');
+    const thinkingSection = qaItem.querySelector('.thinking-section');
+    
     let fullAnswer = '';
+    let fullThinking = '';
+    let lastUpdateTime = 0;
+    let pendingUpdate = null;
+    
+    // Throttled update function (max 60fps)
+    const updateDisplay = (immediate = false) => {
+        const now = performance.now();
+        
+        if (immediate || now - lastUpdateTime >= 16) {
+            // Update immediately
+            if (thinkingDiv && fullThinking) {
+                thinkingDiv.innerHTML = renderMarkdown(fullThinking) + '<span class="cursor-blink">▊</span>';
+            }
+            if (fullAnswer) {
+                answerDiv.innerHTML = renderMarkdown(fullAnswer) + '<span class="cursor-blink">▊</span>';
+            }
+            lastUpdateTime = now;
+            pendingUpdate = null;
+        } else if (!pendingUpdate) {
+            // Schedule update
+            pendingUpdate = setTimeout(() => {
+                if (thinkingDiv && fullThinking) {
+                    thinkingDiv.innerHTML = renderMarkdown(fullThinking) + '<span class="cursor-blink">▊</span>';
+                }
+                if (fullAnswer) {
+                    answerDiv.innerHTML = renderMarkdown(fullAnswer) + '<span class="cursor-blink">▊</span>';
+                }
+                lastUpdateTime = performance.now();
+                pendingUpdate = null;
+            }, 16);
+        }
+    };
     
     try {
         const response = await fetch(`${API_BASE}/papers/${paperId}/ask_stream`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question })
+            body: JSON.stringify({ 
+                question,
+                parent_qa_id: parentQaId
+            })
         });
         
         const reader = response.body.getReader();
@@ -567,13 +636,26 @@ async function askQuestion(paperId, question) {
                     try {
                         const data = JSON.parse(line.slice(6));
                         
-                        if (data.chunk) {
+                        if (data.type === 'thinking' && data.chunk) {
+                            fullThinking += data.chunk;
+                            updateDisplay();
+                        } else if (data.type === 'content' && data.chunk) {
                             fullAnswer += data.chunk;
-                            // Update display with streaming effect
-                            answerDiv.innerHTML = renderMarkdown(fullAnswer) + '<span class="cursor-blink">▊</span>';
+                            updateDisplay();
                         } else if (data.done) {
-                            // Remove cursor and finalize
-                            answerDiv.innerHTML = renderMarkdown(fullAnswer);
+                            // Finalize - remove cursors
+                            if (thinkingDiv && fullThinking) {
+                                thinkingDiv.innerHTML = renderMarkdown(fullThinking);
+                                thinkingDiv.classList.remove('streaming-answer');
+                                // Auto-collapse thinking after completion
+                                setTimeout(() => {
+                                    if (thinkingSection) thinkingSection.open = false;
+                                }, 500);
+                            }
+                            if (fullAnswer) {
+                                answerDiv.innerHTML = renderMarkdown(fullAnswer);
+                                answerDiv.classList.remove('streaming-answer');
+                            }
                         } else if (data.error) {
                             answerDiv.innerHTML = `<span style="color: var(--danger);">Error: ${escapeHtml(data.error)}</span>`;
                         }
@@ -584,7 +666,12 @@ async function askQuestion(paperId, question) {
             }
         }
         
-        // Finalize answer
+        // Final cleanup
+        if (pendingUpdate) clearTimeout(pendingUpdate);
+        if (thinkingDiv && fullThinking) {
+            thinkingDiv.innerHTML = renderMarkdown(fullThinking);
+            thinkingDiv.classList.remove('streaming-answer');
+        }
         answerDiv.innerHTML = renderMarkdown(fullAnswer);
         answerDiv.classList.remove('streaming-answer');
         askInput.value = '';
@@ -1211,6 +1298,54 @@ function restoreSearchState() {
         searchInput.value = savedQuery;
         // Don't auto-trigger search on restore, let user decide
     }
+}
+
+// Start follow-up question
+function startFollowUp(event, qaIndex) {
+    event.stopPropagation();
+    
+    const qaItem = event.target.closest('.qa-item');
+    
+    // Check if follow-up input already exists
+    let followUpContainer = qaItem.querySelector('.follow-up-container');
+    
+    if (followUpContainer) {
+        // Toggle visibility
+        followUpContainer.style.display = followUpContainer.style.display === 'none' ? 'block' : 'none';
+        if (followUpContainer.style.display === 'block') {
+            followUpContainer.querySelector('input').focus();
+        }
+        return;
+    }
+    
+    // Create follow-up input container
+    followUpContainer = document.createElement('div');
+    followUpContainer.className = 'follow-up-container';
+    followUpContainer.innerHTML = `
+        <div class="follow-up-input-wrapper">
+            <input 
+                type="text" 
+                class="input follow-up-input" 
+                placeholder="Ask a follow-up question... (Press Enter to send)"
+            >
+            <button class="btn-cancel" onclick="this.closest('.follow-up-container').remove()">×</button>
+        </div>
+        <p class="follow-up-hint">💡 Tip: Use "think:" prefix for reasoning mode</p>
+    `;
+    
+    qaItem.appendChild(followUpContainer);
+    
+    const input = followUpContainer.querySelector('input');
+    input.focus();
+    
+    // Handle Enter key
+    input.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter' && input.value.trim()) {
+            const question = input.value.trim();
+            followUpContainer.remove();
+            askQuestion(currentPaperId, question, qaIndex);
+        }
+    });
 }
 
 // Convert arXiv abstract URL to PDF URL

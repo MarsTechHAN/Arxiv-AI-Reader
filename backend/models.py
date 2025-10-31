@@ -11,10 +11,17 @@ import json
 
 @dataclass
 class QAPair:
-    """Question-answer pair"""
+    """Question-answer pair with reasoning support"""
     question: str
     answer: str
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    
+    # Reasoning mode (deepseek-reasoner)
+    thinking: Optional[str] = None  # Thinking process (only for reasoning mode)
+    is_reasoning: bool = False      # Whether this used reasoning model
+    
+    # Follow-up conversation support
+    parent_qa_id: Optional[int] = None  # Index of parent QA in qa_pairs list (for follow-ups)
 
 
 @dataclass

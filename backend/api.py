@@ -99,6 +99,7 @@ elif frontend_path.exists():
 # Request/Response models
 class AskQuestionRequest(BaseModel):
     question: str
+    parent_qa_id: Optional[int] = None  # For follow-up questions
 
 
 class UpdateConfigRequest(BaseModel):
@@ -253,6 +254,10 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
     """
     Ask a custom question about a paper with streaming response.
     Uses Server-Sent Events (SSE) for real-time streaming.
+    
+    Supports:
+    - Reasoning mode: prefix question with "think:" to use deepseek-reasoner
+    - Follow-up: provide parent_qa_id to build conversation context
     """
     try:
         paper = fetcher.load_paper(paper_id)
@@ -261,9 +266,14 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
         async def event_generator():
             """Generate SSE events with streamed answer"""
             try:
-                async for chunk in analyzer.ask_custom_question_stream(paper, request.question, config):
-                    # Send chunk as SSE format
-                    yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                async for chunk_data in analyzer.ask_custom_question_stream(
+                    paper, 
+                    request.question, 
+                    config,
+                    parent_qa_id=request.parent_qa_id
+                ):
+                    # chunk_data is now a dict: {"type": "thinking"/"content", "chunk": "..."}
+                    yield f"data: {json.dumps(chunk_data)}\n\n"
                 
                 # Send completion event
                 yield f"data: {json.dumps({'done': True})}\n\n"

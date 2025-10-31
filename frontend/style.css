@@ -562,17 +562,157 @@ body.modal-open {
     border-radius: 8px;
     padding: 16px;
     margin-bottom: 16px;
+    border: 1px solid var(--border);
 }
 
 .qa-question {
     font-weight: 600;
     color: var(--primary);
     margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .qa-answer {
     color: var(--text);
     line-height: 1.6;
+}
+
+/* Follow-up badge */
+.follow-up-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--primary);
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+/* Thinking section (collapsible) */
+.thinking-section {
+    background: rgba(251, 191, 36, 0.08);
+    border: 1px solid rgba(251, 191, 36, 0.2);
+    border-radius: 8px;
+    padding: 12px;
+    margin: 12px 0;
+}
+
+.thinking-section summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: #fbbf24;
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.thinking-section summary::-webkit-details-marker {
+    display: none;
+}
+
+.thinking-section summary::before {
+    content: '▼';
+    display: inline-block;
+    transition: transform 0.2s;
+    font-size: 10px;
+}
+
+.thinking-section:not([open]) summary::before {
+    transform: rotate(-90deg);
+}
+
+.thinking-content {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(251, 191, 36, 0.2);
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+/* QA actions (follow-up button) */
+.qa-actions {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+}
+
+.btn-follow-up {
+    padding: 6px 12px;
+    background: var(--bg-lighter);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-follow-up:hover {
+    background: var(--primary);
+    color: white;
+    border-color: var(--primary);
+}
+
+/* Follow-up input container */
+.follow-up-container {
+    margin-top: 12px;
+    padding: 12px;
+    background: rgba(59, 130, 246, 0.05);
+    border: 1px solid rgba(59, 130, 246, 0.2);
+    border-radius: 8px;
+}
+
+.follow-up-input-wrapper {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.follow-up-input {
+    flex: 1;
+    padding: 8px 12px;
+    background: var(--bg-lighter);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 14px;
+}
+
+.follow-up-input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+.btn-cancel {
+    padding: 4px 12px;
+    background: var(--bg-lighter);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 18px;
+    cursor: pointer;
+    transition: all 0.2s;
+    line-height: 1;
+}
+
+.btn-cancel:hover {
+    background: var(--danger);
+    color: white;
+    border-color: var(--danger);
+}
+
+.follow-up-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
 }
 
 /* Markdown content styling */

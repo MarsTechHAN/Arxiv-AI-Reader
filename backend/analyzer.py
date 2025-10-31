@@ -173,13 +173,25 @@ Paper Content:
         self,
         paper: Paper,
         question: str,
-        config: Config
+        config: Config,
+        parent_qa_id: Optional[int] = None
     ):
         """
         Ask a custom question about a paper with streaming response.
         Yields chunks of the answer as they arrive.
+        
+        Supports:
+        - Reasoning mode: prefix question with "think:" to use deepseek-reasoner
+        - Follow-up: provide parent_qa_id to build conversation context
         """
         import re
+        
+        # Check for reasoning mode (case-insensitive "think:" prefix)
+        is_reasoning = False
+        original_question = question
+        if question.lower().startswith("think:"):
+            is_reasoning = True
+            question = question[6:].strip()  # Remove "think:" prefix
         
         # Extract arXiv IDs from question (format: [2510.09212] or [2510.09212v1])
         arxiv_id_pattern = r'\[(\d{4}\.\d{4,5}(?:v\d+)?)\]'
@@ -215,6 +227,21 @@ Paper Content:
                 except Exception as e:
                     print(f"   ✗ Failed to load {ref_id}: {e}")
         
+        # Build conversation context for follow-ups
+        conversation_history = []
+        if parent_qa_id is not None and 0 <= parent_qa_id < len(paper.qa_pairs):
+            # Build conversation history (exclude thinking to maintain KV cache consistency)
+            current_id = parent_qa_id
+            while current_id is not None:
+                qa = paper.qa_pairs[current_id]
+                # Prepend to history (oldest first)
+                conversation_history.insert(0, {
+                    "question": qa.question,
+                    "answer": qa.answer
+                    # Note: thinking is excluded for KV cache consistency
+                })
+                current_id = qa.parent_qa_id
+        
         # Build enhanced context
         if referenced_papers:
             enhanced_question = question
@@ -248,16 +275,43 @@ Paper Content:
             final_question = question
             cache_id = paper.id
         
-        # Stream the answer
+        # Stream the answer (with reasoning support)
         full_answer = ""
-        async for chunk in self._ask_question_stream(cache_prefix, final_question, config, cache_id):
-            full_answer += chunk
-            yield chunk
+        full_thinking = ""
         
-        # Save to paper (save original question)
+        # Choose model based on reasoning mode
+        model = "deepseek-reasoner" if is_reasoning else config.model
+        
+        async for chunk in self._ask_question_stream(
+            cache_prefix, 
+            final_question, 
+            config, 
+            cache_id,
+            model=model,
+            is_reasoning=is_reasoning,
+            conversation_history=conversation_history if parent_qa_id is not None else None
+        ):
+            # Yield chunks with type annotation
+            if isinstance(chunk, dict):
+                # Reasoning mode: {"thinking": ..., "content": ...}
+                if "thinking" in chunk:
+                    full_thinking += chunk["thinking"]
+                    yield {"type": "thinking", "chunk": chunk["thinking"]}
+                if "content" in chunk:
+                    full_answer += chunk["content"]
+                    yield {"type": "content", "chunk": chunk["content"]}
+            else:
+                # Normal mode: just text
+                full_answer += chunk
+                yield {"type": "content", "chunk": chunk}
+        
+        # Save to paper (save original question with "think:" prefix if used)
         paper.qa_pairs.append(QAPair(
-            question=question,
-            answer=full_answer
+            question=original_question,
+            answer=full_answer,
+            thinking=full_thinking if is_reasoning else None,
+            is_reasoning=is_reasoning,
+            parent_qa_id=parent_qa_id
         ))
         self._save_paper(paper)
     
@@ -371,26 +425,56 @@ Paper Content:
         cache_prefix: str,
         question: str,
         config: Config,
-        cache_id: str
+        cache_id: str,
+        model: Optional[str] = None,
+        is_reasoning: bool = False,
+        conversation_history: Optional[list] = None
     ):
         """
         Ask a question with streaming response.
         Yields chunks as they arrive from the API.
+        
+        For reasoning mode (deepseek-reasoner):
+        - Yields {"thinking": chunk} for reasoning_content
+        - Yields {"content": chunk} for final content
+        
+        For normal mode:
+        - Yields text chunks directly
         """
+        # Build messages with conversation history
+        messages = [{"role": "system", "content": config.system_prompt}]
+        
+        # Add conversation history if provided (for follow-ups)
+        if conversation_history:
+            for conv in conversation_history:
+                messages.append({"role": "user", "content": f"Question: {conv['question']}"})
+                messages.append({"role": "assistant", "content": conv['answer']})
+        
+        # Add current question
+        messages.append({"role": "user", "content": f"{cache_prefix}\n\nQuestion: {question}"})
+        
         response = await self.client.chat.completions.create(
-            model=config.model,
-            messages=[
-                {"role": "system", "content": config.system_prompt},
-                {"role": "user", "content": f"{cache_prefix}\n\nQuestion: {question}"}
-            ],
+            model=model or config.model,
+            messages=messages,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
             stream=True,
         )
         
+        # Stream response
         async for chunk in response:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            delta = chunk.choices[0].delta
+            
+            if is_reasoning:
+                # Reasoning mode: handle both reasoning_content and content
+                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    yield {"thinking": delta.reasoning_content}
+                if delta.content:
+                    yield {"content": delta.content}
+            else:
+                # Normal mode: just content
+                if delta.content:
+                    yield delta.content
     
     async def _ask_question(
         self,
