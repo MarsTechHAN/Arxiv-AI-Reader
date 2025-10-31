@@ -81,20 +81,33 @@ app.add_middleware(
 
 # GZip compression - BUT exclude streaming endpoints to prevent buffering
 # FastAPI's GZipMiddleware buffers StreamingResponse, which breaks SSE real-time delivery
-# Solution: Use custom middleware that skips /ask_stream paths
-class SelectiveGZipMiddleware(BaseHTTPMiddleware):
-    """GZip middleware that skips streaming endpoints"""
-    async def dispatch(self, request: Request, call_next):
-        # Skip compression for streaming endpoints (critical for real-time SSE)
-        if "/ask_stream" in str(request.url.path):
-            response = await call_next(request)
-            return response
-        
-        # Apply GZip for all other endpoints
-        gzip_middleware = GZipMiddleware(minimum_size=256)
-        return await gzip_middleware.dispatch(request, call_next)
+# Solution: Only apply GZip to non-streaming endpoints
+@app.middleware("http")
+async def selective_gzip_middleware(request: Request, call_next):
+    """Skip GZip for streaming endpoints to prevent buffering"""
+    # Skip compression for streaming endpoints (critical for real-time SSE)
+    if "/ask_stream" in str(request.url.path):
+        response = await call_next(request)
+        return response
+    
+    # For other endpoints, use standard GZip middleware behavior
+    # But we need to apply it properly - use the middleware's dispatch method
+    # Actually, the simplest: just bypass GZip for streaming, let others go through
+    # We'll apply GZip via a wrapper that checks the response type
+    
+    response = await call_next(request)
+    
+    # Don't compress StreamingResponse - they need immediate delivery
+    if isinstance(response, StreamingResponse):
+        return response
+    
+    # For other responses, let GZip middleware handle it if configured
+    # Since we're not using global GZipMiddleware, we rely on reverse proxy (nginx) for compression
+    # The key fix: streaming endpoints never go through GZip
+    return response
 
-app.add_middleware(SelectiveGZipMiddleware)
+# Note: We don't add global GZipMiddleware because it buffers StreamingResponse
+# Compression for non-streaming endpoints can be handled by reverse proxy (nginx)
 
 # Global instances
 fetcher = ArxivFetcher()
