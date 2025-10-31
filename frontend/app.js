@@ -604,12 +604,29 @@ async function openConfigModal() {
         const response = await fetch(`${API_BASE}/config`);
         const config = await response.json();
         
+        // Keywords
         document.getElementById('filterKeywords').value = config.filter_keywords.join(', ');
         document.getElementById('negativeKeywords').value = (config.negative_keywords || []).join(', ');
+        
+        // Q&A
         document.getElementById('presetQuestions').value = config.preset_questions.join('\n');
         document.getElementById('systemPrompt').value = config.system_prompt;
         
+        // Model settings
+        document.getElementById('model').value = config.model || 'deepseek-chat';
+        document.getElementById('temperature').value = config.temperature || 0.3;
+        document.getElementById('maxTokens').value = config.max_tokens || 2000;
+        
+        // Fetch settings
+        document.getElementById('fetchInterval').value = config.fetch_interval || 300;
+        document.getElementById('maxPapersPerFetch').value = config.max_papers_per_fetch || 100;
+        
+        // Analysis settings
+        document.getElementById('concurrentPapers').value = config.concurrent_papers || 10;
+        document.getElementById('minRelevanceScoreForStage2').value = config.min_relevance_score_for_stage2 || 6;
+        
         configModal.classList.add('active');
+        document.body.classList.add('modal-open');
     } catch (error) {
         console.error('Error loading config:', error);
         showError('Failed to load configuration');
@@ -617,6 +634,7 @@ async function openConfigModal() {
 }
 
 async function saveConfig() {
+    // Keywords
     const keywords = document.getElementById('filterKeywords').value
         .split(',')
         .map(k => k.trim())
@@ -627,6 +645,7 @@ async function saveConfig() {
         .map(k => k.trim())
         .filter(k => k);
     
+    // Q&A
     const questions = document.getElementById('presetQuestions').value
         .split('\n')
         .map(q => q.trim())
@@ -634,20 +653,68 @@ async function saveConfig() {
     
     const systemPrompt = document.getElementById('systemPrompt').value.trim();
     
+    // Model settings
+    const model = document.getElementById('model').value.trim();
+    const temperature = parseFloat(document.getElementById('temperature').value);
+    const maxTokens = parseInt(document.getElementById('maxTokens').value);
+    
+    // Fetch settings
+    const fetchInterval = parseInt(document.getElementById('fetchInterval').value);
+    const maxPapersPerFetch = parseInt(document.getElementById('maxPapersPerFetch').value);
+    
+    // Analysis settings
+    const concurrentPapers = parseInt(document.getElementById('concurrentPapers').value);
+    const minRelevanceScoreForStage2 = parseFloat(document.getElementById('minRelevanceScoreForStage2').value);
+    
+    // Validation
+    if (isNaN(temperature) || temperature < 0 || temperature > 2) {
+        showError('Temperature must be between 0 and 2');
+        return;
+    }
+    if (isNaN(maxTokens) || maxTokens < 100 || maxTokens > 8000) {
+        showError('Max Tokens must be between 100 and 8000');
+        return;
+    }
+    if (isNaN(fetchInterval) || fetchInterval < 60) {
+        showError('Fetch Interval must be at least 60 seconds');
+        return;
+    }
+    if (isNaN(maxPapersPerFetch) || maxPapersPerFetch < 1 || maxPapersPerFetch > 500) {
+        showError('Max Papers Per Fetch must be between 1 and 500');
+        return;
+    }
+    if (isNaN(concurrentPapers) || concurrentPapers < 1 || concurrentPapers > 50) {
+        showError('Concurrent Papers must be between 1 and 50');
+        return;
+    }
+    if (isNaN(minRelevanceScoreForStage2) || minRelevanceScoreForStage2 < 0 || minRelevanceScoreForStage2 > 10) {
+        showError('Min Relevance Score must be between 0 and 10');
+        return;
+    }
+    
     try {
-        await fetch(`${API_BASE}/config`, {
+        const response = await fetch(`${API_BASE}/config`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 filter_keywords: keywords,
                 negative_keywords: negativeKeywords,
                 preset_questions: questions,
-                system_prompt: systemPrompt
+                system_prompt: systemPrompt,
+                model: model,
+                temperature: temperature,
+                max_tokens: maxTokens,
+                fetch_interval: fetchInterval,
+                max_papers_per_fetch: maxPapersPerFetch,
+                concurrent_papers: concurrentPapers,
+                min_relevance_score_for_stage2: minRelevanceScoreForStage2
             })
         });
         
+        const result = await response.json();
+        
         closeModal(configModal);
-        showSuccess('Configuration saved');
+        showSuccess(result.message || 'Configuration saved');
     } catch (error) {
         console.error('Error saving config:', error);
         showError('Failed to save configuration');

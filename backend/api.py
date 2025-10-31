@@ -101,6 +101,13 @@ class UpdateConfigRequest(BaseModel):
     negative_keywords: Optional[List[str]] = None
     preset_questions: Optional[List[str]] = None
     system_prompt: Optional[str] = None
+    fetch_interval: Optional[int] = None
+    max_papers_per_fetch: Optional[int] = None
+    model: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    concurrent_papers: Optional[int] = None
+    min_relevance_score_for_stage2: Optional[float] = None
 
 
 class UpdateRelevanceRequest(BaseModel):
@@ -270,10 +277,11 @@ async def get_config():
 
 @app.put("/config")
 async def update_config(request: UpdateConfigRequest):
-    """Update configuration"""
+    """Update configuration - supports all config options"""
     config = Config.load(config_path)
     old_negative_keywords = set(config.negative_keywords or [])
     
+    # Update all provided fields
     if request.filter_keywords is not None:
         config.filter_keywords = request.filter_keywords
     if request.negative_keywords is not None:
@@ -282,6 +290,20 @@ async def update_config(request: UpdateConfigRequest):
         config.preset_questions = request.preset_questions
     if request.system_prompt is not None:
         config.system_prompt = request.system_prompt
+    if request.fetch_interval is not None:
+        config.fetch_interval = max(60, request.fetch_interval)  # Minimum 60 seconds
+    if request.max_papers_per_fetch is not None:
+        config.max_papers_per_fetch = max(1, min(500, request.max_papers_per_fetch))  # 1-500 range
+    if request.model is not None:
+        config.model = request.model
+    if request.temperature is not None:
+        config.temperature = max(0.0, min(2.0, request.temperature))  # 0-2 range
+    if request.max_tokens is not None:
+        config.max_tokens = max(100, min(8000, request.max_tokens))  # 100-8000 range
+    if request.concurrent_papers is not None:
+        config.concurrent_papers = max(1, min(50, request.concurrent_papers))  # 1-50 range
+    if request.min_relevance_score_for_stage2 is not None:
+        config.min_relevance_score_for_stage2 = max(0.0, min(10.0, request.min_relevance_score_for_stage2))  # 0-10 range
     
     config.save(config_path)
     
