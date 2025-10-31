@@ -234,3 +234,6 @@ backend/data/config.json
 *.tmp
 *.bak
 .cache/
+
+# Build outputs
+frontend_dist/

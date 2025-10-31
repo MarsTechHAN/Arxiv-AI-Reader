@@ -14,6 +14,13 @@ fi
 # Create data directory
 mkdir -p data/papers
 
+# Build static assets with cache busting
+echo "🔨 Building static assets..."
+python3 build_static.py
+if [ $? -ne 0 ]; then
+    echo "⚠️  Static assets build failed, continuing with source files..."
+fi
+
 # Check if running with Docker
 if [ "$1" == "docker" ]; then
     echo "🐳 Starting with Docker..."

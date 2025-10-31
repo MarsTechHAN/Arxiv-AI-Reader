@@ -86,8 +86,13 @@ analyzer = DeepSeekAnalyzer()
 config_path = Path("data/config.json")
 
 # Serve frontend static files FIRST (before other routes)
+# Try frontend_dist first (built assets), fallback to frontend (source)
+frontend_dist = Path(__file__).parent.parent / "frontend_dist"
 frontend_path = Path(__file__).parent.parent / "frontend"
-if frontend_path.exists():
+if frontend_dist.exists():
+    app.mount("/static", StaticFiles(directory=str(frontend_dist)), name="static")
+    frontend_path = frontend_dist  # Use dist for serving index.html too
+elif frontend_path.exists():
     app.mount("/static", StaticFiles(directory=str(frontend_path)), name="static")
 
 
@@ -120,9 +125,14 @@ class UpdateRelevanceRequest(BaseModel):
 @app.get("/", include_in_schema=False)
 async def serve_frontend():
     """Serve frontend index.html"""
-    frontend_path = Path(__file__).parent.parent / "frontend"
-    if frontend_path.exists():
-        return FileResponse(str(frontend_path / "index.html"))
+    # Try frontend_dist first, fallback to frontend
+    frontend_dist = Path(__file__).parent.parent / "frontend_dist"
+    frontend_source = Path(__file__).parent.parent / "frontend"
+    
+    if frontend_dist.exists() and (frontend_dist / "index.html").exists():
+        return FileResponse(str(frontend_dist / "index.html"))
+    elif frontend_source.exists() and (frontend_source / "index.html").exists():
+        return FileResponse(str(frontend_source / "index.html"))
     return {"message": "Frontend not found. Please check frontend directory."}
 
 
@@ -133,20 +143,21 @@ async def health_check():
 
 
 @app.get("/papers", response_model=List[dict])
-async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: bool = False):
+async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: str = "false"):
     """
     List papers for timeline.
     sort_by: 'relevance' (default), 'latest'
     keyword: filter by keyword
-    starred_only: if True, only return starred papers; if False, exclude starred papers from results
+    starred_only: 'true' to return only starred papers, 'false' to exclude starred papers
     """
     papers = fetcher.list_papers(skip=0, limit=1000)  # Load all first
     
     # Filter out hidden papers first
     papers = [p for p in papers if not p.is_hidden]
     
-    # Filter by starred status
-    if starred_only:
+    # Filter by starred status (handle string 'true'/'false' from query param)
+    starred_only_bool = starred_only.lower() == 'true'
+    if starred_only_bool:
         papers = [p for p in papers if p.is_starred]
     else:
         # For normal timeline, exclude starred papers (they're shown separately)
@@ -338,11 +349,28 @@ async def search_papers(q: str, limit: int = 50):
             # Fetch or load the paper
             paper = await fetcher.fetch_single_paper(arxiv_id)
             
-            # Trigger analysis in background if not analyzed yet
-            if paper.is_relevant is None:
-                config = Config.load(config_path)
-                asyncio.create_task(analyzer.process_papers([paper], config))
-                print(f"📊 Started background analysis for {arxiv_id}")
+            # Trigger analysis in background
+            config = Config.load(config_path)
+            
+            # Check if Stage 1 is needed (is_relevant is None)
+            needs_stage1 = paper.is_relevant is None
+            
+            # Check if Stage 2 is needed (is_relevant=True, score>=min, but no detailed_summary)
+            min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+            needs_stage2 = (
+                paper.is_relevant is True 
+                and paper.relevance_score >= min_score
+                and (not paper.detailed_summary or paper.detailed_summary.strip() == '')
+            )
+            
+            if needs_stage1 or needs_stage2:
+                if needs_stage1:
+                    print(f"📊 Started background Stage 1+2 analysis for {arxiv_id}")
+                    asyncio.create_task(analyzer.process_papers([paper], config))
+                else:
+                    # Only Stage 2 needed
+                    print(f"📚 Started background Stage 2 analysis for {arxiv_id}")
+                    asyncio.create_task(analyzer.process_papers([paper], config, skip_stage1=True))
             
             # Return the paper
             return [{
