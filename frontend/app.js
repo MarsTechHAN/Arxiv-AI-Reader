@@ -9,8 +9,7 @@ let currentSortBy = 'relevance';
 let currentKeyword = null;
 let hasMorePapers = true;
 let isLoadingMore = false;
-let lastPaperCount = 0;
-let lastAnalyzedCount = 0;
+let currentTab = 'all';  // 'all' or 'starred'
 
 // DOM Elements
 const timeline = document.getElementById('timeline');
@@ -23,7 +22,8 @@ const configBtn = document.getElementById('configBtn');
 const fetchBtn = document.getElementById('fetchBtn');
 const configModal = document.getElementById('configModal');
 const paperModal = document.getElementById('paperModal');
-const statsEl = document.getElementById('stats');
+const tabAll = document.getElementById('tabAll');
+const tabStarred = document.getElementById('tabStarred');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -31,16 +31,9 @@ document.addEventListener('DOMContentLoaded', () => {
     restoreSearchState();
     
     loadPapers();
-    loadStats();
     setupEventListeners();
     setupInfiniteScroll();
     checkDeepLink();  // Check if URL has paper ID parameter
-    
-    // Auto-refresh stats every 30s
-    setInterval(loadStats, 30000);
-    
-    // Check for updates every 30s
-    setInterval(checkForUpdates, 30000);
 });
 
 // Event Listeners
@@ -188,6 +181,14 @@ function setupEventListeners() {
             loadPapers();
         });
     }
+    
+    // Tab switching
+    if (tabAll) {
+        tabAll.addEventListener('click', () => switchTab('all'));
+    }
+    if (tabStarred) {
+        tabStarred.addEventListener('click', () => switchTab('starred'));
+    }
 }
 
 // Infinite scroll
@@ -216,6 +217,33 @@ function setupInfiniteScroll() {
     });
 }
 
+// Switch Tab
+function switchTab(tab) {
+    if (currentTab === tab) return;  // Already on this tab
+    
+    currentTab = tab;
+    currentPage = 0;
+    hasMorePapers = true;
+    
+    // Update tab buttons
+    if (tab === 'all') {
+        tabAll.classList.add('active');
+        tabStarred.classList.remove('active');
+    } else {
+        tabStarred.classList.add('active');
+        tabAll.classList.remove('active');
+    }
+    
+    // Clear search when switching tabs
+    searchInput.value = '';
+    currentKeyword = null;
+    clearKeywordBtn.style.display = 'none';
+    clearSearchState();
+    
+    // Load papers for the selected tab
+    loadPapers(0, true);
+}
+
 // Load Papers
 async function loadPapers(page = 0, shouldScroll = true) {
     showLoading(true);
@@ -226,7 +254,9 @@ async function loadPapers(page = 0, shouldScroll = true) {
     }
     
     try {
-        let url = `${API_BASE}/papers?skip=${page * 20}&limit=20&sort_by=${currentSortBy}`;
+        // Determine if we're loading starred papers
+        const isStarredTab = currentTab === 'starred';
+        let url = `${API_BASE}/papers?skip=${page * 20}&limit=20&sort_by=${currentSortBy}&starred_only=${isStarredTab ? 'true' : 'false'}`;
         if (currentKeyword) {
             url += `&keyword=${encodeURIComponent(currentKeyword)}`;
         }
@@ -238,9 +268,6 @@ async function loadPapers(page = 0, shouldScroll = true) {
             timeline.innerHTML = '';
             hasMorePapers = true;  // Reset state
             hideEndMarker();
-            
-            // Add starred papers section at the top
-            await addStarredPapersSection();
             
             if (shouldScroll) {
                 window.scrollTo(0, 0);  // Only scroll when explicitly requested
@@ -254,7 +281,10 @@ async function loadPapers(page = 0, shouldScroll = true) {
                 return; // No more papers to add
             }
             // Page 0 with no papers - show empty state
-            timeline.innerHTML = '<p style="text-align: center; color: var(--text-muted); padding: 40px;">暂无论文</p>';
+            const emptyMessage = isStarredTab 
+                ? '<p style="text-align: center; color: var(--text-muted); padding: 40px;">暂无收藏的论文</p>'
+                : '<p style="text-align: center; color: var(--text-muted); padding: 40px;">暂无论文</p>';
+            timeline.innerHTML = emptyMessage;
             return;
         }
         
@@ -263,7 +293,7 @@ async function loadPapers(page = 0, shouldScroll = true) {
             hasMorePapers = false;
         }
         
-        // Add papers to timeline (API already excludes starred papers)
+        // Add papers to timeline
         papers.forEach(paper => {
             timeline.appendChild(createPaperCard(paper));
         });
@@ -884,7 +914,6 @@ async function triggerFetch() {
         setTimeout(() => {
             currentPage = 0;
             loadPapers();
-            loadStats();
         }, 10000);
     } catch (error) {
         console.error('Error triggering fetch:', error);
@@ -897,24 +926,6 @@ async function triggerFetch() {
     }
 }
 
-// Load Stats
-async function loadStats() {
-    if (!statsEl) return; // Stats element doesn't exist in current UI
-    
-    try {
-        const response = await fetch(`${API_BASE}/stats`);
-        const stats = await response.json();
-        
-        statsEl.innerHTML = `
-            📊 总计: ${stats.total_papers} | 
-            ✓ 相关: ${stats.relevant_papers} | 
-            ⭐ 收藏: ${stats.starred_papers} | 
-            ⏳ 待分析: ${stats.pending_analysis}
-        `;
-    } catch (error) {
-        console.error('Error loading stats:', error);
-    }
-}
 
 // Utilities
 function closeModal(modal) {
@@ -966,18 +977,14 @@ async function toggleStar(paperId) {
                 }
             }
             
-            // If starred, remove from timeline (will appear in starred section)
-            if (isStarred) {
+            // If starred and we're on 'all' tab, remove from timeline
+            // If unstarred and we're on 'starred' tab, remove from timeline
+            if ((isStarred && currentTab === 'all') || (!isStarred && currentTab === 'starred')) {
                 card.style.transition = 'opacity 0.3s ease-out';
                 card.style.opacity = '0';
                 setTimeout(() => {
                     card.remove();
-                    // Refresh starred section
-                    refreshStarredSection();
                 }, 300);
-            } else {
-                // If unstarred, also refresh starred section to remove it
-                refreshStarredSection();
             }
         }
         
@@ -991,31 +998,8 @@ async function toggleStar(paperId) {
 
 // Update star button in starred section (if viewing from there)
 function updateStarredItemButton(paperId, isStarred) {
-    // If we're in the starred section and unstar, remove the item
-    if (!isStarred) {
-        const starredItem = document.querySelector(`.starred-item[data-paper-id="${paperId}"]`);
-        if (starredItem) {
-            starredItem.style.transition = 'opacity 0.3s ease-out';
-            starredItem.style.opacity = '0';
-            setTimeout(() => starredItem.remove(), 300);
-        }
-    }
-}
-
-// Refresh only the starred section (without reloading timeline)
-async function refreshStarredSection() {
-    try {
-        // Remove existing starred section
-        const existingSection = document.querySelector('.starred-section');
-        if (existingSection) {
-            existingSection.remove();
-        }
-        
-        // Re-add starred section at the top of timeline
-        await addStarredPapersSection();
-    } catch (error) {
-        console.error('Error refreshing starred section:', error);
-    }
+    // This function is no longer needed with tab-based approach
+    // The card removal is handled in toggleStar
 }
 
 // Hide paper
@@ -1231,84 +1215,8 @@ function checkDeepLink() {
     }
 }
 
-// Add starred papers collapsible section
-async function addStarredPapersSection() {
-    try {
-        // Fetch only starred papers (optimized request)
-        const response = await fetch(`${API_BASE}/papers?skip=0&limit=100&starred_only=true`);
-        const starredPapers = await response.json();
-        
-        if (starredPapers.length === 0) return;
-        
-        // Create collapsible section (collapsed by default)
-        const section = document.createElement('div');
-        section.className = 'starred-section';
-        section.innerHTML = `
-            <div class="starred-header" onclick="toggleStarredSection()">
-                <h3>⭐ 收藏的论文 (${starredPapers.length})</h3>
-                <span class="toggle-icon" id="starredToggle">▶</span>
-            </div>
-            <div class="starred-content" id="starredContent" style="display: none;">
-                ${starredPapers.map(paper => `
-                    <div class="starred-item" data-paper-id="${paper.id}" onclick="openPaperModal('${paper.id}')">
-                        <div class="starred-item-content">
-                            <div class="starred-title">${escapeHtml(paper.title)}</div>
-                            ${paper.one_line_summary ? `
-                                <div class="starred-summary">${escapeHtml(paper.one_line_summary)}</div>
-                            ` : ''}
-                        </div>
-                        <span class="starred-score">${paper.relevance_score}/10</span>
-                    </div>
-                `).join('')}
-            </div>
-        `;
-        
-        timeline.appendChild(section);
-    } catch (error) {
-        console.error('Error loading starred papers:', error);
-    }
-}
+// Removed addStarredPapersSection and toggleStarredSection - now using tab-based approach
 
-// Toggle starred section
-function toggleStarredSection() {
-    const content = document.getElementById('starredContent');
-    const toggle = document.getElementById('starredToggle');
-    
-    if (content.style.display === 'none') {
-        content.style.display = 'block';
-        toggle.textContent = '▼';
-    } else {
-        content.style.display = 'none';
-        toggle.textContent = '▶';
-    }
-}
-
-// Check for updates (new papers or completed analysis)
-async function checkForUpdates() {
-    try {
-        const response = await fetch(`${API_BASE}/stats`);
-        const stats = await response.json();
-        
-        // Initialize on first check
-        if (lastPaperCount === 0) {
-            lastPaperCount = stats.total_papers;
-            lastAnalyzedCount = stats.analyzed_papers;
-            return;
-        }
-        
-        // Check if there are updates
-        const hasNewPapers = stats.total_papers > lastPaperCount;
-        const hasNewAnalysis = stats.analyzed_papers > lastAnalyzedCount;
-        
-        if (hasNewPapers || hasNewAnalysis) {
-            showUpdateNotification();
-            lastPaperCount = stats.total_papers;
-            lastAnalyzedCount = stats.analyzed_papers;
-        }
-    } catch (error) {
-        console.error('Error checking for updates:', error);
-    }
-}
 
 // Show update notification
 function showUpdateNotification() {

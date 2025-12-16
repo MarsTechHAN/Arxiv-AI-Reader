@@ -20,7 +20,6 @@
             <div class="header-actions">
                 <button id="configBtn" class="btn btn-secondary">⚙️ Config</button>
                 <button id="fetchBtn" class="btn btn-primary">🔄 Fetch Now</button>
-                <div class="stats" id="stats"></div>
             </div>
         </div>
     </header>
@@ -30,6 +29,16 @@
         <span>🎉 有新的论文更新！</span>
         <button onclick="refreshPapers()" class="btn-small">刷新查看</button>
         <button onclick="dismissUpdate()" class="btn-small btn-dismiss">×</button>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs-container">
+        <div class="container">
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="all" id="tabAll">📄 全部论文</button>
+                <button class="tab-btn" data-tab="starred" id="tabStarred">⭐ 收藏</button>
+            </div>
+        </div>
     </div>
 
     <!-- Search Bar & Controls -->

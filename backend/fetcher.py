@@ -10,10 +10,11 @@ import httpx
 import feedparser
 from bs4 import BeautifulSoup
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Optional
 import json
 from datetime import datetime
 import os
+from threading import Lock
 
 from models import Paper
 
@@ -28,6 +29,12 @@ class ArxivFetcher:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
+        # In-memory metadata cache: {paper_id: {metadata dict}}
+        # Only stores lightweight metadata, not full Paper objects
+        self._metadata_cache: Dict[str, dict] = {}
+        self._cache_lock = Lock()  # Thread-safe cache updates
+        self._cache_initialized = False
+        
         # arXiv RSS feed URLs for different categories
         self.categories = [
             "cs.AI",  # Artificial Intelligence
@@ -40,6 +47,9 @@ class ArxivFetcher:
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         }
+        
+        # Initialize cache on startup
+        self._refresh_metadata_cache()
     
     async def fetch_latest(self, max_papers_per_category: int = 100) -> List[Paper]:
         """
@@ -185,7 +195,31 @@ class ArxivFetcher:
         """
         # Check if already exists
         if self._paper_exists(arxiv_id):
-            return self.load_paper(arxiv_id)
+            paper = self.load_paper(arxiv_id)
+            # Update cache if paper exists
+            if paper.id not in self._metadata_cache:
+                # Paper exists but not in cache, refresh this entry
+                file_path = self.data_dir / f"{arxiv_id}.json"
+                if file_path.exists():
+                    try:
+                        with open(file_path) as f:
+                            data = json.load(f)
+                            with self._cache_lock:
+                                self._metadata_cache[paper.id] = {
+                                    'id': data.get('id', arxiv_id),
+                                    'file_path': file_path,
+                                    'mtime': file_path.stat().st_mtime,
+                                    'is_starred': data.get('is_starred', False),
+                                    'is_hidden': data.get('is_hidden', False),
+                                    'relevance_score': data.get('relevance_score', 0.0),
+                                    'published_date': data.get('published_date', ''),
+                                    'created_at': data.get('created_at', ''),
+                                    'extracted_keywords': data.get('extracted_keywords', []),
+                                    'detailed_summary': data.get('detailed_summary', ''),
+                                }
+                    except Exception as e:
+                        print(f"Warning: Failed to update cache for {arxiv_id}: {e}")
+            return paper
         
         async with httpx.AsyncClient(headers=self.headers, timeout=30.0, follow_redirects=True) as client:
             # Use arXiv API to get paper metadata
@@ -241,10 +275,29 @@ class ArxivFetcher:
         return (self.data_dir / f"{arxiv_id}.json").exists()
     
     def save_paper(self, paper: Paper):
-        """Save paper to JSON file"""
+        """Save paper to JSON file and update metadata cache"""
         file_path = self.data_dir / f"{paper.id}.json"
         with open(file_path, 'w') as f:
             json.dump(paper.to_dict(), f, indent=2, ensure_ascii=False)
+        
+        # Update metadata cache immediately (thread-safe)
+        with self._cache_lock:
+            try:
+                mtime = file_path.stat().st_mtime
+            except OSError:
+                mtime = 0
+            self._metadata_cache[paper.id] = {
+                'id': paper.id,
+                'file_path': file_path,  # Path object, will be used in _refresh_stale_cache_entries
+                'mtime': mtime,
+                'is_starred': paper.is_starred,
+                'is_hidden': paper.is_hidden,
+                'relevance_score': paper.relevance_score,
+                'published_date': paper.published_date,
+                'created_at': paper.created_at,
+                'extracted_keywords': paper.extracted_keywords,
+                'detailed_summary': paper.detailed_summary,
+            }
     
     # Keep _save_paper for backward compatibility
     def _save_paper(self, paper: Paper):
@@ -285,6 +338,131 @@ class ArxivFetcher:
                 continue
         
         return papers
+    
+    def _refresh_metadata_cache(self):
+        """
+        Refresh in-memory metadata cache by scanning all paper files.
+        This is called on startup and can be called periodically to sync with disk.
+        """
+        print("🔄 Refreshing metadata cache...")
+        paper_files = list(self.data_dir.glob("*.json"))
+        
+        new_cache = {}
+        for file_path in paper_files:
+            try:
+                # Check file modification time
+                mtime = file_path.stat().st_mtime
+                paper_id = file_path.stem
+                
+                # If already in cache and file hasn't changed, reuse cache
+                if paper_id in self._metadata_cache:
+                    cached = self._metadata_cache[paper_id]
+                    if cached.get('mtime') == mtime:
+                        new_cache[paper_id] = cached
+                        continue
+                
+                # Read metadata from file (only minimal fields)
+                with open(file_path) as f:
+                    data = json.load(f)
+                    new_cache[paper_id] = {
+                        'id': data.get('id', paper_id),
+                        'file_path': file_path,
+                        'mtime': mtime,
+                        'is_starred': data.get('is_starred', False),
+                        'is_hidden': data.get('is_hidden', False),
+                        'relevance_score': data.get('relevance_score', 0.0),
+                        'published_date': data.get('published_date', ''),
+                        'created_at': data.get('created_at', ''),
+                        'extracted_keywords': data.get('extracted_keywords', []),
+                        'detailed_summary': data.get('detailed_summary', ''),
+                    }
+            except Exception as e:
+                print(f"Warning: Failed to read metadata from {file_path.name}: {e}")
+                continue
+        
+        with self._cache_lock:
+            self._metadata_cache = new_cache
+        
+        print(f"✓ Metadata cache refreshed: {len(self._metadata_cache)} papers")
+        self._cache_initialized = True
+    
+    def list_papers_metadata(self, max_files: int = 10000, check_stale: bool = True) -> List[dict]:
+        """
+        List paper metadata from in-memory cache (FAST - no file I/O).
+        Returns list of dicts with: id, file_path, mtime, is_starred, is_hidden, etc.
+        
+        If cache not initialized, refresh it first.
+        If check_stale=True, verify file modification times and refresh stale entries.
+        """
+        if not self._cache_initialized:
+            print("[DEBUG] Cache not initialized, refreshing...")
+            self._refresh_metadata_cache()
+        
+        # Check for stale cache entries (files modified outside of save_paper)
+        if check_stale:
+            self._refresh_stale_cache_entries()
+        
+        # Get all metadata from cache
+        with self._cache_lock:
+            metadata_list = list(self._metadata_cache.values())
+        
+        # Sort by mtime (newest first) and limit
+        metadata_list.sort(key=lambda m: m.get('mtime', 0), reverse=True)
+        result = metadata_list[:max_files]
+        
+        # Debug: log cache stats
+        if len(result) > 0:
+            sample = result[0]
+            print(f"[DEBUG] Cache: {len(self._metadata_cache)} total, returning {len(result)}, sample keys: {list(sample.keys())}")
+        
+        return result
+    
+    def _refresh_stale_cache_entries(self):
+        """
+        Check cache entries against disk files and refresh stale ones.
+        This handles cases where files are modified outside of save_paper().
+        """
+        stale_count = 0
+        with self._cache_lock:
+            for paper_id, cached_meta in list(self._metadata_cache.items()):
+                file_path = cached_meta.get('file_path')
+                # Handle both Path objects and string paths
+                if isinstance(file_path, str):
+                    file_path = Path(file_path)
+                if not file_path or not file_path.exists():
+                    continue
+                
+                try:
+                    # Check if file was modified
+                    current_mtime = file_path.stat().st_mtime
+                    cached_mtime = cached_meta.get('mtime', 0)
+                    
+                    if current_mtime > cached_mtime:
+                        # File was modified, refresh this entry
+                        try:
+                            with open(file_path) as f:
+                                data = json.load(f)
+                                self._metadata_cache[paper_id] = {
+                                    'id': data.get('id', paper_id),
+                                    'file_path': file_path,  # Keep as Path object
+                                    'mtime': current_mtime,
+                                    'is_starred': data.get('is_starred', False),
+                                    'is_hidden': data.get('is_hidden', False),
+                                    'relevance_score': data.get('relevance_score', 0.0),
+                                    'published_date': data.get('published_date', ''),
+                                    'created_at': data.get('created_at', ''),
+                                    'extracted_keywords': data.get('extracted_keywords', []),
+                                    'detailed_summary': data.get('detailed_summary', ''),
+                                }
+                                stale_count += 1
+                        except Exception as e:
+                            print(f"Warning: Failed to refresh stale cache entry {paper_id}: {e}")
+                except OSError:
+                    # File doesn't exist or can't be accessed
+                    continue
+        
+        if stale_count > 0:
+            print(f"🔄 Refreshed {stale_count} stale cache entries")
 
 
 async def run_fetcher_loop(interval: int = 300):

@@ -22,7 +22,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from dateutil import parser as date_parser
 import json
 
 from models import Paper, Config, QAPair
@@ -50,6 +51,10 @@ async def lifespan(app: FastAPI):
         config = Config(**DEFAULT_CONFIG)
         config.save(config_path)
         print(f"✓ Created default config at {config_path}")
+    
+    # Initialize metadata cache (this happens in fetcher.__init__)
+    # Cache is now ready for fast queries
+    print("✓ Metadata cache initialized")
     
     # Start background fetcher (pending analysis handled there)
     global background_task
@@ -179,45 +184,98 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
     sort_by: 'relevance' (default), 'latest'
     keyword: filter by keyword
     starred_only: 'true' to return only starred papers, 'false' to exclude starred papers
+    
+    PERFORMANCE OPTIMIZATION: Use metadata scanning first, then load only needed papers.
     """
-    # When loading starred papers, we need ALL papers, not just the latest 1000
-    # Otherwise old starred papers might be missed
     starred_only_bool = starred_only.lower() == 'true'
+    
+    # Step 1: Scan metadata first (fast - only reads minimal JSON fields)
+    # This avoids loading all paper files into memory
+    max_scan = 10000 if starred_only_bool else 2000  # Scan more for starred, less for normal
+    metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=True)
+    
+    # Debug: log metadata stats
     if starred_only_bool:
-        # Load all papers when fetching starred papers
-        papers = fetcher.list_papers(skip=0, limit=0)  # limit=0 means load all
-    else:
-        # For normal timeline, only load recent papers
-        papers = fetcher.list_papers(skip=0, limit=1000)
+        total_starred = sum(1 for m in metadata_list if m.get('is_starred', False))
+        total_hidden = sum(1 for m in metadata_list if m.get('is_hidden', False))
+        print(f"[DEBUG] Total metadata: {len(metadata_list)}, starred: {total_starred}, hidden: {total_hidden}")
+        # If no starred papers found, force refresh cache
+        if total_starred == 0 and len(metadata_list) > 0:
+            print("[DEBUG] No starred papers in cache, forcing cache refresh...")
+            fetcher._refresh_metadata_cache()
+            metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=False)
+            total_starred = sum(1 for m in metadata_list if m.get('is_starred', False))
+            print(f"[DEBUG] After refresh: {len(metadata_list)} total, {total_starred} starred")
     
-    # Filter out hidden papers first
-    papers = [p for p in papers if not p.is_hidden]
-    
-    # Filter by starred status
+    # Step 2: Filter by starred/hidden status using metadata (no file loading)
     if starred_only_bool:
-        papers = [p for p in papers if p.is_starred]
+        filtered_metadata = [m for m in metadata_list if m.get('is_starred', False) and not m.get('is_hidden', False)]
+        print(f"[DEBUG] Filtered starred metadata: {len(filtered_metadata)}")
     else:
-        # For normal timeline, exclude starred papers (they're shown separately)
-        papers = [p for p in papers if not p.is_starred]
+        filtered_metadata = [m for m in metadata_list if not m.get('is_starred', False) and not m.get('is_hidden', False)]
     
-    # Filter by keyword if provided
+    # Step 3: Filter by keyword if provided (still using metadata)
     if keyword:
-        papers = [p for p in papers if keyword.lower() in ' '.join(p.extracted_keywords).lower()]
+        filtered_metadata = [
+            m for m in filtered_metadata 
+            if keyword.lower() in ' '.join(m.get('extracted_keywords', [])).lower()
+        ]
     
-    # Sort by relevance or latest
+    # Step 4: Sort by relevance or latest (using metadata)
     if sort_by == "relevance":
-        # Multi-level sorting: 
-        # 1. Has deep analysis (True > False) 
-        # 2. Relevance score (high > low)
-        papers.sort(key=lambda p: (
-            bool(p.detailed_summary and p.detailed_summary.strip()),  # Has deep analysis
-            p.relevance_score
+        filtered_metadata.sort(key=lambda m: (
+            bool(m.get('detailed_summary', '') and m['detailed_summary'].strip()),
+            m.get('relevance_score', 0.0)
         ), reverse=True)
     elif sort_by == "latest":
-        papers.sort(key=lambda p: p.published_date or p.created_at, reverse=True)
+        def parse_date(date_str):
+            """Parse date string to datetime object, normalize to UTC for comparison"""
+            if not date_str or not isinstance(date_str, str):
+                return None
+            try:
+                # Use dateutil.parser which handles all formats and timezones
+                dt = date_parser.parse(date_str)
+                # Normalize to UTC for consistent comparison
+                # If datetime is naive (no timezone), assume UTC
+                if dt.tzinfo is None:
+                    # Naive datetime - assume UTC
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    # Convert to UTC
+                    dt = dt.astimezone(timezone.utc)
+                return dt
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                return None
+        
+        def get_sort_date(m):
+            """Get date for sorting: prefer published_date, fallback to created_at"""
+            # Try published_date first
+            pub_date = parse_date(m.get('published_date', ''))
+            if pub_date:
+                return pub_date
+            
+            # Fallback to created_at
+            created_date = parse_date(m.get('created_at', ''))
+            if created_date:
+                return created_date
+            
+            # If both are invalid, use epoch (oldest) in UTC
+            return datetime.fromtimestamp(0, tz=timezone.utc)
+        
+        filtered_metadata.sort(key=get_sort_date, reverse=True)
     
-    # Paginate
-    papers = papers[skip:skip + limit]
+    # Step 5: Paginate (still using metadata)
+    paginated_metadata = filtered_metadata[skip:skip + limit]
+    
+    # Step 6: NOW load only the papers we actually need (lazy loading)
+    papers = []
+    for meta in paginated_metadata:
+        try:
+            paper = fetcher.load_paper(meta['id'])
+            papers.append(paper)
+        except Exception as e:
+            print(f"Warning: Failed to load paper {meta['id']}: {e}")
+            continue
     
     # Return simplified data for timeline
     return [
@@ -563,7 +621,8 @@ async def star_paper(paper_id: str):
     try:
         paper = fetcher.load_paper(paper_id)
         paper.is_starred = not paper.is_starred  # Toggle
-        fetcher.save_paper(paper)
+        fetcher.save_paper(paper)  # This updates cache automatically
+        print(f"[DEBUG] Starred paper {paper_id}: is_starred={paper.is_starred}")
         return {"message": "论文已收藏" if paper.is_starred else "取消收藏", "is_starred": paper.is_starred}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
@@ -587,25 +646,6 @@ async def update_relevance(paper_id: str, request: UpdateRelevanceRequest):
         raise HTTPException(status_code=404, detail="Paper not found")
 
 
-@app.get("/stats")
-async def get_stats():
-    """Get system statistics"""
-    papers = fetcher.list_papers(limit=10000)
-    
-    total = len(papers)
-    analyzed = len([p for p in papers if p.is_relevant is not None])
-    relevant = len([p for p in papers if p.is_relevant])
-    starred = len([p for p in papers if p.is_starred])
-    hidden = len([p for p in papers if p.is_hidden])
-    
-    return {
-        "total_papers": total,
-        "analyzed_papers": analyzed,
-        "relevant_papers": relevant,
-        "starred_papers": starred,
-        "hidden_papers": hidden,
-        "pending_analysis": total - analyzed,
-    }
 
 
 # ============ Background Tasks ============

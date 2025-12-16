@@ -71,6 +71,42 @@ body.modal-open {
     color: var(--text-muted);
 }
 
+/* Tabs */
+.tabs-container {
+    background: var(--bg-light);
+    border-bottom: 1px solid var(--border);
+}
+
+.tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 2px solid var(--border);
+}
+
+.tab-btn {
+    padding: 12px 24px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-bottom: -2px;
+}
+
+.tab-btn:hover {
+    color: var(--text);
+    background: var(--bg-lighter);
+}
+
+.tab-btn.active {
+    color: var(--primary);
+    border-bottom-color: var(--primary);
+    background: transparent;
+}
+
 /* Search */
 .search-container {
     background: var(--bg-light);

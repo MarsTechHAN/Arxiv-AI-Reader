@@ -37,6 +37,45 @@ class DeepSeekAnalyzer:
         self.data_dir = Path("data/papers")
         self.data_dir.mkdir(parents=True, exist_ok=True)
     
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        Estimate token count from text.
+        Conservative estimate: 1 token ≈ 3 chars (accounts for Chinese/English mix).
+        """
+        if not text:
+            return 0
+        return len(text) // 3
+    
+    def _truncate_content_to_fit_tokens(
+        self,
+        content: str,
+        max_tokens: int,
+        reserved_tokens: int = 10000
+    ) -> str:
+        """
+        Truncate content to fit within token limit.
+        
+        Args:
+            content: Content to truncate
+            max_tokens: Maximum total tokens (model limit, e.g., 131072)
+            reserved_tokens: Tokens reserved for system prompt, question, response, etc.
+        
+        Returns:
+            Truncated content with truncation notice
+        """
+        available_tokens = max_tokens - reserved_tokens
+        if available_tokens <= 0:
+            return "[Content too large, cannot fit]"
+        
+        current_tokens = self._estimate_tokens(content)
+        if current_tokens <= available_tokens:
+            return content
+        
+        # Truncate to fit
+        max_chars = available_tokens * 3  # Convert back to chars
+        truncated = content[:max_chars]
+        return truncated + "\n\n[Content truncated due to token limit]"
+    
     async def stage1_filter(self, paper: Paper, config: Config) -> Paper:
         """
         Stage 1: Quick filter.
@@ -131,10 +170,41 @@ class DeepSeekAnalyzer:
         
         # Build cache prefix (system prompt + paper content)
         # This stays the same for all questions -> KV cache hit
+        # Limit content to fit within 100K tokens (safe limit)
+        MODEL_MAX_TOKENS = 100000  # 100K tokens max
+        
+        # Calculate fixed parts token count (system prompt + title + format strings)
+        # Format: "Paper Title: {title}\n\nPaper Content:\n{content}\n\nQuestion: {question}"
+        system_tokens = self._estimate_tokens(config.system_prompt)
+        title_format_tokens = self._estimate_tokens(f"Paper Title: {paper.title}\n\nPaper Content:\n")
+        question_format_tokens = self._estimate_tokens("\n\nQuestion: ")  # Max question length estimate
+        max_question_tokens = 1000  # Reserve for longest question
+        response_tokens = config.max_tokens
+        overhead_tokens = 1000  # Safety margin
+        
+        # Calculate available tokens for content
+        fixed_tokens = system_tokens + title_format_tokens + question_format_tokens + max_question_tokens + response_tokens + overhead_tokens
+        available_content_tokens = MODEL_MAX_TOKENS - fixed_tokens
+        
+        if available_content_tokens <= 0:
+            print(f"  ⚠️  Cannot fit paper {paper.id} even without content (fixed parts: {fixed_tokens} tokens)")
+            return paper
+        
+        # Truncate content to fit
+        content = paper.html_content or paper.abstract
+        content_tokens = self._estimate_tokens(content)
+        
+        if content_tokens > available_content_tokens:
+            # Truncate to fit
+            max_chars = available_content_tokens * 3  # Convert back to chars
+            truncated = content[:max_chars]
+            content = truncated + "\n\n[Content truncated due to token limit]"
+            print(f"  ⚠️  Content truncated for {paper.id} (from {content_tokens} to ~{available_content_tokens} tokens)")
+        
         cache_prefix = f"""Paper Title: {paper.title}
 
 Paper Content:
-{paper.html_content or paper.abstract}
+{content}
 """
         
         # 1. Generate detailed summary first
@@ -265,35 +335,108 @@ Paper Content:
                 })
                 current_id = qa.parent_qa_id
         
-        # Build enhanced context
+        # Build enhanced context with token limit enforcement
+        MODEL_MAX_TOKENS = 100000  # 100K tokens max
+        
+        # Calculate fixed parts token count accurately
+        system_tokens = self._estimate_tokens(config.system_prompt)
+        conversation_tokens = sum(
+            self._estimate_tokens(f"Question: {c['question']}") + self._estimate_tokens(c['answer'])
+            for c in conversation_history
+        ) if conversation_history else 0
+        question_format_tokens = self._estimate_tokens("\n\nQuestion: ")
+        max_question_tokens = self._estimate_tokens(question)  # Actual question length
+        response_tokens = config.max_tokens
+        overhead_tokens = 1000  # Safety margin
+        
+        # Calculate available tokens for content
+        fixed_tokens = system_tokens + conversation_tokens + question_format_tokens + max_question_tokens + response_tokens + overhead_tokens
+        available_content_tokens = MODEL_MAX_TOKENS - fixed_tokens
+        
+        if available_content_tokens <= 0:
+            print(f"  ⚠️  Cannot fit question even without content (fixed parts: {fixed_tokens} tokens)")
+            return
+        
         if referenced_papers:
             enhanced_question = question
             for ref_id, title in id_to_title.items():
                 enhanced_question = enhanced_question.replace(f"[{ref_id}]", f'"{title}"')
             
+            # Build context with all papers, but truncate each to fit
+            # Calculate format tokens for context structure
+            format_parts = [
+                "=== CURRENT PAPER ===",
+                f"Title: {paper.title}",
+                "Content:\n",
+                ""
+            ]
+            format_tokens = self._estimate_tokens("\n".join(format_parts))
+            
+            # For each referenced paper, add format tokens
+            for idx in range(1, len(referenced_papers) + 1):
+                ref_format = f"=== REFERENCE PAPER {idx} ===\nTitle: {referenced_papers[idx-1].title}\nContent:\n\n"
+                format_tokens += self._estimate_tokens(ref_format)
+            
+            # Available tokens for actual content (distribute evenly)
+            num_papers = 1 + len(referenced_papers)
+            available_content_per_paper = (available_content_tokens - format_tokens) // num_papers
+            
+            if available_content_per_paper <= 0:
+                print(f"  ⚠️  Cannot fit papers even with empty content (format: {format_tokens} tokens)")
+                return
+            
             context_parts = [
                 "=== CURRENT PAPER ===",
                 f"Title: {paper.title}",
-                f"Content:\n{paper.html_content or paper.abstract}",
-                ""
             ]
             
+            # Truncate current paper content
+            current_content = paper.html_content or paper.abstract
+            current_tokens = self._estimate_tokens(current_content)
+            if current_tokens > available_content_per_paper:
+                max_chars = available_content_per_paper * 3
+                current_content = current_content[:max_chars] + "\n\n[Content truncated due to token limit]"
+                print(f"  ⚠️  Current paper content truncated (from {current_tokens} to ~{available_content_per_paper} tokens)")
+            context_parts.append(f"Content:\n{current_content}")
+            context_parts.append("")
+            
+            # Truncate each referenced paper
             for idx, ref_paper in enumerate(referenced_papers, 1):
-                context_parts.extend([
-                    f"=== REFERENCE PAPER {idx} ===",
-                    f"Title: {ref_paper.title}",
-                    f"Content:\n{ref_paper.html_content or ref_paper.abstract}",
-                    ""
-                ])
+                context_parts.append(f"=== REFERENCE PAPER {idx} ===")
+                context_parts.append(f"Title: {ref_paper.title}")
+                ref_content = ref_paper.html_content or ref_paper.abstract
+                ref_tokens = self._estimate_tokens(ref_content)
+                if ref_tokens > available_content_per_paper:
+                    max_chars = available_content_per_paper * 3
+                    ref_content = ref_content[:max_chars] + "\n\n[Content truncated due to token limit]"
+                    print(f"  ⚠️  Reference paper {idx} content truncated (from {ref_tokens} to ~{available_content_per_paper} tokens)")
+                context_parts.append(f"Content:\n{ref_content}")
+                context_parts.append("")
             
             cache_prefix = "\n".join(context_parts)
             final_question = enhanced_question
             cache_id = f"{paper.id}_with_refs"
         else:
+            # Single paper: truncate content to fit
+            # Format: "Paper Title: {title}\n\nPaper Content:\n{content}"
+            title_format_tokens = self._estimate_tokens(f"Paper Title: {paper.title}\n\nPaper Content:\n")
+            available_for_content = available_content_tokens - title_format_tokens
+            
+            if available_for_content <= 0:
+                print(f"  ⚠️  Cannot fit paper even without content (title format: {title_format_tokens} tokens)")
+                return
+            
+            content = paper.html_content or paper.abstract
+            content_tokens = self._estimate_tokens(content)
+            if content_tokens > available_for_content:
+                max_chars = available_for_content * 3
+                content = content[:max_chars] + "\n\n[Content truncated due to token limit]"
+                print(f"  ⚠️  Content truncated (from {content_tokens} to ~{available_for_content} tokens)")
+            
             cache_prefix = f"""Paper Title: {paper.title}
 
 Paper Content:
-{paper.html_content or paper.abstract}
+{content}
 """
             final_question = question
             cache_id = paper.id
@@ -408,28 +551,76 @@ Paper Content:
                     print(f"   ✗ Failed to load {ref_id}: {e}")
                     # Continue with available papers
         
-        # Build enhanced context
+        # Build enhanced context with token limit enforcement
+        MODEL_MAX_TOKENS = 100000  # 100K tokens max
+        
+        # Calculate fixed parts token count
+        system_tokens = self._estimate_tokens(config.system_prompt)
+        question_format_tokens = self._estimate_tokens("\n\nQuestion: ")
+        max_question_tokens = self._estimate_tokens(question)
+        response_tokens = config.max_tokens
+        overhead_tokens = 1000
+        
+        # Calculate available tokens for content
+        fixed_tokens = system_tokens + question_format_tokens + max_question_tokens + response_tokens + overhead_tokens
+        available_content_tokens = MODEL_MAX_TOKENS - fixed_tokens
+        
+        if available_content_tokens <= 0:
+            raise ValueError(f"Cannot fit question even without content (fixed parts: {fixed_tokens} tokens)")
+        
         if referenced_papers:
             # Replace IDs with titles in question
             enhanced_question = question
             for ref_id, title in id_to_title.items():
                 enhanced_question = enhanced_question.replace(f"[{ref_id}]", f'"{title}"')
             
+            # Calculate format tokens for context structure
+            format_parts = [
+                "=== CURRENT PAPER ===",
+                f"Title: {paper.title}",
+                "Content:\n",
+                ""
+            ]
+            format_tokens = self._estimate_tokens("\n".join(format_parts))
+            
+            # For each referenced paper, add format tokens
+            for idx in range(1, len(referenced_papers) + 1):
+                ref_format = f"=== REFERENCE PAPER {idx} ===\nTitle: {referenced_papers[idx-1].title}\nContent:\n\n"
+                format_tokens += self._estimate_tokens(ref_format)
+            
+            # Available tokens for actual content (distribute evenly)
+            num_papers = 1 + len(referenced_papers)
+            available_content_per_paper = (available_content_tokens - format_tokens) // num_papers
+            
+            if available_content_per_paper <= 0:
+                raise ValueError(f"Cannot fit papers even with empty content (format: {format_tokens} tokens)")
+            
             # Build context: current paper + referenced papers
             context_parts = [
                 "=== CURRENT PAPER ===",
                 f"Title: {paper.title}",
-                f"Content:\n{paper.html_content or paper.abstract}",
-                ""
             ]
             
+            # Truncate current paper content
+            current_content = paper.html_content or paper.abstract
+            current_tokens = self._estimate_tokens(current_content)
+            if current_tokens > available_content_per_paper:
+                max_chars = available_content_per_paper * 3
+                current_content = current_content[:max_chars] + "\n\n[Content truncated due to token limit]"
+            context_parts.append(f"Content:\n{current_content}")
+            context_parts.append("")
+            
+            # Truncate each referenced paper
             for idx, ref_paper in enumerate(referenced_papers, 1):
-                context_parts.extend([
-                    f"=== REFERENCE PAPER {idx} ===",
-                    f"Title: {ref_paper.title}",
-                    f"Content:\n{ref_paper.html_content or ref_paper.abstract}",
-                    ""
-                ])
+                context_parts.append(f"=== REFERENCE PAPER {idx} ===")
+                context_parts.append(f"Title: {ref_paper.title}")
+                ref_content = ref_paper.html_content or ref_paper.abstract
+                ref_tokens = self._estimate_tokens(ref_content)
+                if ref_tokens > available_content_per_paper:
+                    max_chars = available_content_per_paper * 3
+                    ref_content = ref_content[:max_chars] + "\n\n[Content truncated due to token limit]"
+                context_parts.append(f"Content:\n{ref_content}")
+                context_parts.append("")
             
             cache_prefix = "\n".join(context_parts)
             final_question = enhanced_question
@@ -437,10 +628,23 @@ Paper Content:
             cache_id = f"{paper.id}_with_refs"
         else:
             # Standard single-paper question
+            # Format: "Paper Title: {title}\n\nPaper Content:\n{content}"
+            title_format_tokens = self._estimate_tokens(f"Paper Title: {paper.title}\n\nPaper Content:\n")
+            available_for_content = available_content_tokens - title_format_tokens
+            
+            if available_for_content <= 0:
+                raise ValueError(f"Cannot fit paper even without content (title format: {title_format_tokens} tokens)")
+            
+            content = paper.html_content or paper.abstract
+            content_tokens = self._estimate_tokens(content)
+            if content_tokens > available_for_content:
+                max_chars = available_for_content * 3
+                content = content[:max_chars] + "\n\n[Content truncated due to token limit]"
+            
             cache_prefix = f"""Paper Title: {paper.title}
 
 Paper Content:
-{paper.html_content or paper.abstract}
+{content}
 """
             final_question = question
             cache_id = paper.id
