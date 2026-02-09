@@ -295,6 +295,7 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
             "created_at": p.created_at,
             "has_qa": len(p.qa_pairs) > 0,
             "detailed_summary": p.detailed_summary,  # For Stage 2 status detection
+            "tags": getattr(p, 'tags', []),  # AI-generated tags
         }
         for p in papers
     ]
@@ -456,11 +457,49 @@ async def update_config(request: UpdateConfigRequest):
     return {"message": "Config updated", "config": config.to_dict()}
 
 
+def _calculate_similarity(query: str, text: str) -> float:
+    """
+    Calculate text similarity score (0-1).
+    Uses simple word overlap and frequency.
+    """
+    if not text:
+        return 0.0
+    
+    query_lower = query.lower()
+    text_lower = text.lower()
+    
+    # Exact match bonus
+    if query_lower in text_lower:
+        exact_bonus = 0.3
+    else:
+        exact_bonus = 0.0
+    
+    # Word overlap score
+    query_words = set(query_lower.split())
+    text_words = set(text_lower.split())
+    
+    if not query_words:
+        return 0.0
+    
+    # Calculate Jaccard similarity (intersection over union)
+    intersection = len(query_words & text_words)
+    union = len(query_words | text_words)
+    jaccard = intersection / union if union > 0 else 0.0
+    
+    # Word frequency score (how many query words appear in text)
+    word_freq_score = sum(1 for word in query_words if word in text_lower) / len(query_words)
+    
+    # Combined score
+    similarity = (jaccard * 0.4 + word_freq_score * 0.3 + exact_bonus)
+    return min(1.0, similarity)
+
+
 @app.get("/search")
 async def search_papers(q: str, limit: int = 50):
     """
     Search papers by keyword, full-text, or arXiv ID.
-    If query looks like arXiv ID (e.g., 2510.09212), fetch if not exists.
+    Supports abstract matching and author matching with similarity scoring.
+    Uses cached metadata for fast search.
     """
     import re
     
@@ -514,50 +553,114 @@ async def search_papers(q: str, limit: int = 50):
                 "created_at": paper.created_at,
                 "has_qa": len(paper.qa_pairs) > 0,
                 "detailed_summary": paper.detailed_summary,
-                "search_score": 1000,  # High score for direct ID match
+                "search_score": 1000.0,  # High score for direct ID match
             }]
         
         except Exception as e:
             print(f"✗ Failed to fetch arXiv paper {arxiv_id}: {e}")
             raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found on arXiv")
     
-    # Normal keyword search
-    papers = fetcher.list_papers(limit=1000)
+    # Normal search using cached metadata
     q_lower = q.lower()
+    metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
     
     results = []
-    for paper in papers:
+    for meta in metadata_list:
         # Skip hidden papers
-        if paper.is_hidden:
+        if meta.get('is_hidden', False):
             continue
-            
-        # Search in title, abstract, keywords, summary
-        searchable = (
-            f"{paper.title} {paper.abstract} "
-            f"{' '.join(paper.extracted_keywords)} {paper.one_line_summary}"
-        ).lower()
         
-        if q_lower in searchable:
-            results.append({
-                "id": paper.id,
-                "title": paper.title,
-                "authors": paper.authors,
-                "abstract": paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract,
-                "url": paper.url,
-                "is_relevant": paper.is_relevant,
-                "relevance_score": paper.relevance_score,
-                "extracted_keywords": paper.extracted_keywords,
-                "one_line_summary": paper.one_line_summary,
-                "published_date": paper.published_date,
-                "is_starred": paper.is_starred,
-                "is_hidden": paper.is_hidden,
-                "created_at": paper.created_at,
-                "has_qa": len(paper.qa_pairs) > 0,
-                "detailed_summary": paper.detailed_summary,  # For Stage 2 status detection
-                "search_score": searchable.count(q_lower),  # Simple scoring
-            })
+        # Get cached data
+        paper_id = meta.get('id', '')
+        title = meta.get('title', '')  # May not be in cache, will load if needed
+        abstract = meta.get('abstract', '')
+        detailed_summary = meta.get('detailed_summary', '')
+        authors = meta.get('authors', [])
+        tags = meta.get('tags', [])
+        extracted_keywords = meta.get('extracted_keywords', [])
+        
+        # Calculate similarity scores
+        title_score = 0.0
+        abstract_score = 0.0
+        summary_score = 0.0
+        author_score = 0.0
+        tag_score = 0.0
+        
+        # Title matching (highest weight)
+        if title:
+            title_score = _calculate_similarity(q, title) * 2.0  # Double weight for title
+        else:
+            # Load paper to get title if not cached
+            try:
+                paper = fetcher.load_paper(paper_id)
+                title = paper.title
+                title_score = _calculate_similarity(q, title) * 2.0
+            except:
+                pass
+        
+        # Abstract matching
+        if abstract:
+            abstract_score = _calculate_similarity(q, abstract)
+        
+        # Detailed summary matching
+        if detailed_summary:
+            summary_score = _calculate_similarity(q, detailed_summary) * 1.5  # Higher weight
+        
+        # Author matching
+        authors_text = ' '.join(authors).lower()
+        if authors_text:
+            # Check if query matches any author name
+            query_words = set(q_lower.split())
+            author_match = any(
+                any(word in author.lower() for word in query_words)
+                for author in authors
+            )
+            if author_match:
+                author_score = 0.8  # Fixed high score for author match
+        
+        # Tag matching
+        tags_text = ' '.join(tags + extracted_keywords).lower()
+        if tags_text:
+            tag_score = _calculate_similarity(q, tags_text) * 1.2
+        
+        # Combined score
+        total_score = (
+            title_score +
+            abstract_score +
+            summary_score +
+            author_score +
+            tag_score
+        )
+        
+        # Only include papers with non-zero score
+        if total_score > 0:
+            # Load full paper for response (only if needed)
+            try:
+                paper = fetcher.load_paper(paper_id)
+                results.append({
+                    "id": paper.id,
+                    "title": paper.title,
+                    "authors": paper.authors,
+                    "abstract": paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract,
+                    "url": paper.url,
+                    "is_relevant": paper.is_relevant,
+                    "relevance_score": paper.relevance_score,
+                    "extracted_keywords": paper.extracted_keywords,
+                    "one_line_summary": paper.one_line_summary,
+                    "published_date": paper.published_date,
+                    "is_starred": paper.is_starred,
+                    "is_hidden": paper.is_hidden,
+                    "created_at": paper.created_at,
+                    "has_qa": len(paper.qa_pairs) > 0,
+                    "detailed_summary": paper.detailed_summary,
+                    "tags": getattr(paper, 'tags', []),
+                    "search_score": total_score,
+                })
+            except Exception as e:
+                print(f"Warning: Failed to load paper {paper_id} for search: {e}")
+                continue
     
-    # Sort by search score
+    # Sort by search score (descending)
     results.sort(key=lambda x: x["search_score"], reverse=True)
     
     return results[:limit]

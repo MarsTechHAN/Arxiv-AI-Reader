@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import time
+import httpx
 
 from models import Paper, QAPair, Config
 
@@ -29,9 +30,20 @@ class DeepSeekAnalyzer:
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not set")
         
+        # Configure httpx client with connection pool for better concurrency
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=30.0),  # 5min total, 30s connect
+            limits=httpx.Limits(
+                max_keepalive_connections=100,  # Keep connections alive
+                max_connections=200,  # Max concurrent connections
+            ),
+            http2=True,  # Enable HTTP/2 for better performance
+        )
+        
         self.client = AsyncOpenAI(
             api_key=self.api_key,
-            base_url="https://api.deepseek.com"
+            base_url="https://api.deepseek.com",
+            http_client=http_client,
         )
         
         self.data_dir = Path("data/papers")
@@ -40,11 +52,84 @@ class DeepSeekAnalyzer:
     def _estimate_tokens(self, text: str) -> int:
         """
         Estimate token count from text.
-        Conservative estimate: 1 token ≈ 3 chars (accounts for Chinese/English mix).
+        Very conservative estimate to avoid exceeding model limits.
+        Uses 1.5 chars per token (very conservative for mixed Chinese/English).
         """
         if not text:
             return 0
-        return len(text) // 3
+        # Use 1.5 chars per token for very conservative estimation
+        # This accounts for Chinese characters (often 1 char = 1 token) and English (often 4 chars = 1 token)
+        return int(len(text) / 1.5)
+    
+    def _is_token_limit_error(self, error: Exception) -> bool:
+        """
+        Check if error is a token limit error.
+        """
+        error_str = str(error)
+        return (
+            "maximum context length" in error_str.lower() or
+            "invalid_request_error" in error_str.lower() and "token" in error_str.lower()
+        )
+    
+    def _truncate_cache_prefix(self, cache_prefix: str, truncate_ratio: float = 0.15) -> str:
+        """
+        Truncate cache_prefix by a certain ratio from the end.
+        Handles multiple formats: single paper, multi-paper, etc.
+        
+        Args:
+            cache_prefix: The content to truncate
+            truncate_ratio: Ratio to truncate (0.15 = truncate 15% from end)
+        
+        Returns:
+            Truncated cache_prefix
+        """
+        if not cache_prefix:
+            return cache_prefix
+        
+        # Calculate truncation length
+        truncate_length = int(len(cache_prefix) * truncate_ratio)
+        if truncate_length <= 0:
+            return cache_prefix
+        
+        # Try to truncate intelligently: find the last "Content:\n" section and truncate from there
+        # This preserves structure better than just truncating from the end
+        
+        # Check for multi-paper format (=== REFERENCE PAPER ===)
+        if "=== REFERENCE PAPER" in cache_prefix:
+            # Multi-paper format: truncate from the last paper's content
+            parts = cache_prefix.rsplit("Content:\n", 1)
+            if len(parts) == 2:
+                header = parts[0] + "Content:\n"
+                last_content = parts[1]
+                if len(last_content) > truncate_length:
+                    truncated_content = last_content[:-truncate_length]
+                    return header + truncated_content + "\n\n[Content truncated due to token limit]"
+        
+        # Check for single paper format (Paper Content:\n)
+        content_marker = "Paper Content:\n"
+        if content_marker in cache_prefix:
+            parts = cache_prefix.split(content_marker, 1)
+            if len(parts) == 2:
+                header = parts[0] + content_marker
+                content = parts[1]
+                if len(content) > truncate_length:
+                    truncated_content = content[:-truncate_length]
+                    return header + truncated_content + "\n\n[Content truncated due to token limit]"
+        
+        # Check for generic "Content:\n" format
+        if "Content:\n" in cache_prefix:
+            parts = cache_prefix.rsplit("Content:\n", 1)
+            if len(parts) == 2:
+                header = parts[0] + "Content:\n"
+                content = parts[1]
+                if len(content) > truncate_length:
+                    truncated_content = content[:-truncate_length]
+                    return header + truncated_content + "\n\n[Content truncated due to token limit]"
+        
+        # Fallback: truncate from end
+        if len(cache_prefix) > truncate_length:
+            return cache_prefix[:-truncate_length] + "\n\n[Content truncated due to token limit]"
+        return cache_prefix
     
     def _truncate_content_to_fit_tokens(
         self,
@@ -71,8 +156,8 @@ class DeepSeekAnalyzer:
         if current_tokens <= available_tokens:
             return content
         
-        # Truncate to fit
-        max_chars = available_tokens * 3  # Convert back to chars
+        # Truncate to fit (use 1.5 chars per token to match estimation)
+        max_chars = int(available_tokens * 1.5)
         truncated = content[:max_chars]
         return truncated + "\n\n[Content truncated due to token limit]"
     
@@ -170,8 +255,8 @@ class DeepSeekAnalyzer:
         
         # Build cache prefix (system prompt + paper content)
         # This stays the same for all questions -> KV cache hit
-        # Limit content to fit within 100K tokens (safe limit)
-        MODEL_MAX_TOKENS = 100000  # 100K tokens max
+        # Limit content to fit within model's token limit
+        MODEL_MAX_TOKENS = 100000  # Very conservative limit (model max is 131072)
         
         # Calculate fixed parts token count (system prompt + title + format strings)
         # Format: "Paper Title: {title}\n\nPaper Content:\n{content}\n\nQuestion: {question}"
@@ -195,11 +280,73 @@ class DeepSeekAnalyzer:
         content_tokens = self._estimate_tokens(content)
         
         if content_tokens > available_content_tokens:
-            # Truncate to fit
-            max_chars = available_content_tokens * 3  # Convert back to chars
+            # Truncate to fit (use 1.5 chars per token to match estimation)
+            max_chars = int(available_content_tokens * 1.5)
             truncated = content[:max_chars]
             content = truncated + "\n\n[Content truncated due to token limit]"
             print(f"  ⚠️  Content truncated for {paper.id} (from {content_tokens} to ~{available_content_tokens} tokens)")
+        
+        # 1. Generate detailed summary and tags first
+        # Prepare existing tags (from extracted_keywords) for reference
+        existing_tags = paper.extracted_keywords if paper.extracted_keywords else []
+        existing_tags_str = ", ".join(existing_tags) if existing_tags else "无"
+        
+        detailed_summary_question = f"""请用中文生成这篇论文的详细摘要（约200-300字），包括：
+1. 研究背景和动机
+2. 核心方法和技术创新
+3. 主要实验结果
+4. 研究意义和价值
+
+使用 Markdown 格式，让摘要清晰易读。
+
+同时，请为这篇论文生成合适的标签（tags）。如果论文中已经存在以下标签，请优先使用这些标签：{existing_tags_str}
+
+请用 JSON 格式回答：
+{{
+    "summary": "详细摘要（Markdown格式）",
+    "tags": ["标签1", "标签2", "标签3", ...]
+}}
+
+注意：tags应该包含3-8个关键词，涵盖论文的核心主题、方法和技术。如果给定的标签已经很好地描述了论文，请优先使用它们。"""
+        
+        # Final token check before asking question
+        MODEL_MAX_TOKENS = 131072  # Actual model limit
+        system_tokens = self._estimate_tokens(config.system_prompt)
+        title_format = f"Paper Title: {paper.title}\n\nPaper Content:\n"
+        title_tokens = self._estimate_tokens(title_format)
+        content_tokens_final = self._estimate_tokens(content)
+        question_tokens = self._estimate_tokens(detailed_summary_question)
+        question_format_tokens = self._estimate_tokens("\n\nQuestion: ")
+        response_tokens = config.max_tokens
+        overhead_tokens = 500
+        
+        total_tokens = system_tokens + title_tokens + content_tokens_final + question_format_tokens + question_tokens + response_tokens + overhead_tokens
+        
+        if total_tokens > MODEL_MAX_TOKENS:
+            # Further truncate content
+            available_for_content = MODEL_MAX_TOKENS - (
+                system_tokens + title_tokens + question_format_tokens + question_tokens + response_tokens + overhead_tokens
+            )
+            if available_for_content > 0:
+                max_chars = int(available_for_content * 1.5)
+                content = content[:max_chars] + "\n\n[Content truncated due to token limit]"
+                # Re-verify after truncation
+                content_tokens_final = self._estimate_tokens(content)
+                total_tokens = system_tokens + title_tokens + content_tokens_final + question_format_tokens + question_tokens + response_tokens + overhead_tokens
+                print(f"  ⚠️  Final truncation in stage2_qa: content reduced to ~{available_for_content} tokens (total: {total_tokens})")
+                if total_tokens > MODEL_MAX_TOKENS:
+                    # Still too large, truncate more aggressively
+                    available_for_content = int((MODEL_MAX_TOKENS - (total_tokens - content_tokens_final)) * 0.9)
+                    if available_for_content > 0:
+                        max_chars = int(available_for_content * 1.5)
+                        content = content[:max_chars] + "\n\n[Content truncated due to token limit]"
+                        print(f"  ⚠️  Aggressive truncation in stage2_qa: content reduced to ~{available_for_content} tokens")
+                    else:
+                        print(f"  ⚠️  Cannot fit question even with empty content (fixed parts: {total_tokens - content_tokens_final} tokens)")
+                        return paper
+            else:
+                print(f"  ⚠️  Cannot fit question even with empty content (fixed parts: {total_tokens - content_tokens_final} tokens)")
+                return paper
         
         cache_prefix = f"""Paper Title: {paper.title}
 
@@ -207,29 +354,42 @@ Paper Content:
 {content}
 """
         
-        # 1. Generate detailed summary first
-        detailed_summary_question = """请用中文生成这篇论文的详细摘要（约200-300字），包括：
-1. 研究背景和动机
-2. 核心方法和技术创新
-3. 主要实验结果
-4. 研究意义和价值
-
-使用 Markdown 格式，让摘要清晰易读。"""
-        
-        detailed_summary = await self._ask_question_with_retry(
+        summary_response = await self._ask_question_with_retry(
             cache_prefix=cache_prefix,
             question=detailed_summary_question,
             config=config,
             cache_id=paper.id
         )
         
-        if detailed_summary is None:
+        if summary_response is None:
             # Failed after retries - do NOT save
             print(f"  Stage 2 FAILED to generate summary for {paper.id}")
             return paper
         
-        paper.detailed_summary = detailed_summary
-        print(f"  Stage 2: Generated detailed summary for {paper.id}")
+        # Parse JSON response
+        try:
+            summary_data = json.loads(summary_response)
+            paper.detailed_summary = summary_data.get("summary", summary_response)
+            generated_tags = summary_data.get("tags", [])
+            
+            # Merge tags: prioritize existing tags, then add generated ones
+            if existing_tags:
+                # Use existing tags as base, add generated ones that don't exist
+                merged_tags = list(existing_tags)
+                for tag in generated_tags:
+                    if tag not in merged_tags:
+                        merged_tags.append(tag)
+                paper.tags = merged_tags[:10]  # Limit to 10 tags
+            else:
+                paper.tags = generated_tags[:10] if generated_tags else []
+            
+            print(f"  Stage 2: Generated summary and {len(paper.tags)} tags for {paper.id}")
+        except json.JSONDecodeError:
+            # Fallback: treat as plain text summary
+            paper.detailed_summary = summary_response
+            # Use existing tags if available
+            paper.tags = list(existing_tags) if existing_tags else []
+            print(f"  Stage 2: Generated summary (JSON parse failed, using existing tags) for {paper.id}")
         
         # 2. Ask each preset question
         all_success = True
@@ -336,7 +496,7 @@ Paper Content:
                 current_id = qa.parent_qa_id
         
         # Build enhanced context with token limit enforcement
-        MODEL_MAX_TOKENS = 100000  # 100K tokens max
+        MODEL_MAX_TOKENS = 100000  # Very conservative limit (model max is 131072)
         
         # Calculate fixed parts token count accurately
         system_tokens = self._estimate_tokens(config.system_prompt)
@@ -394,7 +554,7 @@ Paper Content:
             current_content = paper.html_content or paper.abstract
             current_tokens = self._estimate_tokens(current_content)
             if current_tokens > available_content_per_paper:
-                max_chars = available_content_per_paper * 3
+                max_chars = int(available_content_per_paper * 1.5)
                 current_content = current_content[:max_chars] + "\n\n[Content truncated due to token limit]"
                 print(f"  ⚠️  Current paper content truncated (from {current_tokens} to ~{available_content_per_paper} tokens)")
             context_parts.append(f"Content:\n{current_content}")
@@ -407,7 +567,7 @@ Paper Content:
                 ref_content = ref_paper.html_content or ref_paper.abstract
                 ref_tokens = self._estimate_tokens(ref_content)
                 if ref_tokens > available_content_per_paper:
-                    max_chars = available_content_per_paper * 3
+                    max_chars = int(available_content_per_paper * 1.5)
                     ref_content = ref_content[:max_chars] + "\n\n[Content truncated due to token limit]"
                     print(f"  ⚠️  Reference paper {idx} content truncated (from {ref_tokens} to ~{available_content_per_paper} tokens)")
                 context_parts.append(f"Content:\n{ref_content}")
@@ -429,7 +589,7 @@ Paper Content:
             content = paper.html_content or paper.abstract
             content_tokens = self._estimate_tokens(content)
             if content_tokens > available_for_content:
-                max_chars = available_for_content * 3
+                max_chars = int(available_for_content * 1.5)
                 content = content[:max_chars] + "\n\n[Content truncated due to token limit]"
                 print(f"  ⚠️  Content truncated (from {content_tokens} to ~{available_for_content} tokens)")
             
@@ -448,9 +608,10 @@ Paper Content:
         # Choose model based on reasoning mode
         model = "deepseek-reasoner" if is_reasoning else config.model
         
-        # Retry logic for streaming (up to 3 attempts)
+        # Retry logic for streaming (up to 3 attempts) with dynamic token truncation
         max_retries = 3
         success = False
+        current_cache_prefix = cache_prefix
         
         for attempt in range(max_retries):
             try:
@@ -458,7 +619,7 @@ Paper Content:
                 full_thinking = ""
                 
                 async for chunk in self._ask_question_stream(
-                    cache_prefix, 
+                    current_cache_prefix, 
                     final_question, 
                     config, 
                     cache_id,
@@ -478,15 +639,43 @@ Paper Content:
                 break  # Success, exit retry loop
                 
             except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    print(f"  Stream retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
-                    yield {"type": "error", "chunk": f"⚠️ Connection error, retrying in {wait_time}s...\n"}
-                    await asyncio.sleep(wait_time)
+                error_str = str(e)
+                
+                # Check if it's a token limit error
+                if self._is_token_limit_error(e):
+                    # Truncate cache_prefix by 15% for each retry
+                    truncate_ratio = 0.15 * (attempt + 1)  # Increase truncation with each attempt
+                    if len(current_cache_prefix) > 1000:  # Only truncate if content is substantial
+                        old_length = len(current_cache_prefix)
+                        current_cache_prefix = self._truncate_cache_prefix(current_cache_prefix, truncate_ratio)
+                        new_length = len(current_cache_prefix)
+                        print(f"  ⚠️  Token limit error detected in stream, truncating cache_prefix: {old_length} -> {new_length} chars (attempt {attempt + 1}/{max_retries})")
+                        yield {"type": "error", "chunk": f"⚠️ Token limit exceeded, truncating content and retrying (attempt {attempt + 1}/{max_retries})...\n"}
+                        
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            await asyncio.sleep(wait_time)
+                            continue  # Retry with truncated content
+                        else:
+                            print(f"  Stream FAILED after {max_retries} attempts with truncation: {e}")
+                            yield {"type": "error", "chunk": f"❌ Failed after {max_retries} attempts with truncation: {str(e)}\n"}
+                            return  # Don't save on failure
+                    else:
+                        # Content too small to truncate further
+                        print(f"  Stream FAILED: Content too small to truncate further: {e}")
+                        yield {"type": "error", "chunk": f"❌ Content too small to truncate further: {str(e)}\n"}
+                        return  # Don't save on failure
                 else:
-                    print(f"  Stream FAILED after {max_retries} attempts: {e}")
-                    yield {"type": "error", "chunk": f"❌ Failed after {max_retries} attempts: {str(e)}"}
-                    return  # Don't save on failure
+                    # Not a token limit error, use normal retry logic
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        print(f"  Stream retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
+                        yield {"type": "error", "chunk": f"⚠️ Connection error, retrying in {wait_time}s...\n"}
+                        await asyncio.sleep(wait_time)
+                    else:
+                        print(f"  Stream FAILED after {max_retries} attempts: {e}")
+                        yield {"type": "error", "chunk": f"❌ Failed after {max_retries} attempts: {str(e)}\n"}
+                        return  # Don't save on failure
         
         # Save to paper ONLY if successful
         if success and (full_answer or full_thinking):
@@ -552,7 +741,7 @@ Paper Content:
                     # Continue with available papers
         
         # Build enhanced context with token limit enforcement
-        MODEL_MAX_TOKENS = 100000  # 100K tokens max
+        MODEL_MAX_TOKENS = 100000  # Very conservative limit (model max is 131072)
         
         # Calculate fixed parts token count
         system_tokens = self._estimate_tokens(config.system_prompt)
@@ -605,7 +794,7 @@ Paper Content:
             current_content = paper.html_content or paper.abstract
             current_tokens = self._estimate_tokens(current_content)
             if current_tokens > available_content_per_paper:
-                max_chars = available_content_per_paper * 3
+                max_chars = int(available_content_per_paper * 1.5)
                 current_content = current_content[:max_chars] + "\n\n[Content truncated due to token limit]"
             context_parts.append(f"Content:\n{current_content}")
             context_parts.append("")
@@ -617,7 +806,7 @@ Paper Content:
                 ref_content = ref_paper.html_content or ref_paper.abstract
                 ref_tokens = self._estimate_tokens(ref_content)
                 if ref_tokens > available_content_per_paper:
-                    max_chars = available_content_per_paper * 3
+                    max_chars = int(available_content_per_paper * 1.5)
                     ref_content = ref_content[:max_chars] + "\n\n[Content truncated due to token limit]"
                 context_parts.append(f"Content:\n{ref_content}")
                 context_parts.append("")
@@ -638,7 +827,7 @@ Paper Content:
             content = paper.html_content or paper.abstract
             content_tokens = self._estimate_tokens(content)
             if content_tokens > available_for_content:
-                max_chars = available_for_content * 3
+                max_chars = int(available_for_content * 1.5)
                 content = content[:max_chars] + "\n\n[Content truncated due to token limit]"
             
             cache_prefix = f"""Paper Title: {paper.title}
@@ -695,8 +884,47 @@ Paper Content:
                 messages.append({"role": "user", "content": f"Question: {conv['question']}"})
                 messages.append({"role": "assistant", "content": conv['answer']})
         
-        # Add current question
-        messages.append({"role": "user", "content": f"{cache_prefix}\n\nQuestion: {question}"})
+        # Build user message
+        user_content = f"{cache_prefix}\n\nQuestion: {question}"
+        
+        # Final token check before sending request
+        MODEL_MAX_TOKENS = 131072  # Actual model limit
+        total_tokens = sum(self._estimate_tokens(msg["content"]) for msg in messages)
+        total_tokens += self._estimate_tokens(user_content)
+        total_tokens += config.max_tokens  # Add response tokens
+        overhead_tokens = 500  # Message formatting overhead
+        
+        if total_tokens + overhead_tokens > MODEL_MAX_TOKENS:
+            # Need to truncate cache_prefix further
+            available_for_prefix = MODEL_MAX_TOKENS - (
+                sum(self._estimate_tokens(msg["content"]) for msg in messages) +
+                self._estimate_tokens(f"\n\nQuestion: {question}") +
+                config.max_tokens +
+                overhead_tokens
+            )
+            
+            if available_for_prefix > 0:
+                max_chars = int(available_for_prefix * 1.5)
+                if len(cache_prefix) > max_chars:
+                    cache_prefix = cache_prefix[:max_chars] + "\n\n[Content truncated due to token limit]"
+                    user_content = f"{cache_prefix}\n\nQuestion: {question}"
+                    # Re-verify after truncation
+                    total_tokens = sum(self._estimate_tokens(msg["content"]) for msg in messages)
+                    total_tokens += self._estimate_tokens(user_content)
+                    total_tokens += config.max_tokens + overhead_tokens
+                    print(f"  ⚠️  Final truncation: cache_prefix reduced to ~{available_for_prefix} tokens (total: {total_tokens})")
+                    if total_tokens > MODEL_MAX_TOKENS:
+                        # Still too large, truncate more aggressively
+                        available_for_prefix = int((MODEL_MAX_TOKENS - total_tokens + self._estimate_tokens(cache_prefix)) * 0.9)
+                        if available_for_prefix > 0:
+                            max_chars = int(available_for_prefix * 1.5)
+                            cache_prefix = cache_prefix[:max_chars] + "\n\n[Content truncated due to token limit]"
+                            user_content = f"{cache_prefix}\n\nQuestion: {question}"
+                            print(f"  ⚠️  Aggressive truncation: cache_prefix reduced to ~{available_for_prefix} tokens")
+            else:
+                raise ValueError(f"Request too large: {total_tokens + overhead_tokens} tokens exceeds limit {MODEL_MAX_TOKENS}")
+        
+        messages.append({"role": "user", "content": user_content})
         
         response = await self.client.chat.completions.create(
             model=model or config.model,
@@ -740,15 +968,59 @@ Paper Content:
         
         Key: cache_prefix stays the same, only question changes.
         """
-        response = await self.client.chat.completions.create(
-            model=config.model,
-            messages=[
+        # Final token check before sending request
+        MODEL_MAX_TOKENS = 131072  # Actual model limit
+        system_tokens = self._estimate_tokens(config.system_prompt)
+        user_content = f"{cache_prefix}\n\nQuestion: {question}"
+        user_tokens = self._estimate_tokens(user_content)
+        total_tokens = system_tokens + user_tokens + config.max_tokens + 500  # +500 for overhead
+        
+        if total_tokens > MODEL_MAX_TOKENS:
+            # Truncate cache_prefix further
+            available_for_prefix = MODEL_MAX_TOKENS - (
+                system_tokens +
+                self._estimate_tokens(f"\n\nQuestion: {question}") +
+                config.max_tokens +
+                500
+            )
+            
+            if available_for_prefix > 0:
+                max_chars = int(available_for_prefix * 1.5)
+                if len(cache_prefix) > max_chars:
+                    cache_prefix = cache_prefix[:max_chars] + "\n\n[Content truncated due to token limit]"
+                    user_content = f"{cache_prefix}\n\nQuestion: {question}"
+                    # Re-verify after truncation
+                    user_tokens = self._estimate_tokens(user_content)
+                    total_tokens = system_tokens + user_tokens + config.max_tokens + 500
+                    print(f"  ⚠️  Final truncation in _ask_question: cache_prefix reduced to ~{available_for_prefix} tokens (total: {total_tokens})")
+                    if total_tokens > MODEL_MAX_TOKENS:
+                        # Still too large, truncate more aggressively
+                        available_for_prefix = int((MODEL_MAX_TOKENS - (system_tokens + self._estimate_tokens(f"\n\nQuestion: {question}") + config.max_tokens + 500)) * 0.9)
+                        if available_for_prefix > 0:
+                            max_chars = int(available_for_prefix * 1.5)
+                            cache_prefix = cache_prefix[:max_chars] + "\n\n[Content truncated due to token limit]"
+                            user_content = f"{cache_prefix}\n\nQuestion: {question}"
+                            print(f"  ⚠️  Aggressive truncation in _ask_question: cache_prefix reduced to ~{available_for_prefix} tokens")
+            else:
+                raise ValueError(f"Request too large: {total_tokens} tokens exceeds limit {MODEL_MAX_TOKENS}")
+        
+        # Check if question asks for JSON format
+        use_json_format = "JSON" in question.upper() or "json" in question.lower()
+        
+        response_kwargs = {
+            "model": config.model,
+            "messages": [
                 {"role": "system", "content": config.system_prompt},
-                {"role": "user", "content": f"{cache_prefix}\n\nQuestion: {question}"}
+                {"role": "user", "content": user_content}
             ],
-            temperature=config.temperature,
-            max_tokens=config.max_tokens,
-        )
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
+        }
+        
+        if use_json_format:
+            response_kwargs["response_format"] = {"type": "json_object"}
+        
+        response = await self.client.chat.completions.create(**response_kwargs)
         
         return response.choices[0].message.content
     
@@ -761,20 +1033,50 @@ Paper Content:
         max_retries: int = 3
     ) -> Optional[str]:
         """
-        Ask a question with retry logic.
+        Ask a question with retry logic and dynamic token truncation.
+        When token limit error occurs, truncate cache_prefix and retry.
         Returns None if all retries fail.
         """
+        current_cache_prefix = cache_prefix
+        
         for attempt in range(max_retries):
             try:
-                return await self._ask_question(cache_prefix, question, config, cache_id)
+                return await self._ask_question(current_cache_prefix, question, config, cache_id)
             except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt
-                    print(f"  Retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
-                    await asyncio.sleep(wait_time)
+                error_str = str(e)
+                
+                # Check if it's a token limit error
+                if self._is_token_limit_error(e):
+                    # Truncate cache_prefix by 15% for each retry
+                    truncate_ratio = 0.15 * (attempt + 1)  # Increase truncation with each attempt
+                    if len(current_cache_prefix) > 1000:  # Only truncate if content is substantial
+                        old_length = len(current_cache_prefix)
+                        current_cache_prefix = self._truncate_cache_prefix(current_cache_prefix, truncate_ratio)
+                        new_length = len(current_cache_prefix)
+                        print(f"  ⚠️  Token limit error detected, truncating cache_prefix: {old_length} -> {new_length} chars (attempt {attempt + 1}/{max_retries})")
+                        
+                        if attempt < max_retries - 1:
+                            wait_time = 2 ** attempt
+                            await asyncio.sleep(wait_time)
+                            continue  # Retry with truncated content
+                        else:
+                            print(f"  FAILED after {max_retries} attempts with truncation: {e}")
+                            return None
+                    else:
+                        # Content too small to truncate further
+                        print(f"  FAILED: Content too small to truncate further: {e}")
+                        return None
                 else:
-                    print(f"  FAILED after {max_retries} attempts: {e}")
-                    return None
+                    # Not a token limit error, use normal retry logic
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        print(f"  Retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        print(f"  FAILED after {max_retries} attempts: {e}")
+                        return None
+        
+        return None
     
     def _save_paper(self, paper: Paper):
         """Save paper to JSON file"""
@@ -789,10 +1091,10 @@ Paper Content:
         skip_stage1: bool = False
     ) -> List[Paper]:
         """
-        Process multiple papers concurrently.
+        Process multiple papers concurrently with proper concurrency control.
         
-        Stage 1: Filter all papers (fast, all concurrent)
-        Stage 2: Deep analysis only for relevant papers (batched by config.concurrent_papers)
+        Stage 1: Filter papers with controlled concurrency
+        Stage 2: Deep analysis only for relevant papers with controlled concurrency
         
         Args:
             papers: List of papers to process
@@ -802,10 +1104,20 @@ Paper Content:
         if not papers:
             return papers
         
+        concurrent = config.concurrent_papers
+        
         # Stage 1: Filter papers (unless skipped)
         if not skip_stage1:
-            print(f"\n🔍 Stage 1: Filtering {len(papers)} papers...")
-            stage1_tasks = [self.stage1_filter(paper, config) for paper in papers]
+            print(f"\n🔍 Stage 1: Filtering {len(papers)} papers (concurrent={concurrent})...")
+            
+            # Use semaphore to control concurrency
+            semaphore = asyncio.Semaphore(concurrent)
+            
+            async def stage1_with_semaphore(paper: Paper) -> Paper:
+                async with semaphore:
+                    return await self.stage1_filter(paper, config)
+            
+            stage1_tasks = [stage1_with_semaphore(paper) for paper in papers]
             papers = await asyncio.gather(*stage1_tasks)
             
             # Find relevant papers with score >= min_relevance_score_for_stage2
@@ -826,15 +1138,19 @@ Paper Content:
         
         # Stage 2: Deep analysis for relevant papers
         if relevant_papers:
-            concurrent = config.concurrent_papers
             print(f"\n📚 Stage 2: Deep analysis of {len(relevant_papers)} papers (concurrent={concurrent})...")
             
-            # Process in batches to control concurrency
-            for i in range(0, len(relevant_papers), concurrent):
-                batch = relevant_papers[i:i + concurrent]
-                print(f"   Processing batch {i//concurrent + 1}/{(len(relevant_papers) + concurrent - 1)//concurrent} ({len(batch)} papers)")
-                stage2_tasks = [self.stage2_qa(paper, config) for paper in batch]
-                await asyncio.gather(*stage2_tasks)
+            # Use semaphore to control concurrency (better than batching)
+            semaphore = asyncio.Semaphore(concurrent)
+            
+            async def stage2_with_semaphore(paper: Paper) -> Paper:
+                async with semaphore:
+                    return await self.stage2_qa(paper, config)
+            
+            stage2_tasks = [stage2_with_semaphore(paper) for paper in relevant_papers]
+            await asyncio.gather(*stage2_tasks)
+            
+            print(f"✓ Completed Stage 2 analysis for {len(relevant_papers)} papers")
         
         return papers
 

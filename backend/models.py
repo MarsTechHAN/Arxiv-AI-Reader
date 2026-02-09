@@ -47,6 +47,7 @@ class Paper:
     
     # Stage 2 results (deep analysis)
     detailed_summary: str = ""  # Detailed AI-generated abstract (Chinese)
+    tags: List[str] = field(default_factory=list)  # AI-generated tags (prioritize given tags)
     qa_pairs: List[QAPair] = field(default_factory=list)
     
     # User actions

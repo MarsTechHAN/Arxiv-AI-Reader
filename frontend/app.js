@@ -10,6 +10,8 @@ let currentKeyword = null;
 let hasMorePapers = true;
 let isLoadingMore = false;
 let currentTab = 'all';  // 'all' or 'starred'
+let currentPaperList = [];  // Store current paper list for navigation
+let currentPaperIndex = -1;  // Current paper index in the list
 
 // DOM Elements
 const timeline = document.getElementById('timeline');
@@ -27,6 +29,11 @@ const tabStarred = document.getElementById('tabStarred');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
+    // Sync sortSelect with currentSortBy on initialization
+    if (sortSelect) {
+        currentSortBy = sortSelect.value;
+    }
+    
     // Restore search state from URL or sessionStorage
     restoreSearchState();
     
@@ -149,6 +156,15 @@ function setupEventListeners() {
         });
     }
     
+    // Export button for paper modal
+    const exportBtn = document.getElementById('exportBtn');
+    if (exportBtn && paperModal) {
+        exportBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            exportPaperToMarkdown(currentPaperId);
+        });
+    }
+    
     // Fullscreen toggle for paper modal
     const fullscreenBtn = document.getElementById('fullscreenBtn');
     if (fullscreenBtn && paperModal) {
@@ -157,6 +173,29 @@ function setupEventListeners() {
             paperModal.classList.toggle('fullscreen');
         });
     }
+    
+    // Keyboard navigation for paper modal (only when fullscreen)
+    document.addEventListener('keydown', (e) => {
+        if (paperModal?.classList.contains('active') && paperModal?.classList.contains('fullscreen')) {
+            // Check if input/textarea is focused (don't navigate when typing)
+            const activeElement = document.activeElement;
+            const isInputFocused = activeElement && (
+                activeElement.tagName === 'INPUT' || 
+                activeElement.tagName === 'TEXTAREA' ||
+                activeElement.isContentEditable
+            );
+            
+            if (!isInputFocused) {
+                if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    navigateToPaper(-1);  // Previous paper
+                } else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    navigateToPaper(1);  // Next paper
+                }
+            }
+        }
+    });
     
     // Load more
     loadMoreBtn.addEventListener('click', () => {
@@ -266,6 +305,7 @@ async function loadPapers(page = 0, shouldScroll = true) {
         
         if (page === 0) {
             timeline.innerHTML = '';
+            currentPaperList = [];  // Reset paper list
             hasMorePapers = true;  // Reset state
             hideEndMarker();
             
@@ -298,6 +338,18 @@ async function loadPapers(page = 0, shouldScroll = true) {
             timeline.appendChild(createPaperCard(paper));
         });
         
+        // Update current paper list for navigation
+        if (page === 0) {
+            currentPaperList = papers.map(p => p.id);
+        } else {
+            // Append new papers to the list
+            papers.forEach(paper => {
+                if (!currentPaperList.includes(paper.id)) {
+                    currentPaperList.push(paper.id);
+                }
+            });
+        }
+        
         // Show end marker if no more papers
         if (!hasMorePapers && page > 0) {
             showEndMarker();
@@ -327,14 +379,18 @@ async function searchPapers(query) {
         const results = await response.json();
         
         timeline.innerHTML = '';
+        currentPaperList = [];  // Reset paper list for search
         window.scrollTo(0, 0);
         
         if (results.length === 0) {
             timeline.innerHTML = '<p style="text-align: center; color: var(--text-muted); padding: 40px;">未找到相关论文</p>';
+            currentPaperList = [];
         } else {
             results.forEach(paper => {
                 timeline.appendChild(createPaperCard(paper));
             });
+            // Update current paper list for navigation
+            currentPaperList = results.map(p => p.id);
             // Show end marker for search results
             showEndMarker();
         }
@@ -442,6 +498,9 @@ function createPaperCard(paper) {
 // Open Paper Modal
 async function openPaperModal(paperId) {
     currentPaperId = paperId;
+    
+    // Update current paper index for navigation
+    currentPaperIndex = currentPaperList.indexOf(paperId);
     
     try {
         const response = await fetch(`${API_BASE}/papers/${paperId}`);
@@ -1239,6 +1298,11 @@ function refreshPapers() {
     dismissUpdate();
     currentPage = 0;
     
+    // Sync currentSortBy with sortSelect value before refresh
+    if (sortSelect) {
+        currentSortBy = sortSelect.value;
+    }
+    
     // Check if there's a search query
     const searchQuery = searchInput.value.trim();
     if (searchQuery) {
@@ -1352,6 +1416,118 @@ function togglePdfViewer(paperId) {
     } else {
         container.style.display = 'none';
         viewer.src = ''; // Clear iframe to stop loading
+    }
+}
+
+// Export paper to markdown
+async function exportPaperToMarkdown(paperId) {
+    if (!paperId) return;
+    
+    try {
+        const response = await fetch(`${API_BASE}/papers/${paperId}`);
+        const paper = await response.json();
+        
+        // Build markdown content
+        let markdown = `# ${paper.title}\n\n`;
+        
+        // Authors
+        if (paper.authors && paper.authors.length > 0) {
+            markdown += `**Authors:** ${paper.authors.join(', ')}\n\n`;
+        }
+        
+        // Published date
+        if (paper.published_date) {
+            try {
+                const date = new Date(paper.published_date);
+                markdown += `**Published:** ${date.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}\n\n`;
+            } catch (e) {
+                // Skip invalid dates
+            }
+        }
+        
+        // URL
+        if (paper.url) {
+            markdown += `**URL:** ${paper.url}\n\n`;
+        }
+        
+        // Relevance score
+        if (paper.relevance_score !== null && paper.relevance_score !== undefined) {
+            markdown += `**Relevance Score:** ${paper.relevance_score}/10\n\n`;
+        }
+        
+        // Keywords
+        if (paper.extracted_keywords && paper.extracted_keywords.length > 0) {
+            markdown += `**Keywords:** ${paper.extracted_keywords.join(', ')}\n\n`;
+        }
+        
+        markdown += `---\n\n`;
+        
+        // Abstract
+        if (paper.abstract) {
+            markdown += `## Abstract\n\n${paper.abstract}\n\n`;
+        }
+        
+        // Detailed summary
+        if (paper.detailed_summary) {
+            markdown += `## AI Detailed Summary\n\n${paper.detailed_summary}\n\n`;
+        } else if (paper.one_line_summary) {
+            markdown += `## AI Summary\n\n${paper.one_line_summary}\n\n`;
+        }
+        
+        // Q&A pairs
+        if (paper.qa_pairs && paper.qa_pairs.length > 0) {
+            markdown += `## Questions & Answers\n\n`;
+            paper.qa_pairs.forEach((qa, index) => {
+                markdown += `### Q${index + 1}: ${qa.question}\n\n`;
+                if (qa.thinking) {
+                    markdown += `**Thinking Process:**\n\n${qa.thinking}\n\n`;
+                }
+                markdown += `**Answer:**\n\n${qa.answer}\n\n`;
+                if (qa.parent_qa_id !== null && qa.parent_qa_id !== undefined) {
+                    markdown += `*This is a follow-up question*\n\n`;
+                }
+                markdown += `---\n\n`;
+            });
+        }
+        
+        // Create download link
+        const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        
+        // Sanitize filename
+        const safeTitle = paper.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50);
+        a.download = `${safeTitle}_${paperId}.md`;
+        
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        showSuccess('Markdown文件已下载');
+    } catch (error) {
+        console.error('Error exporting paper:', error);
+        showError('导出失败');
+    }
+}
+
+// Navigate to previous/next paper
+function navigateToPaper(direction) {
+    if (currentPaperList.length === 0 || currentPaperIndex === -1) {
+        return;
+    }
+    
+    const newIndex = currentPaperIndex + direction;
+    
+    if (newIndex < 0 || newIndex >= currentPaperList.length) {
+        return;  // Already at first/last paper
+    }
+    
+    const newPaperId = currentPaperList[newIndex];
+    if (newPaperId) {
+        currentPaperIndex = newIndex;
+        openPaperModal(newPaperId);
     }
 }
 
