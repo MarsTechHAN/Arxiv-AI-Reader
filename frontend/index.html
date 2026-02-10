@@ -174,7 +174,8 @@
             <div class="modal-header">
                 <h2 id="paperTitle"></h2>
                 <div class="modal-header-actions">
-                    <button id="exportBtn" class="icon-btn" title="Export Markdown">⬇</button>
+                    <button id="starModalBtn" class="icon-btn" title="Star/Unstar">☆</button>
+                    <button id="exportBtn" class="icon-btn" title="Export Markdown">⇩</button>
                     <button id="shareBtn" class="icon-btn" title="Share">⎘</button>
                     <button id="fullscreenBtn" class="icon-btn" title="Toggle Fullscreen">⛶</button>
                     <button class="close" title="Close">&times;</button>
@@ -222,6 +223,17 @@
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- Fullscreen PDF Viewer -->
+    <div id="fullscreenPdfViewer" class="fullscreen-pdf-viewer" style="display: none;">
+        <div class="pdf-viewer-header">
+            <div class="pdf-viewer-controls">
+                <a id="pdfViewerLink" href="" target="_blank" class="pdf-download-link">📄 PDF链接</a>
+                <button onclick="closeFullscreenPdf()" class="btn btn-secondary btn-compact">关闭预览</button>
+            </div>
+        </div>
+        <iframe id="fullscreenPdfFrame" src="" frameborder="0"></iframe>
     </div>
 
     <script src="/static/app.js"></script>

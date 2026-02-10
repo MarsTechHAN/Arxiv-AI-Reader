@@ -456,11 +456,17 @@ body.modal-open {
     border-radius: 6px;
     transition: all 0.3s;
     flex-shrink: 0;
+    line-height: 1;
 }
 
-/* Share button - smaller size */
+/* Ensure all icon buttons have consistent size */
 #shareBtn {
-    font-size: 33px;
+    font-size: 24px;
+}
+
+/* Star button in modal */
+#starModalBtn.starred {
+    color: #fbbf24;
 }
 
 .close {
@@ -1356,6 +1362,50 @@ body.modal-open {
     width: 100%;
     height: 600px;
     border: none;
+}
+
+/* Fullscreen PDF Viewer */
+.fullscreen-pdf-viewer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg);
+    z-index: 2000;
+    display: flex;
+    flex-direction: column;
+}
+
+.pdf-viewer-header {
+    background: var(--bg-light);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+    flex-shrink: 0;
+}
+
+.pdf-viewer-controls {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.pdf-viewer-controls .pdf-download-link {
+    flex: 1;
+    margin: 0;
+}
+
+.fullscreen-pdf-viewer iframe {
+    flex: 1;
+    width: 100%;
+    border: none;
+    min-height: 0;
+}
+
+body.pdf-preview-open {
+    overflow: hidden;
 }
 
 /* Starred Papers Section */

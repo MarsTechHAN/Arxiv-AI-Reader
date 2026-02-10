@@ -136,16 +136,28 @@ function setupEventListeners() {
         });
     });
     
-    // ESC key to close modals
+    // ESC key to close modals and PDF preview
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
-            if (paperModal?.classList.contains('active')) {
+            const fullscreenViewer = document.getElementById('fullscreenPdfViewer');
+            if (fullscreenViewer && fullscreenViewer.style.display !== 'none') {
+                closeFullscreenPdf();
+            } else if (paperModal?.classList.contains('active')) {
                 closeModal(paperModal);
             } else if (configModal?.classList.contains('active')) {
                 closeModal(configModal);
             }
         }
     });
+    
+    // Star button for paper modal
+    const starModalBtn = document.getElementById('starModalBtn');
+    if (starModalBtn && paperModal) {
+        starModalBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleStarFromModal(currentPaperId);
+        });
+    }
     
     // Share button for paper modal
     const shareBtn = document.getElementById('shareBtn');
@@ -174,9 +186,9 @@ function setupEventListeners() {
         });
     }
     
-    // Keyboard navigation for paper modal (only when fullscreen)
+    // Keyboard navigation for paper modal (always enabled when modal is active)
     document.addEventListener('keydown', (e) => {
-        if (paperModal?.classList.contains('active') && paperModal?.classList.contains('fullscreen')) {
+        if (paperModal?.classList.contains('active')) {
             // Check if input/textarea is focused (don't navigate when typing)
             const activeElement = document.activeElement;
             const isInputFocused = activeElement && (
@@ -541,9 +553,6 @@ async function openPaperModal(paperId) {
                         👁️ 在线预览
                     </button>
                 </div>
-                <div id="pdfViewerContainer" class="pdf-viewer-container" style="display: none;">
-                    <iframe id="pdfViewer" src="" frameborder="0"></iframe>
-                </div>
             </div>
             
             ${paper.extracted_keywords && paper.extracted_keywords.length > 0 ? `
@@ -587,14 +596,6 @@ async function openPaperModal(paperId) {
         document.getElementById('qaList').innerHTML = qaHtml;
         document.getElementById('askInput').value = '';
         
-        // Reset PDF viewer
-        const pdfContainer = document.getElementById('pdfViewerContainer');
-        const pdfViewer = document.getElementById('pdfViewer');
-        if (pdfContainer && pdfViewer) {
-            pdfContainer.style.display = 'none';
-            pdfViewer.src = '';
-        }
-        
         // Show relevance editor for non-relevant papers
         const relevanceEditor = document.getElementById('relevanceEditor');
         const currentRelevanceScore = document.getElementById('currentRelevanceScore');
@@ -606,6 +607,18 @@ async function openPaperModal(paperId) {
             relevanceScoreInput.value = paper.relevance_score || 5;
         } else {
             relevanceEditor.style.display = 'none';
+        }
+        
+        // Update star button state
+        const starModalBtn = document.getElementById('starModalBtn');
+        if (starModalBtn) {
+            if (paper.is_starred) {
+                starModalBtn.textContent = '★';
+                starModalBtn.classList.add('starred');
+            } else {
+                starModalBtn.textContent = '☆';
+                starModalBtn.classList.remove('starred');
+            }
         }
         
         paperModal.classList.add('active');
@@ -1047,12 +1060,31 @@ async function toggleStar(paperId) {
             }
         }
         
+        // Update modal star button if this paper is currently open
+        if (currentPaperId === paperId) {
+            const starModalBtn = document.getElementById('starModalBtn');
+            if (starModalBtn) {
+                if (isStarred) {
+                    starModalBtn.textContent = '★';
+                    starModalBtn.classList.add('starred');
+                } else {
+                    starModalBtn.textContent = '☆';
+                    starModalBtn.classList.remove('starred');
+                }
+            }
+        }
+        
         // Also update starred items in the starred section
         updateStarredItemButton(paperId, isStarred);
         
     } catch (error) {
         console.error('Error toggling star:', error);
     }
+}
+
+// Toggle star from modal
+async function toggleStarFromModal(paperId) {
+    await toggleStar(paperId);
 }
 
 // Update star button in starred section (if viewing from there)
@@ -1395,28 +1427,36 @@ function getPdfUrl(url) {
     return url;
 }
 
-// Toggle PDF viewer
+// Toggle PDF viewer - open fullscreen preview
 function togglePdfViewer(paperId) {
-    const container = document.getElementById('pdfViewerContainer');
-    const viewer = document.getElementById('pdfViewer');
+    const fullscreenViewer = document.getElementById('fullscreenPdfViewer');
+    const fullscreenFrame = document.getElementById('fullscreenPdfFrame');
+    const pdfViewerLink = document.getElementById('pdfViewerLink');
     
-    if (container.style.display === 'none') {
-        // Get paper URL and convert to PDF
-        fetch(`${API_BASE}/papers/${paperId}`)
-            .then(res => res.json())
-            .then(paper => {
-                const pdfUrl = getPdfUrl(paper.url);
-                viewer.src = pdfUrl;
-                container.style.display = 'block';
-            })
-            .catch(err => {
-                console.error('Error loading PDF:', err);
-                showError('无法加载 PDF');
-            });
-    } else {
-        container.style.display = 'none';
-        viewer.src = ''; // Clear iframe to stop loading
-    }
+    // Get paper URL and convert to PDF
+    fetch(`${API_BASE}/papers/${paperId}`)
+        .then(res => res.json())
+        .then(paper => {
+            const pdfUrl = getPdfUrl(paper.url);
+            pdfViewerLink.href = pdfUrl;
+            fullscreenFrame.src = pdfUrl;
+            fullscreenViewer.style.display = 'flex';
+            document.body.classList.add('pdf-preview-open');
+        })
+        .catch(err => {
+            console.error('Error loading PDF:', err);
+            showError('无法加载 PDF');
+        });
+}
+
+// Close fullscreen PDF viewer
+function closeFullscreenPdf() {
+    const fullscreenViewer = document.getElementById('fullscreenPdfViewer');
+    const fullscreenFrame = document.getElementById('fullscreenPdfFrame');
+    
+    fullscreenViewer.style.display = 'none';
+    fullscreenFrame.src = ''; // Clear iframe to stop loading
+    document.body.classList.remove('pdf-preview-open');
 }
 
 // Export paper to markdown
@@ -1504,8 +1544,6 @@ async function exportPaperToMarkdown(paperId) {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        
-        showSuccess('Markdown文件已下载');
     } catch (error) {
         console.error('Error exporting paper:', error);
         showError('导出失败');
