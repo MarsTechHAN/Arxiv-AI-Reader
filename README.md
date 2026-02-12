@@ -2,7 +2,7 @@
 
 **Automatically fetch, filter, and analyze latest arXiv papers using DeepSeek AI.**
 
-A lightweight, file-based system that monitors arXiv for new papers, intelligently filters them based on your interests, performs deep analysis with Q&A, and provides an interactive timeline UI for exploration. This code is completely vibed, and I have no idea how it works. Don't ask me why.
+A lightweight, file-based system that monitors arXiv for new papers, intelligently filters them based on your interests, performs deep analysis with Q&A, and provides an interactive timeline UI for exploration.
 
 ---
 
@@ -51,6 +51,8 @@ A lightweight, file-based system that monitors arXiv for new papers, intelligent
 #### 4. **Interactive Q&A**
 - Ask custom questions about any paper
 - **Streaming responses** - see answers in real-time
+- **Reasoning mode** - prefix `think:` to use deepseek-reasoner (shows thinking process)
+- **Follow-up questions** - contextual follow-up on any QA with `↩️ Follow-up`
 - **Cross-paper comparison** - reference other papers using `[arxiv_id]` syntax
   - Example: `"Compare this paper with [2510.09212]"`
   - System auto-fetches and analyzes referenced papers
@@ -58,21 +60,30 @@ A lightweight, file-based system that monitors arXiv for new papers, intelligent
 
 #### 5. **Advanced Paper Management**
 - ⭐ **Star/Bookmark** papers for later
+- **Star categories** - AI classifies starred papers (e.g. 高效视频生成, LLM稀疏注意力)
+- **Tabbed starred view** - filter starred papers by category
 - 👁️ **Hide** irrelevant papers from timeline
 - 🎯 **Manual relevance override** - adjust AI's relevance scoring
 - Smart sorting: Starred → Deep analyzed → Relevance score
 
 #### 6. **Full-Text Search**
-- Search across title, abstract, keywords, summaries
+- Search across title, abstract, keywords, summaries, authors
 - **arXiv ID lookup** - enter `2510.09212` to fetch specific paper
+- **PDF drag-and-drop** - drop PDF onto search bar to parse and analyze local papers
 - Auto-triggers analysis for new papers
 
 #### 7. **Beautiful Timeline UI**
 - Clean, responsive interface
+- Markdown + LaTeX (KaTeX) rendering in Q&A
 - Expand/collapse paper details
 - Color-coded relevance indicators
 - Real-time streaming Q&A
 - Keyword filtering
+- Pull-to-refresh (mobile-friendly)
+- Update notification when new papers arrive
+- **Export to Markdown** - download paper summary + Q&A as .md
+- **Share** - copy URL with paper ID
+- **Fullscreen PDF viewer** - inline PDF preview
 
 ---
 
@@ -86,8 +97,8 @@ A lightweight, file-based system that monitors arXiv for new papers, intelligent
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourusername/arxiv_paper_fetcher.git
-cd arxiv_paper_fetcher
+git clone https://github.com/yourusername/Arxiv-AI-Reader.git
+cd Arxiv-AI-Reader
 
 # 2. Install dependencies
 pip install -r requirements.txt
@@ -99,7 +110,7 @@ export DEEPSEEK_API_KEY="your-api-key-here"
 ./start.sh
 ```
 
-The server starts at `http://localhost:5000` and begins fetching papers automatically.
+The server starts at `http://localhost:8000` and begins fetching papers automatically. `build_static.py` runs before startup to build frontend assets with cache busting (`frontend/` → `frontend_dist/`).
 
 ### Alternative: Manual Start
 
@@ -107,26 +118,24 @@ The server starts at `http://localhost:5000` and begins fetching papers automati
 # Set API key
 export DEEPSEEK_API_KEY="your-api-key"
 
-# Run backend
+# Run backend (from project root)
 cd backend
 python api.py
 ```
 
-### Using Docker (Coming Soon)
+### Using Docker
 
+When `docker-compose.yml` is configured:
 ```bash
-# Create .env file
 echo "DEEPSEEK_API_KEY=your-api-key" > .env
-
-# Start with Docker Compose
-docker-compose up --build
+./start.sh docker
 ```
 
 ---
 
 ## ⚙️ Configuration
 
-All configuration is in `data/config.json`. On first run, default config is auto-generated from `backend/default_config.py`.
+All configuration is in `backend/data/config.json`. On first run, default config is auto-generated from `backend/default_config.py`.
 
 ### Configuration File Structure
 
@@ -153,7 +162,8 @@ All configuration is in `data/config.json`. On first run, default config is auto
   "temperature": 0.3,
   "max_tokens": 2000,
   "concurrent_papers": 10,
-  "min_relevance_score_for_stage2": 6.0
+  "min_relevance_score_for_stage2": 6.0,
+  "star_categories": ["高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"]
 }
 ```
 
@@ -172,6 +182,7 @@ All configuration is in `data/config.json`. On first run, default config is auto
 | `max_tokens` | `int` | `2000` | Max tokens per response |
 | `concurrent_papers` | `int` | `10` | Papers to analyze concurrently (Stage 2) |
 | `min_relevance_score_for_stage2` | `float` | `6.0` | Minimum score (0-10) required for deep analysis |
+| `star_categories` | `List[str]` | See below | AI classification categories for starred papers (narrowest first) |
 
 ### Default Filter Keywords
 ```python
@@ -198,6 +209,14 @@ Papers containing these are auto-rejected (score=1):
 ]
 ```
 
+### Default Star Categories
+Papers starred by user are AI-classified into these categories (narrowest match first):
+```python
+[
+    "高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"
+]
+```
+
 ### Default Preset Questions
 ```python
 [
@@ -215,7 +234,7 @@ Papers containing these are auto-rejected (score=1):
 
 #### Method 1: Edit JSON directly
 ```bash
-vim data/config.json
+vim backend/data/config.json
 # Server auto-reloads on next fetch cycle
 ```
 
@@ -240,16 +259,18 @@ Navigate to `http://localhost:8000` → Settings panel → Edit configuration
 
 ## 📦 Data Structure
 
-All data stored as JSON files - **no database required**.
+All data stored as JSON files - **no database required**. When running from `backend/`, data lives in `backend/data/`.
 
 ### Directory Structure
 ```
-data/
-├── config.json          # System configuration
-└── papers/             
-    ├── 2510.08582v1.json
-    ├── 2510.08588v1.json
-    └── ...
+backend/
+├── data/
+│   ├── config.json          # System configuration
+│   ├── fetcher_state.json   # RSS query state per category
+│   └── papers/             
+│       ├── 2510.08582v1.json
+│       ├── 2510.08588v1.json
+│       └── ...
 ```
 
 ### Paper JSON Schema
@@ -279,12 +300,16 @@ Each paper is saved as `data/papers/{arxiv_id}.json`:
     {
       "question": "What is the core innovation?",
       "answer": "Detailed answer...",
-      "timestamp": "2024-01-15T10:30:00"
+      "timestamp": "2024-01-15T10:30:00",
+      "thinking": null,
+      "is_reasoning": false,
+      "parent_qa_id": null
     }
   ],
   
   "// User Actions": "",
   "is_starred": false,
+  "star_category": "Other",
   "is_hidden": false,
   
   "// Metadata": "",
@@ -314,9 +339,10 @@ Each paper is saved as `data/papers/{arxiv_id}.json`:
 | `one_line_summary` | `string` | Brief summary (Chinese) |
 | **Stage 2** | | |
 | `detailed_summary` | `string` | 200-300 word summary (Chinese) |
-| `qa_pairs` | `QAPair[]` | Questions and answers |
+| `qa_pairs` | `QAPair[]` | Questions and answers (each may have `thinking`, `is_reasoning`, `parent_qa_id`) |
 | **User Actions** | | |
 | `is_starred` | `bool` | User bookmarked this paper |
+| `star_category` | `string` | AI-classified category (e.g. "高效视频生成", "Other") |
 | `is_hidden` | `bool` | Hidden from timeline |
 | **Metadata** | | |
 | `published_date` | `string` | arXiv submission date |
@@ -331,14 +357,21 @@ Backend runs on `http://localhost:8000` (default).
 
 ### Paper Endpoints
 
+#### `GET /api/health`
+Health check. Returns `{"message": "arXiv Paper Fetcher API", "status": "running"}`.
+
+---
+
 #### `GET /papers`
 List papers with pagination and filtering.
 
 **Query Parameters:**
 - `skip` (int, default: 0) - Pagination offset
 - `limit` (int, default: 20) - Max papers to return
-- `sort_by` (string, default: "relevance") - Sort mode: `relevance`, `latest`, `starred`
+- `sort_by` (string, default: "relevance") - Sort mode: `relevance`, `latest`
 - `keyword` (string, optional) - Filter by keyword
+- `starred_only` (string, default: "false") - `"true"` to show only starred papers
+- `category` (string, optional) - When `starred_only=true`, filter by star_category (e.g. "高效视频生成", "Other")
 
 **Response:**
 ```json
@@ -373,9 +406,13 @@ Ask a custom question about a paper.
 **Request Body:**
 ```json
 {
-  "question": "What is the core innovation?"
+  "question": "What is the core innovation?",
+  "parent_qa_id": null
 }
 ```
+- `parent_qa_id` (int, optional) - Index of parent QA for follow-up questions
+
+**Note:** Prefix with `think:` to use deepseek-reasoner (e.g. `"think: What is the core innovation?"`)
 
 **Response:**
 ```json
@@ -391,15 +428,21 @@ Ask a custom question about a paper.
 #### `POST /papers/{paper_id}/ask_stream`
 Ask a question with **streaming response** (Server-Sent Events).
 
-**Request Body:** Same as `/ask`
+**Request Body:**
+```json
+{
+  "question": "What is the core innovation?",
+  "parent_qa_id": null
+}
+```
+- `parent_qa_id` (int, optional) - Index of parent QA for follow-up questions
+
+**Note:** Prefix question with `think:` to use deepseek-reasoner (reasoning mode). Response streams both `thinking` and `content` chunks.
 
 **Response:** SSE stream
-```
-data: {"chunk": "The"}
-data: {"chunk": " core"}
-data: {"chunk": " innovation..."}
-data: {"done": true}
-```
+- Content chunks: `data: {"type": "content", "chunk": "..."}`
+- Thinking chunks (reasoning mode): `data: {"type": "thinking", "chunk": "..."}`
+- Done: `data: {"done": true}`
 
 **Frontend Example:**
 ```javascript
@@ -449,6 +492,15 @@ Manually override AI's relevance assessment.
   "relevance_score": 9.0
 }
 ```
+
+---
+
+#### `POST /upload_pdf`
+Upload a PDF file, extract text with PyPDF, create Paper, and trigger analysis in background.
+
+**Request:** `multipart/form-data` with `file` field (PDF only)
+
+**Response:** Array with single paper object (same schema as list item)
 
 ---
 
@@ -520,6 +572,16 @@ Get system statistics.
 ---
 
 ## 🔥 Advanced Usage
+
+### Reasoning Mode (deepseek-reasoner)
+
+Prefix any question with `think:` to use the reasoning model. The answer will include an expandable "thinking" section showing the model's reasoning process.
+
+**Example:** `think: 这篇论文有什么创新点？`
+
+### Follow-up Questions
+
+Click `↩️ Follow-up` on any QA to ask a contextual follow-up. The system automatically includes conversation context (excluding thinking, for KV cache consistency). Supports chained follow-ups.
 
 ### Cross-Paper Comparison
 
@@ -722,16 +784,19 @@ See [arXiv category list](https://arxiv.org/category_taxonomy) for all options.
 See `requirements.txt`:
 
 ```txt
-fastapi==0.109.0        # Web framework
-uvicorn[standard]==0.27.0  # ASGI server
-httpx==0.26.0           # Async HTTP client
-beautifulsoup4==4.12.3  # HTML parsing
-lxml==5.1.0             # XML/HTML parser
-python-multipart==0.0.6 # Form parsing
-pydantic==2.5.3         # Data validation
-openai==1.12.0          # DeepSeek API client
-feedparser==6.0.11      # RSS parsing
-aiofiles==23.2.1        # Async file I/O
+fastapi>=0.109.0        # Web framework
+uvicorn[standard]>=0.27.0  # ASGI server
+httpx>=0.26.0           # Async HTTP client
+beautifulsoup4>=4.12.3  # HTML parsing
+lxml>=5.1.0             # XML/HTML parser
+python-multipart>=0.0.6 # Form parsing
+pydantic>=2.11.0        # Data validation
+openai>=1.12.0          # DeepSeek API client
+feedparser>=6.0.11      # RSS parsing
+aiofiles>=23.2.1        # Async file I/O
+python-dateutil>=2.8.2  # Date parsing
+mcp>=1.0.0              # MCP server for tools
+pypdf>=4.0.0            # PDF text extraction
 ```
 
 ### External APIs
@@ -740,6 +805,10 @@ aiofiles==23.2.1        # Async file I/O
   - Get key at: https://platform.deepseek.com  
   - Model: `deepseek-chat`  
   - Supports KV cache and streaming  
+
+### MCP Integration
+
+The project includes `backend/mcp_server.py` exposing paper search/retrieval tools for MCP (Model Context Protocol) clients. Configure your MCP client to use this server for programmatic paper access.
 
 ### System Requirements
 

@@ -27,6 +27,7 @@ const configModal = document.getElementById('configModal');
 const paperModal = document.getElementById('paperModal');
 const tabAll = document.getElementById('tabAll');
 const categoryTabsContainer = document.getElementById('categoryTabsContainer');
+const searchBarWrapper = document.getElementById('searchBarWrapper');
 
 // Initialize
 document.addEventListener('DOMContentLoaded', async () => {
@@ -70,6 +71,35 @@ function setupEventListeners() {
             }
         }
     });
+    
+    // Drag-and-drop PDF onto search bar
+    if (searchBarWrapper) {
+        searchBarWrapper.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.dataTransfer.types.includes('Files')) {
+                searchBarWrapper.classList.add('drag-over');
+            }
+        });
+        searchBarWrapper.addEventListener('dragleave', (e) => {
+            if (!searchBarWrapper.contains(e.relatedTarget)) {
+                searchBarWrapper.classList.remove('drag-over');
+            }
+        });
+        searchBarWrapper.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            searchBarWrapper.classList.remove('drag-over');
+            const files = e.dataTransfer?.files;
+            if (!files || files.length === 0) return;
+            const pdfFile = Array.from(files).find(f => f.name.toLowerCase().endsWith('.pdf'));
+            if (pdfFile) {
+                uploadAndParsePdf(pdfFile);
+            } else {
+                showError('请拖入 PDF 文件');
+            }
+        });
+    }
     
     // Sort
     sortSelect.addEventListener('change', (e) => {
@@ -460,6 +490,51 @@ async function loadPapers(page = 0, shouldScroll = true) {
     }
 }
 
+// Upload and parse PDF file
+async function uploadAndParsePdf(file) {
+    showLoading(true);
+    try {
+        const formData = new FormData();
+        formData.append('file', file);
+        
+        const response = await fetch(`${API_BASE}/upload_pdf`, {
+            method: 'POST',
+            body: formData,
+        });
+        
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({ detail: response.statusText }));
+            throw new Error(err.detail || 'Upload failed');
+        }
+        
+        const results = await response.json();
+        
+        if (results.length === 0) {
+            showError('PDF 解析失败');
+            return;
+        }
+        
+        timeline.innerHTML = '';
+        currentPaperList = [];
+        window.scrollTo(0, 0);
+        
+        results.forEach(paper => {
+            timeline.appendChild(createPaperCard(paper));
+        });
+        currentPaperList = results.map(p => p.id);
+        showEndMarker();
+        loadMoreBtn.style.display = 'none';
+        
+        showSuccess('PDF 已解析，正在分析中...');
+        openPaperModal(results[0].id);
+    } catch (error) {
+        console.error('Error uploading PDF:', error);
+        showError('上传失败: ' + (error.message || 'Unknown error'));
+    } finally {
+        showLoading(false);
+    }
+}
+
 // Search Papers
 async function searchPapers(query) {
     showLoading(true);
@@ -627,6 +702,7 @@ async function openPaperModal(paperId) {
                 </div>
             `}
             
+            ${paper.url ? `
             <div class="detail-section">
                 <h3>PDF</h3>
                 <div class="paper-links">
@@ -638,6 +714,12 @@ async function openPaperModal(paperId) {
                     </button>
                 </div>
             </div>
+            ` : `
+            <div class="detail-section">
+                <h3>PDF</h3>
+                <p style="color: var(--text-muted);">本地上传论文，无在线 PDF 链接</p>
+            </div>
+            `}
             
             ${paper.extracted_keywords && paper.extracted_keywords.length > 0 ? `
                 <div class="detail-section">

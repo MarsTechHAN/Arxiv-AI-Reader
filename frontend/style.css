@@ -158,6 +158,13 @@ body.modal-open {
     display: flex;
     gap: 12px;
     align-items: center;
+    transition: all 0.2s ease;
+}
+
+.search-bar-wrapper.drag-over {
+    background: rgba(59, 130, 246, 0.15);
+    border-radius: 8px;
+    border: 2px dashed var(--primary);
 }
 
 .search-input {

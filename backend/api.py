@@ -12,7 +12,7 @@ Endpoints:
 
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -466,6 +466,91 @@ async def update_config(request: UpdateConfigRequest):
         }
     
     return {"message": "Config updated", "config": config.to_dict()}
+
+
+def _parse_pdf_to_paper(file_content: bytes, filename: str) -> Paper:
+    """Extract text from PDF and create Paper object. ID prefix: local_"""
+    from pypdf import PdfReader
+    from io import BytesIO
+    import uuid
+    
+    reader = PdfReader(BytesIO(file_content))
+    full_text = ""
+    for page in reader.pages:
+        t = page.extract_text()
+        if t:
+            full_text += t + "\n"
+    
+    if not full_text.strip():
+        raise ValueError("PDF contains no extractable text")
+    
+    lines = [ln.strip() for ln in full_text.split("\n") if ln.strip()]
+    title = Path(filename).stem.replace("_", " ") if filename else "Uploaded Paper"
+    if lines:
+        first_line = lines[0]
+        if len(first_line) > 10 and len(first_line) < 300 and not first_line.isdigit():
+            title = first_line
+    
+    abstract = full_text[:1500] if len(full_text) > 1500 else full_text
+    preview_text = f"{abstract}\n\n{full_text[1500:3500]}"[:2000] if len(full_text) > 1500 else full_text[:2000]
+    
+    paper_id = f"local_{uuid.uuid4().hex[:12]}"
+    return Paper(
+        id=paper_id,
+        title=title,
+        authors=[],
+        abstract=abstract,
+        url="",
+        html_url="",
+        html_content=full_text,
+        preview_text=preview_text,
+        published_date="",
+    )
+
+
+@app.post("/upload_pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    """
+    Upload a PDF file, extract text, create Paper, and trigger analysis.
+    Returns the created paper for immediate display.
+    """
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    
+    try:
+        content = await file.read()
+        if len(content) < 100:
+            raise HTTPException(status_code=400, detail="PDF file is too small or empty")
+        
+        paper = _parse_pdf_to_paper(content, file.filename or "paper.pdf")
+        fetcher.save_paper(paper)
+        
+        config = Config.load(config_path)
+        asyncio.create_task(analyzer.process_papers([paper], config))
+        
+        return [{
+            "id": paper.id,
+            "title": paper.title,
+            "authors": paper.authors,
+            "abstract": paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract,
+            "url": paper.url,
+            "is_relevant": paper.is_relevant,
+            "relevance_score": paper.relevance_score,
+            "extracted_keywords": paper.extracted_keywords,
+            "one_line_summary": paper.one_line_summary,
+            "published_date": paper.published_date,
+            "is_starred": paper.is_starred,
+            "is_hidden": paper.is_hidden,
+            "created_at": paper.created_at,
+            "has_qa": len(paper.qa_pairs) > 0,
+            "detailed_summary": paper.detailed_summary,
+        }]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {str(e)}")
 
 
 def _calculate_similarity(query: str, text: str) -> float:
