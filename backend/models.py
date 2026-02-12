@@ -105,13 +105,17 @@ class Config:
     star_categories: List[str] = field(default_factory=lambda: [
         "高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"
     ])
+
+    # Optional MCP/external search URL for AI search candidates.
+    # GET {url}?q=query&limit=N returns JSON array of paper dicts.
+    mcp_search_url: Optional[str] = None
     
     def to_dict(self) -> dict:
         return asdict(self)
     
     @classmethod
     def from_dict(cls, data: dict) -> 'Config':
-        return cls(**data)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
     
     def save(self, path: str):
         """Save config to JSON file"""

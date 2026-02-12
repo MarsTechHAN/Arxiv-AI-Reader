@@ -11,6 +11,7 @@ Endpoints:
 """
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,7 +92,7 @@ app.add_middleware(
 async def selective_gzip_middleware(request: Request, call_next):
     """Skip GZip for streaming endpoints to prevent buffering"""
     # Skip compression for streaming endpoints (critical for real-time SSE)
-    if "/ask_stream" in str(request.url.path):
+    if "/ask_stream" in str(request.url.path) or "/search/ai/stream" in str(request.url.path):
         response = await call_next(request)
         return response
     
@@ -149,6 +150,7 @@ class UpdateConfigRequest(BaseModel):
     concurrent_papers: Optional[int] = None
     min_relevance_score_for_stage2: Optional[float] = None
     star_categories: Optional[List[str]] = None
+    mcp_search_url: Optional[str] = None
 
 
 class UpdateRelevanceRequest(BaseModel):
@@ -281,7 +283,7 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
             print(f"Warning: Failed to load paper {meta['id']}: {e}")
             continue
     
-    # Return simplified data for timeline
+    config = Config.load(config_path)
     return [
         {
             "id": p.id,
@@ -301,9 +303,22 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
             "has_qa": len(p.qa_pairs) > 0,
             "detailed_summary": p.detailed_summary,
             "tags": getattr(p, 'tags', []),
+            "stage2_pending": _stage2_status(p, config)[1],
         }
         for p in papers
     ]
+
+
+def _stage2_status(paper: Paper, config: Config) -> tuple:
+    """Returns (needs_stage2, stage2_pending)."""
+    min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+    preset = getattr(config, 'preset_questions', []) or []
+    if not paper.is_relevant or paper.relevance_score < min_score:
+        return False, False
+    has_summary = bool(paper.detailed_summary and paper.detailed_summary.strip())
+    preset_answered = sum(1 for qa in (paper.qa_pairs or []) if qa.question in preset)
+    needs = not has_summary or preset_answered < len(preset)
+    return needs, needs
 
 
 @app.get("/papers/{paper_id}", response_model=dict)
@@ -313,7 +328,10 @@ async def get_paper(paper_id: str):
     """
     try:
         paper = fetcher.load_paper(paper_id)
-        return paper.to_dict()
+        config = Config.load(config_path)
+        d = paper.to_dict()
+        _, d["stage2_pending"] = _stage2_status(paper, config)
+        return d
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
 
@@ -452,6 +470,8 @@ async def update_config(request: UpdateConfigRequest):
         new_categories = set(config.star_categories)
         if old_categories != new_categories:
             asyncio.create_task(reclassify_all_starred_papers(config))
+    if request.mcp_search_url is not None:
+        config.mcp_search_url = request.mcp_search_url.strip() or None
     
     config.save(config_path)
     
@@ -590,15 +610,221 @@ def _calculate_similarity(query: str, text: str) -> float:
     return min(1.0, similarity)
 
 
+def _mcp_format_search_result(p: dict, include_all: bool = True) -> dict:
+    """Format search result for AI (minimal tokens). Include papers even without summaries."""
+    return {
+        "id": p.get("id"),
+        "title": p.get("title", ""),
+        "search_score": round(p.get("search_score", 0), 2),
+        "one_line_summary": p.get("one_line_summary", "")[:200],
+        "detailed_summary": (p.get("detailed_summary", "") or "")[:300],
+    }
+
+
+async def _mcp_tool_executor(fetcher, name: str, args: dict) -> dict | list:
+    """Execute MCP search tools. Returns minimal format for AI, or full dict for get_paper."""
+    from mcp_server import _do_search, _do_search_full_text
+
+    q = args.get("query", "")
+    limit = min(int(args.get("limit", 25)), 30)
+    if name == "search_papers":
+        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=True, search_generated_only=False)
+        return [_mcp_format_search_result(p) for p in raw]
+    elif name == "search_generated_content":
+        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=False, search_generated_only=True)
+        return [_mcp_format_search_result(p) for p in raw]
+    elif name == "search_full_text":
+        max_scan = min(int(args.get("max_scan", 1500)), 2000)
+        raw = _do_search_full_text(q, fetcher, limit=limit, ids_only=False, max_scan=max_scan)
+        return [_mcp_format_search_result(p) for p in raw]
+    elif name == "get_paper_ids_by_query":
+        raw = _do_search(q, fetcher, limit=min(limit, 30), ids_only=True)
+        return [r["id"] for r in raw]
+    elif name == "get_paper":
+        arxiv_id = (args.get("arxiv_id", "") or "").strip()
+        if not arxiv_id:
+            return {"error": "arxiv_id required"}
+        try:
+            if fetcher._paper_exists(arxiv_id):
+                paper = fetcher.load_paper(arxiv_id)
+            else:
+                paper = await fetcher.fetch_single_paper(arxiv_id)
+        except Exception as e:
+            return {"error": str(e), "arxiv_id": arxiv_id}
+        return {
+            "id": paper.id,
+            "title": paper.title,
+            "authors": paper.authors,
+            "abstract": (paper.abstract or "")[:400],
+            "one_line_summary": paper.one_line_summary,
+            "detailed_summary": (paper.detailed_summary or "")[:500],
+            "tags": getattr(paper, "tags", []),
+            "extracted_keywords": paper.extracted_keywords,
+        }
+    return []
+
+
+@app.get("/search/ai/stream")
+async def search_ai_stream(q: str, limit: int = 50):
+    """
+    AI search with streaming progress. Use "ai: query" or just "query".
+    Returns SSE: progress messages, then done with results.
+    """
+    config = Config.load(config_path)
+    inner_q = q.strip()
+    for prefix in ("ai:", "ai："):
+        if inner_q.lower().startswith(prefix):
+            inner_q = inner_q[len(prefix):].strip()
+            break
+
+    if not inner_q:
+        async def empty_gen():
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Empty query'})}\n\n"
+        return StreamingResponse(empty_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+
+    async def tool_executor(name, args):
+        return await _mcp_tool_executor(fetcher, name, args)
+
+    async def event_gen():
+        try:
+            yield f"data: {json.dumps({'type': 'progress', 'message': 'AI 搜索中...'})}\n\n"
+            progress_queue = asyncio.Queue()
+
+            async def on_progress(msg):
+                await progress_queue.put(msg)
+
+            async def run_ai():
+                return await analyzer.ai_search_with_mcp_tools(
+                    inner_q, tool_executor, config, limit=limit, on_progress=on_progress
+                )
+
+            def to_event(msg):
+                if isinstance(msg, dict) and "type" in msg:
+                    return msg
+                return {"type": "progress", "message": str(msg)}
+
+            task = asyncio.create_task(run_ai())
+            while not task.done():
+                try:
+                    msg = await asyncio.wait_for(progress_queue.get(), timeout=0.3)
+                    yield f"data: {json.dumps(to_event(msg))}\n\n"
+                except asyncio.TimeoutError:
+                    pass
+            while not progress_queue.empty():
+                try:
+                    msg = progress_queue.get_nowait()
+                    yield f"data: {json.dumps(to_event(msg))}\n\n"
+                except asyncio.QueueEmpty:
+                    break
+            final_ids = await task
+
+            yield f"data: {json.dumps({'type': 'progress', 'message': '加载结果中...'})}\n\n"
+
+            results = []
+            for pid in (final_ids or [])[:limit]:
+                try:
+                    full = fetcher.load_paper(pid)
+                    results.append({
+                        "id": full.id,
+                        "title": full.title,
+                        "authors": full.authors,
+                        "abstract": (full.abstract[:200] + "..." if len(full.abstract) > 200 else full.abstract),
+                        "url": full.url,
+                        "is_relevant": full.is_relevant,
+                        "relevance_score": full.relevance_score,
+                        "extracted_keywords": full.extracted_keywords,
+                        "one_line_summary": full.one_line_summary,
+                        "published_date": full.published_date,
+                        "is_starred": full.is_starred,
+                        "is_hidden": full.is_hidden,
+                        "created_at": full.created_at,
+                        "has_qa": len(full.qa_pairs) > 0,
+                        "detailed_summary": full.detailed_summary,
+                        "tags": getattr(full, "tags", []),
+                        "search_score": len(final_ids) - final_ids.index(pid) if pid in final_ids else 0,
+                        "stage2_pending": _stage2_status(full, config)[1],
+                    })
+                except Exception:
+                    continue
+
+            yield f"data: {json.dumps({'type': 'done', 'results': results})}\n\n"
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _run_ai_search(inner_q: str, limit: int, config, fetcher):
+    """Core AI search logic. Returns list of paper dicts."""
+
+    async def tool_executor_sync(name, args):
+        return await _mcp_tool_executor(fetcher, name, args)
+
+    final_ids = await analyzer.ai_search_with_mcp_tools(
+        inner_q, tool_executor_sync, config, limit=limit, on_progress=None
+    )
+    results = []
+    for pid in (final_ids or [])[:limit]:
+        try:
+            full = fetcher.load_paper(pid)
+            results.append({
+                "id": full.id,
+                "title": full.title,
+                "authors": full.authors,
+                "abstract": (full.abstract[:200] + "..." if len(full.abstract) > 200 else full.abstract),
+                "url": full.url,
+                "is_relevant": full.is_relevant,
+                "relevance_score": full.relevance_score,
+                "extracted_keywords": full.extracted_keywords,
+                "one_line_summary": full.one_line_summary,
+                "published_date": full.published_date,
+                "is_starred": full.is_starred,
+                "is_hidden": full.is_hidden,
+                "created_at": full.created_at,
+                "has_qa": len(full.qa_pairs) > 0,
+                "detailed_summary": full.detailed_summary,
+                "tags": getattr(full, "tags", []),
+                "search_score": len(final_ids) - final_ids.index(pid) if pid in final_ids else 0,
+                "stage2_pending": _stage2_status(full, config)[1],
+            })
+        except Exception:
+            continue
+    return results
+
+
+@app.get("/search/ai")
+async def search_ai_nostream(q: str, limit: int = 50):
+    """
+    Non-streaming AI search. Use when stream is aborted (e.g. tab backgrounded).
+    Returns JSON directly. Same logic as /search/ai/stream.
+    """
+    config = Config.load(config_path)
+    inner_q = q.strip()
+    for prefix in ("ai:", "ai："):
+        if inner_q.lower().startswith(prefix):
+            inner_q = inner_q[len(prefix):].strip()
+            break
+    if not inner_q:
+        return []
+    results = await _run_ai_search(inner_q, limit, config, fetcher)
+    return results
+
+
 @app.get("/search")
 async def search_papers(q: str, limit: int = 50):
     """
     Search papers by keyword, full-text, or arXiv ID.
-    Supports abstract matching and author matching with similarity scoring.
-    Uses cached metadata for fast search.
+    For AI search use GET /search/ai/stream?q=ai:query
     """
-    import re
-    
+    config = Config.load(config_path)
+    q = q.strip()
+
     # Check if query is an arXiv ID (format: YYMM.NNNNN or YYMM.NNNNNvN)
     arxiv_id_pattern = r'^\d{4}\.\d{4,5}(v\d+)?$'
     if re.match(arxiv_id_pattern, q.strip()):
@@ -615,13 +841,8 @@ async def search_papers(q: str, limit: int = 50):
             # Check if Stage 1 is needed (is_relevant is None)
             needs_stage1 = paper.is_relevant is None
             
-            # Check if Stage 2 is needed (is_relevant=True, score>=min, but no detailed_summary)
-            min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
-            needs_stage2 = (
-                paper.is_relevant is True 
-                and paper.relevance_score >= min_score
-                and (not paper.detailed_summary or paper.detailed_summary.strip() == '')
-            )
+            # Stage 2 needed if relevant, score>=min, and (no summary or incomplete preset Q&As)
+            needs_stage2, _ = _stage2_status(paper, config)
             
             if needs_stage1 or needs_stage2:
                 if needs_stage1:
@@ -649,6 +870,7 @@ async def search_papers(q: str, limit: int = 50):
                 "created_at": paper.created_at,
                 "has_qa": len(paper.qa_pairs) > 0,
                 "detailed_summary": paper.detailed_summary,
+                "stage2_pending": _stage2_status(paper, config)[1],
                 "search_score": 1000.0,  # High score for direct ID match
             }]
         
@@ -657,6 +879,7 @@ async def search_papers(q: str, limit: int = 50):
             raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found on arXiv")
     
     # Normal search using cached metadata
+    config = Config.load(config_path)
     q_lower = q.lower()
     metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
     
@@ -764,6 +987,7 @@ async def search_papers(q: str, limit: int = 50):
                     "has_qa": len(paper.qa_pairs) > 0,
                     "detailed_summary": paper.detailed_summary,
                     "tags": getattr(paper, 'tags', []),
+                    "stage2_pending": _stage2_status(paper, config)[1],
                     "search_score": total_score,
                 })
             except Exception as e:
@@ -953,17 +1177,14 @@ async def check_pending_deep_analysis():
         config = Config.load(config_path)
         all_papers = fetcher.list_papers(limit=10000)
         
-        min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
-        
-        # Find papers: is_relevant=True, score >= min_score, but detailed_summary is empty
+        # Find papers needing Stage 2 (no summary or incomplete preset Q&As)
         pending_papers = [
             p for p in all_papers 
-            if p.is_relevant is True 
-            and p.relevance_score >= min_score
-            and (not p.detailed_summary or p.detailed_summary.strip() == '')
+            if _stage2_status(p, config)[0]
         ]
         
         if pending_papers:
+            min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
             print(f"\n🔍 Found {len(pending_papers)} papers pending deep analysis (score >= {min_score})")
             print(f"📚 Prioritizing deep analysis for these papers...")
             
@@ -971,6 +1192,7 @@ async def check_pending_deep_analysis():
             await analyzer.process_papers(pending_papers, config, skip_stage1=True)
             print(f"✓ Completed pending deep analysis for {len(pending_papers)} papers")
         else:
+            min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
             print(f"✓ No pending deep analysis required (min score: {min_score})")
             
     except Exception as e:

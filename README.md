@@ -42,6 +42,7 @@ A lightweight, file-based system that monitors arXiv for new papers, intelligent
 - Generates detailed summary (200-300 words in Chinese)
 - Answers preset questions about methodology, experiments, limitations
 - Full paper content analyzed with DeepSeek
+- **Resume support** - skips existing summary and answered questions; incremental save after each answer
 
 #### 3. **KV Cache Optimization**
 - Keeps `system_prompt + paper_content` fixed across questions
@@ -68,6 +69,7 @@ A lightweight, file-based system that monitors arXiv for new papers, intelligent
 
 #### 6. **Full-Text Search**
 - Search across title, abstract, keywords, summaries, authors
+- **AI semantic search** - prefix `ai:` (e.g. `ai: methods for video generation`) uses DeepSeek + MCP tools (search_papers, search_generated_content, search_full_text) with streaming progress
 - **arXiv ID lookup** - enter `2510.09212` to fetch specific paper
 - **PDF drag-and-drop** - drop PDF onto search bar to parse and analyze local papers
 - Auto-triggers analysis for new papers
@@ -84,6 +86,7 @@ A lightweight, file-based system that monitors arXiv for new papers, intelligent
 - **Export to Markdown** - download paper summary + Q&A as .md
 - **Share** - copy URL with paper ID
 - **Fullscreen PDF viewer** - inline PDF preview
+- **Stage 2 progress polling** - modal auto-refreshes when deep analysis completes
 
 ---
 
@@ -163,7 +166,8 @@ All configuration is in `backend/data/config.json`. On first run, default config
   "max_tokens": 2000,
   "concurrent_papers": 10,
   "min_relevance_score_for_stage2": 6.0,
-  "star_categories": ["高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"]
+  "star_categories": ["高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"],
+  "mcp_search_url": null
 }
 ```
 
@@ -183,6 +187,7 @@ All configuration is in `backend/data/config.json`. On first run, default config
 | `concurrent_papers` | `int` | `10` | Papers to analyze concurrently (Stage 2) |
 | `min_relevance_score_for_stage2` | `float` | `6.0` | Minimum score (0-10) required for deep analysis |
 | `star_categories` | `List[str]` | See below | AI classification categories for starred papers (narrowest first) |
+| `mcp_search_url` | `str?` | `null` | Optional: external MCP search API for AI search candidates (GET {url}?q=query&limit=N) |
 
 ### Default Filter Keywords
 ```python
@@ -344,6 +349,7 @@ Each paper is saved as `data/papers/{arxiv_id}.json`:
 | `is_starred` | `bool` | User bookmarked this paper |
 | `star_category` | `string` | AI-classified category (e.g. "高效视频生成", "Other") |
 | `is_hidden` | `bool` | Hidden from timeline |
+| `stage2_pending` | `bool` | In API responses only: true when deep analysis (summary or preset Q&As) is incomplete |
 | **Metadata** | | |
 | `published_date` | `string` | arXiv submission date |
 | `created_at` | `string` | When fetched by system |
@@ -386,10 +392,13 @@ List papers with pagination and filtering.
     "one_line_summary": "Summary...",
     "is_starred": false,
     "has_qa": true,
-    "detailed_summary": "..."
+    "detailed_summary": "...",
+    "tags": [],
+    "stage2_pending": false
   }
 ]
 ```
+- `stage2_pending` - true when Stage 2 (summary or preset Q&As) is incomplete; frontend polls for updates
 
 ---
 
@@ -504,10 +513,30 @@ Upload a PDF file, extract text with PyPDF, create Paper, and trigger analysis i
 
 ---
 
-### Search Endpoint
+### Search Endpoints
+
+#### `GET /search/ai/stream?q={query}`
+AI semantic search with **streaming progress** (SSE). Use `ai:` prefix or plain query.
+
+**Response:** SSE stream
+- `{"type": "thinking", "text": "..."}` - AI reasoning
+- `{"type": "tool_start", "tool": "search_papers", "query": "..."}` - tool execution started
+- `{"type": "tool_done", "tool": "...", "query": "...", "count": N}` - tool finished
+- `{"type": "progress", "message": "..."}` - status update
+- `{"type": "done", "results": [...]}` - final ranked papers
+- `{"type": "error", "message": "..."}` - error
+
+**Query Parameters:** `q` (string), `limit` (int, default: 50)
+
+---
+
+#### `GET /search/ai?q={query}`
+Non-streaming AI search. Same logic as `/search/ai/stream`. Use when stream is aborted (e.g. tab backgrounded).
+
+---
 
 #### `GET /search?q={query}`
-Search papers by keyword or arXiv ID.
+Keyword search by title, abstract, authors, summaries. For AI search use `/search/ai/stream?q=ai:query`.
 
 **Special behavior:** If query matches arXiv ID format (e.g., `2510.08582`), fetches and analyzes that specific paper.
 
@@ -583,6 +612,12 @@ Prefix any question with `think:` to use the reasoning model. The answer will in
 
 Click `↩️ Follow-up` on any QA to ask a contextual follow-up. The system automatically includes conversation context (excluding thinking, for KV cache consistency). Supports chained follow-ups.
 
+### AI Semantic Search
+
+Prefix search with `ai:` or `ai：` for semantic search. DeepSeek selects tools (search_papers, search_generated_content, search_full_text), executes them, merges results, and returns ranked papers. Streaming progress shows thinking and tool execution. When stream is aborted (e.g. tab backgrounded), frontend falls back to non-streaming `/search/ai`.
+
+**Example:** `ai: methods for efficient video diffusion`
+
 ### Cross-Paper Comparison
 
 Ask questions that reference other papers using `[arxiv_id]` syntax. System automatically fetches and analyzes referenced papers.
@@ -609,7 +644,7 @@ curl -X POST http://localhost:8000/papers/2510.08582v1/ask \
 
 ### Batch Processing New Papers
 
-If you have many unanalyzed papers:
+Background fetcher auto-processes papers with `stage2_pending` (no summary or incomplete preset Q&As). To manually process:
 
 ```bash
 cd backend
@@ -738,14 +773,20 @@ See [arXiv category list](https://arxiv.org/category_taxonomy) for all options.
    Preview text → DeepSeek → Relevance score → Update JSON
    ```
 
-3. **Stage 2 Analysis** (score ≥ 6)
+3. **Stage 2 Analysis** (score ≥ 6, or `stage2_pending`)
    ```
-   Full content → DeepSeek (KV cached) → Summary + Q&A → Update JSON
+   Full content → DeepSeek (KV cached) → Summary + Q&A → Incremental save per answer
+   Resumes from existing summary/answers if interrupted
    ```
 
 4. **Interactive Q&A**
    ```
    User question → DeepSeek (reuses cache) → Stream answer → Save to JSON
+   ```
+
+5. **AI Semantic Search** (`ai:` prefix)
+   ```
+   Query → DeepSeek + MCP tools (search_papers, search_generated_content, search_full_text) → submit_ranking → Ranked results
    ```
 
 ### Key Design Principles

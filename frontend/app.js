@@ -13,6 +13,7 @@ let currentTab = 'all';  // 'all' or category name (e.g. '高效视频生成', '
 let starCategories = ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
 let currentPaperList = [];  // Store current paper list for navigation
 let currentPaperIndex = -1;  // Current paper index in the list
+let stage2PollInterval = null;
 
 // DOM Elements
 const timeline = document.getElementById('timeline');
@@ -34,23 +35,34 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (sortSelect) {
         currentSortBy = sortSelect.value;
     }
-    restoreSearchState();
+    const aiRestored = restoreSearchState();
     await loadConfigAndRenderTabs();
     setupEventListeners();
     setupInfiniteScroll();
     setupPullToRefresh();
-    loadPapers();
+    if (!aiRestored) loadPapers();
     checkDeepLink();
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            const cached = restoreSearchResults(currentTab);
+            if (cached && searchInput?.value === cached.query && (!currentPaperList || currentPaperList.length === 0) && cached.results.length > 0) {
+                renderSearchResults(cached.results);
+            }
+        }
+    });
 });
 
 // Event Listeners
 function setupEventListeners() {
-    // Search - input event (with debounce)
+    // Search - input event (with debounce). ai: queries only run on Enter.
     searchInput.addEventListener('input', (e) => {
+        const val = e.target.value.trim();
+        if (/^ai[:：]\s*/i.test(val)) return;  // ai: search only on Enter
         clearTimeout(searchTimeout);
         searchTimeout = setTimeout(() => {
-            if (e.target.value.trim()) {
-                searchPapers(e.target.value.trim());
+            if (val) {
+                searchPapers(val);
             } else {
                 currentPage = 0;
                 loadPapers();
@@ -390,22 +402,30 @@ function setupInfiniteScroll() {
 // Switch Tab
 function switchTab(tab) {
     if (currentTab === tab) return;
-    
+
     currentTab = tab;
     currentPage = 0;
     hasMorePapers = true;
-    
+
     if (tabAll) tabAll.classList.toggle('active', tab === 'all');
     categoryTabsContainer?.querySelectorAll('.tab-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.tab === tab);
     });
-    
-    searchInput.value = '';
-    currentKeyword = null;
-    clearKeywordBtn.style.display = 'none';
-    clearSearchState();
-    
-    loadPapers(0, true);
+
+    const cached = restoreSearchResults(tab);
+    if (cached && cached.query) {
+        searchInput.value = cached.query;
+        currentKeyword = null;
+        clearKeywordBtn.style.display = 'none';
+        hasMorePapers = false;
+        hideEndMarker();
+        renderSearchResults(cached.results);
+    } else {
+        searchInput.value = '';
+        currentKeyword = null;
+        clearKeywordBtn.style.display = 'none';
+        loadPapers(0, true);
+    }
 }
 
 // Load Papers
@@ -537,42 +557,237 @@ async function uploadAndParsePdf(file) {
 
 // Search Papers
 async function searchPapers(query) {
+    const isAiSearch = /^ai[:：]\s*/i.test(query);
     showLoading(true);
-    currentPage = 0;  // Reset page
-    hasMorePapers = false;  // Disable infinite scroll for search results
+    currentPage = 0;
+    hasMorePapers = false;
     hideEndMarker();
-    
-    // Save search state
-    saveSearchState(query);
-    
-    try {
-        const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50`);
-        const results = await response.json();
-        
-        timeline.innerHTML = '';
-        currentPaperList = [];  // Reset paper list for search
-        window.scrollTo(0, 0);
-        
-        if (results.length === 0) {
-            timeline.innerHTML = '<p style="text-align: center; color: var(--text-muted); padding: 40px;">未找到相关论文</p>';
-            currentPaperList = [];
-        } else {
-            results.forEach(paper => {
-                timeline.appendChild(createPaperCard(paper));
-            });
-            // Update current paper list for navigation
-            currentPaperList = results.map(p => p.id);
-            // Show end marker for search results
-            showEndMarker();
+
+    if (isAiSearch) {
+        await searchPapersAiStream(query);
+    } else {
+        try {
+            const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50`);
+            const results = await response.json();
+            saveSearchResults(query, results || []);
+            renderSearchResults(results);
+        } catch (error) {
+            console.error('Error searching:', error);
+            showError('Search failed');
         }
-        
-        loadMoreBtn.style.display = 'none';
-    } catch (error) {
-        console.error('Error searching:', error);
-        showError('Search failed');
-    } finally {
-        showLoading(false);
     }
+    showLoading(false);
+}
+
+function _searchStateKey(tab) {
+    return `search_state_${tab || currentTab || 'all'}`;
+}
+
+function saveSearchResults(query, results) {
+    try {
+        const key = _searchStateKey(currentTab);
+        sessionStorage.setItem(key, JSON.stringify({ query: query || '', results: results || [] }));
+    } catch (_) {}
+}
+
+function restoreSearchResults(tab) {
+    try {
+        const t = tab || currentTab || 'all';
+        const raw = sessionStorage.getItem(_searchStateKey(t));
+        if (raw) {
+            const data = JSON.parse(raw);
+            if (data && Array.isArray(data.results)) {
+                return { query: data.query || '', results: data.results };
+            }
+        }
+    } catch (_) {}
+    return null;
+}
+
+async function searchPapersAiStream(query) {
+    let statusContainer = document.getElementById('searchStatusContainer');
+    if (!statusContainer) {
+        const container = document.querySelector('.search-container .container');
+        if (container) {
+            statusContainer = document.createElement('div');
+            statusContainer.id = 'searchStatusContainer';
+            statusContainer.className = 'search-status-container';
+            container.appendChild(statusContainer);
+        }
+    }
+    if (!statusContainer) return;
+
+    timeline.innerHTML = '';
+    currentPaperList = [];
+    window.scrollTo(0, 0);
+    statusContainer.innerHTML = '';
+    statusContainer.style.display = 'block';
+
+    const logEl = document.createElement('div');
+    logEl.className = 'ai-search-log';
+    statusContainer.appendChild(logEl);
+
+    const scrollToBottom = () => {
+        if (statusContainer) statusContainer.scrollTop = statusContainer.scrollHeight;
+    };
+
+    const appendItem = (el) => {
+        logEl.appendChild(el);
+        scrollToBottom();
+    };
+
+    const toolNameMap = {
+        search_papers: '关键词搜索',
+        search_generated_content: 'AI 总结搜索',
+        search_full_text: '全文搜索',
+        get_paper_ids_by_query: '获取 ID 列表',
+        get_paper: '获取论文',
+        submit_ranking: '提交结果',
+    };
+
+    const addThinking = (text) => {
+        const p = document.createElement('div');
+        p.className = 'ai-search-thinking';
+        p.textContent = text;
+        appendItem(p);
+    };
+
+    const formatToolResult = (tool, count) => {
+        if (count === undefined) return '';
+        if (tool === 'get_paper') return count ? '已获取' : '—';
+        if (tool === 'submit_ranking') return count ? `${count} 篇` : '';
+        return count ? `${count} 篇` : '0 篇';
+    };
+
+    const addToolChip = (tool, query, status, count) => {
+        const chip = document.createElement('div');
+        const label = toolNameMap[tool] || tool;
+        chip.className = `ai-tool-chip ${status}`;
+        chip.innerHTML = `
+            <span class="tool-icon">${status === 'done' ? '✓' : '<span class="tool-spinner"></span>'}</span>
+            <span class="tool-name">${escapeHtml(label)}</span>
+            ${query ? `<span class="tool-query" title="${escapeHtml(String(query))}">${escapeHtml(String(query))}</span>` : '<span class="tool-query"></span>'}
+            ${status === 'done' && count !== undefined ? `<span class="tool-result">${escapeHtml(formatToolResult(tool, count))}</span>` : ''}
+        `;
+        chip.dataset.tool = tool;
+        chip.dataset.query = query || '';
+        appendItem(chip);
+        return chip;
+    };
+
+    const addToolBatch = (count, tools) => {
+        const batch = document.createElement('div');
+        batch.className = 'ai-search-batch-label';
+        batch.style.cssText = 'font-size: 12px; color: var(--text-muted); padding: 4px 0;';
+        const labels = (tools || []).map(t => toolNameMap[t] || t).slice(0, 3);
+        batch.textContent = `并行执行 ${count} 个工具${labels.length ? '：' + labels.join('、') : ''}`;
+        appendItem(batch);
+    };
+
+    const pendingToolChips = [];
+    const finishWithResults = (results) => {
+        statusContainer.style.display = 'none';
+        saveSearchResults(query, results || []);
+        if (results && results.length > 0) {
+            renderSearchResults(results);
+        } else {
+            timeline.innerHTML = '<p style="text-align: center; color: var(--text-muted); padding: 40px;">未找到相关论文</p>';
+        }
+    };
+
+    const doStreamSearch = async () => {
+        const response = await fetch(`${API_BASE}/search/ai/stream?q=${encodeURIComponent(query)}&limit=50`);
+        if (!response.ok) throw new Error(response.statusText);
+        if (!response.body) throw new Error('No stream');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let results = null;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buffer.indexOf('\n\n')) !== -1) {
+                const msg = buffer.substring(0, idx);
+                buffer = buffer.substring(idx + 2);
+                if (!msg.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(msg.slice(6));
+                    if (data.type === 'thinking' && data.text) addThinking(data.text);
+                    else if (data.type === 'tool_start') pendingToolChips.push(addToolChip(data.tool, data.query, 'running'));
+                    else if (data.type === 'tool_done') {
+                        const chip = pendingToolChips.shift();
+                        const label = toolNameMap[data.tool] || data.tool;
+                        const result = formatToolResult(data.tool, data.count);
+                        if (chip) {
+                            chip.className = 'ai-tool-chip done';
+                            chip.innerHTML = `
+                                <span class="tool-icon">✓</span>
+                                <span class="tool-name">${escapeHtml(label)}</span>
+                                ${(data.query || '') ? `<span class="tool-query" title="${escapeHtml(String(data.query))}">${escapeHtml(String(data.query))}</span>` : '<span class="tool-query"></span>'}
+                                ${result ? `<span class="tool-result">${escapeHtml(result)}</span>` : ''}
+                            `;
+                        } else {
+                            addToolChip(data.tool, data.query, 'done', data.count);
+                        }
+                        scrollToBottom();
+                    } else if (data.type === 'tool_batch') addToolBatch(data.count || 0, data.tools);
+                    else if (data.type === 'progress') addThinking(data.message || 'AI 处理中...');
+                    else if (data.type === 'done') results = data.results || [];
+                    else if (data.type === 'error') throw new Error(data.message || 'Search failed');
+                } catch (e) {
+                    if (!(e instanceof SyntaxError)) throw e;
+                }
+            }
+        }
+        return results;
+    };
+
+    const doNonStreamSearch = async () => {
+        addThinking('正在使用备用模式搜索（适合后台标签页）...');
+        const response = await fetch(`${API_BASE}/search/ai?q=${encodeURIComponent(query)}&limit=50`);
+        if (!response.ok) throw new Error(response.statusText);
+        return await response.json();
+    };
+
+    try {
+        let results = null;
+        try {
+            results = await doStreamSearch();
+        } catch (streamErr) {
+            const isAbort = streamErr.name === 'AbortError' || /abort|fetch/i.test(streamErr.message || '');
+            if (isAbort || streamErr.message?.includes('NetworkError')) {
+                try {
+                    results = await doNonStreamSearch();
+                } catch (e) {
+                    throw streamErr;
+                }
+            } else {
+                throw streamErr;
+            }
+        }
+        finishWithResults(results);
+    } catch (error) {
+        console.error('AI search error:', error);
+        showError('AI 搜索失败: ' + (error.message || 'Unknown error'));
+        statusContainer.style.display = 'none';
+    }
+}
+
+function renderSearchResults(results) {
+    timeline.innerHTML = '';
+    currentPaperList = [];
+    if (results.length === 0) {
+        timeline.innerHTML = '<p style="text-align: center; color: var(--text-muted); padding: 40px;">未找到相关论文</p>';
+    } else {
+        results.forEach(paper => {
+            timeline.appendChild(createPaperCard(paper));
+        });
+        currentPaperList = results.map(p => p.id);
+        showEndMarker();
+    }
+    loadMoreBtn.style.display = 'none';
 }
 
 // Create Paper Card
@@ -616,9 +831,7 @@ function createPaperCard(paper) {
     }
     // Don't show "✓ 相关" for relevant papers
     
-    // Stage 2 status (only show "pending" for incomplete analysis)
-    const hasDeepAnalysis = paper.detailed_summary && paper.detailed_summary.trim() !== '';
-    const stage2Badge = (paper.is_relevant && !hasDeepAnalysis) ? 
+    const stage2Badge = (paper.stage2_pending ?? (paper.is_relevant && !(paper.detailed_summary && paper.detailed_summary.trim()))) ? 
         '<span class="stage-badge stage-pending">⏳ 待深度分析</span>' : '';
     
     // Safe authors handling
@@ -797,10 +1010,109 @@ async function openPaperModal(paperId) {
                 modalBody.scrollTop = 0;
             }
         }, 0);
+        
+        // Poll for Stage 2 progress when pending
+        if (stage2PollInterval) {
+            clearInterval(stage2PollInterval);
+            stage2PollInterval = null;
+        }
+        if (paper.stage2_pending) {
+            stage2PollInterval = setInterval(async () => {
+                if (currentPaperId !== paperId) return;
+                try {
+                    const r = await fetch(`${API_BASE}/papers/${paperId}`);
+                    const p = await r.json();
+                    if (!p.stage2_pending) {
+                        clearInterval(stage2PollInterval);
+                        stage2PollInterval = null;
+                    }
+                    updateModalPaperContent(p);
+                } catch (e) {
+                    console.warn('Stage 2 poll failed:', e);
+                }
+            }, 4000);
+        }
     } catch (error) {
         console.error('Error loading paper:', error);
         showError('Failed to load paper details');
     }
+}
+
+function updateModalPaperContent(paper) {
+    const detailsHtml = `
+        <div class="detail-section">
+            <h3>作者</h3>
+            <p>${escapeHtml(paper.authors.join(', '))}</p>
+        </div>
+        ${paper.detailed_summary ? `
+            <div class="detail-section">
+                <h3>AI 详细摘要</h3>
+                <div class="markdown-content">${renderMarkdown(paper.detailed_summary)}</div>
+            </div>
+        ` : paper.one_line_summary ? `
+            <div class="detail-section">
+                <h3>AI 总结</h3>
+                <div class="markdown-content" style="font-size: 16px;">${renderMarkdown(paper.one_line_summary)}</div>
+            </div>
+        ` : `
+            <div class="detail-section">
+                <h3>摘要</h3>
+                <p>${escapeHtml(paper.abstract)}</p>
+            </div>
+        `}
+        ${paper.url ? `
+        <div class="detail-section">
+            <h3>PDF</h3>
+            <div class="paper-links">
+                <a href="${getPdfUrl(paper.url)}" target="_blank" class="pdf-download-link">
+                    📄 ${getPdfUrl(paper.url)}
+                </a>
+                <button onclick="togglePdfViewer('${escapeHtml(paper.id)}')" class="btn btn-secondary btn-compact">
+                    👁️ 在线预览
+                </button>
+            </div>
+        </div>
+        ` : `
+        <div class="detail-section">
+            <h3>PDF</h3>
+            <p style="color: var(--text-muted);">本地上传论文，无在线 PDF 链接</p>
+        </div>
+        `}
+        ${paper.extracted_keywords && paper.extracted_keywords.length > 0 ? `
+            <div class="detail-section">
+                <h3>关键词</h3>
+                <div class="paper-keywords">
+                    ${paper.extracted_keywords.map(kw => 
+                        `<span class="keyword" onclick="filterByKeyword('${escapeHtml(kw)}'); closeModal(paperModal); event.stopPropagation();">${escapeHtml(kw)}</span>`
+                    ).join('')}
+                </div>
+            </div>
+        ` : ''}
+    `;
+    document.getElementById('paperDetails').innerHTML = detailsHtml;
+    const qaHtml = paper.qa_pairs && paper.qa_pairs.length > 0 ? 
+        paper.qa_pairs.map((qa, index) => `
+            <div class="qa-item">
+                <div class="qa-question">
+                    Q: ${escapeHtml(qa.question)}
+                    ${qa.parent_qa_id !== null && qa.parent_qa_id !== undefined ? '<span class="follow-up-badge">↩️ Follow-up</span>' : ''}
+                </div>
+                ${qa.thinking ? `
+                    <details class="thinking-section">
+                        <summary>🤔 Thinking process</summary>
+                        <div class="thinking-content markdown-content">${renderMarkdown(qa.thinking)}</div>
+                    </details>
+                ` : ''}
+                <div class="qa-answer markdown-content">${renderMarkdown(qa.answer)}</div>
+                <div class="qa-actions">
+                    <button class="btn-follow-up" onclick="startFollowUp(event, ${index})">
+                        ↩️ Follow-up
+                    </button>
+                </div>
+            </div>
+        `).join('') : 
+        '<p style="color: var(--text-muted);">暂无问答。请在下方输入问题！</p>';
+    document.getElementById('qaList').innerHTML = qaHtml;
 }
 
 // Ask Question (with streaming, reasoning, and follow-up support)
@@ -1183,6 +1495,12 @@ async function triggerFetch() {
 function closeModal(modal) {
     modal.classList.remove('active');
     document.body.classList.remove('modal-open');
+    if (modal === paperModal) {
+        if (stage2PollInterval) {
+            clearInterval(stage2PollInterval);
+            stage2PollInterval = null;
+        }
+    }
 }
 
 function showLoading(show) {
@@ -1523,27 +1841,24 @@ function refreshPapers() {
     }
 }
 
-// Save search state to sessionStorage
-function saveSearchState(query) {
-    if (query) {
-        sessionStorage.setItem('arxiv_search_query', query);
-    } else {
-        sessionStorage.removeItem('arxiv_search_query');
-    }
-}
-
-// Clear search state
+// Clear search state for current tab only
 function clearSearchState() {
-    sessionStorage.removeItem('arxiv_search_query');
+    try {
+        sessionStorage.removeItem(_searchStateKey(currentTab));
+    } catch (_) {}
 }
 
-// Restore search state on page load
+// Restore search state on page load for current tab. Returns true if results were restored.
 function restoreSearchState() {
-    const savedQuery = sessionStorage.getItem('arxiv_search_query');
-    if (savedQuery && searchInput) {
-        searchInput.value = savedQuery;
-        // Don't auto-trigger search on restore, let user decide
+    const cached = restoreSearchResults(currentTab);
+    if (cached && timeline) {
+        if (cached.query && searchInput) {
+            searchInput.value = cached.query;
+        }
+        renderSearchResults(cached.results);
+        return true;
     }
+    return false;
 }
 
 // Start follow-up question
