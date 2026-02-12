@@ -53,6 +53,7 @@ class Paper:
     # User actions
     is_hidden: bool = False
     is_starred: bool = False
+    star_category: str = "Other"  # AI-classified category for starred papers
     
     # Metadata
     published_date: str = ""  # arXiv submission date
@@ -67,13 +68,15 @@ class Paper:
     @classmethod
     def from_dict(cls, data: dict) -> 'Paper':
         """Create Paper from dict"""
-        # Convert qa_pairs dicts to QAPair objects
+        data = dict(data)
+        if 'star_category' not in data:
+            data['star_category'] = 'Other'
         if 'qa_pairs' in data and data['qa_pairs']:
             data['qa_pairs'] = [
                 QAPair(**qa) if isinstance(qa, dict) else qa
                 for qa in data['qa_pairs']
             ]
-        return cls(**data)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 @dataclass
@@ -97,6 +100,11 @@ class Config:
     max_tokens: int = 2000
     concurrent_papers: int = 3  # Number of papers to analyze concurrently
     min_relevance_score_for_stage2: float = 6.0  # Minimum relevance score for Stage 2 deep analysis
+
+    # Star categories for AI classification (narrowest first)
+    star_categories: List[str] = field(default_factory=lambda: [
+        "高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"
+    ])
     
     def to_dict(self) -> dict:
         return asdict(self)

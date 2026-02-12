@@ -489,14 +489,17 @@ class ArxivFetcher:
                                     'title': data.get('title', ''),
                                     'is_starred': data.get('is_starred', False),
                                     'is_hidden': data.get('is_hidden', False),
+                                    'star_category': data.get('star_category', 'Other'),
                                     'relevance_score': data.get('relevance_score', 0.0),
                                     'published_date': data.get('published_date', ''),
                                     'created_at': data.get('created_at', ''),
                                     'extracted_keywords': data.get('extracted_keywords', []),
                                     'detailed_summary': data.get('detailed_summary', ''),
+                                    'one_line_summary': data.get('one_line_summary', ''),
                                     'abstract': data.get('abstract', ''),
                                     'authors': data.get('authors', []),
                                     'tags': data.get('tags', []),
+                                    'preview_text': data.get('preview_text', ''),
                                 }
                     except Exception as e:
                         print(f"Warning: Failed to update cache for {arxiv_id}: {e}")
@@ -600,19 +603,22 @@ class ArxivFetcher:
                 mtime = 0
             self._metadata_cache[paper.id] = {
                 'id': paper.id,
-                'file_path': file_path,  # Path object, will be used in _refresh_stale_cache_entries
+                'file_path': file_path,
                 'mtime': mtime,
                 'title': paper.title,
                 'is_starred': paper.is_starred,
                 'is_hidden': paper.is_hidden,
+                'star_category': getattr(paper, 'star_category', 'Other'),
                 'relevance_score': paper.relevance_score,
                 'published_date': paper.published_date,
                 'created_at': paper.created_at,
                 'extracted_keywords': paper.extracted_keywords,
                 'detailed_summary': paper.detailed_summary,
+                'one_line_summary': paper.one_line_summary,
                 'abstract': paper.abstract,
                 'authors': paper.authors,
                 'tags': getattr(paper, 'tags', []),
+                'preview_text': getattr(paper, 'preview_text', ''),
             }
     
     # Keep _save_paper for backward compatibility
@@ -684,17 +690,20 @@ class ArxivFetcher:
                         'id': data.get('id', paper_id),
                         'file_path': file_path,
                         'mtime': mtime,
-                        'title': data.get('title', ''),  # Cache title for search
+                        'title': data.get('title', ''),
                         'is_starred': data.get('is_starred', False),
                         'is_hidden': data.get('is_hidden', False),
+                        'star_category': data.get('star_category', 'Other'),
                         'relevance_score': data.get('relevance_score', 0.0),
                         'published_date': data.get('published_date', ''),
                         'created_at': data.get('created_at', ''),
                         'extracted_keywords': data.get('extracted_keywords', []),
                         'detailed_summary': data.get('detailed_summary', ''),
-                        'abstract': data.get('abstract', ''),  # Cache abstract for search
-                        'authors': data.get('authors', []),  # Cache authors for search
-                        'tags': data.get('tags', []),  # Cache tags for search
+                        'one_line_summary': data.get('one_line_summary', ''),
+                        'abstract': data.get('abstract', ''),
+                        'authors': data.get('authors', []),
+                        'tags': data.get('tags', []),
+                        'preview_text': data.get('preview_text', ''),
                     }
             except Exception as e:
                 print(f"Warning: Failed to read metadata from {file_path.name}: {e}")
@@ -764,19 +773,22 @@ class ArxivFetcher:
                                 data = json.load(f)
                                 self._metadata_cache[paper_id] = {
                                     'id': data.get('id', paper_id),
-                                    'file_path': file_path,  # Keep as Path object
+                                    'file_path': file_path,
                                     'mtime': current_mtime,
                                     'title': data.get('title', ''),
                                     'is_starred': data.get('is_starred', False),
                                     'is_hidden': data.get('is_hidden', False),
+                                    'star_category': data.get('star_category', 'Other'),
                                     'relevance_score': data.get('relevance_score', 0.0),
                                     'published_date': data.get('published_date', ''),
                                     'created_at': data.get('created_at', ''),
                                     'extracted_keywords': data.get('extracted_keywords', []),
                                     'detailed_summary': data.get('detailed_summary', ''),
+                                    'one_line_summary': data.get('one_line_summary', ''),
                                     'abstract': data.get('abstract', ''),
                                     'authors': data.get('authors', []),
                                     'tags': data.get('tags', []),
+                                    'preview_text': data.get('preview_text', ''),
                                 }
                                 stale_count += 1
                         except Exception as e:

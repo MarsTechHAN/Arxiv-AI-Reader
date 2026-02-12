@@ -1078,6 +1078,65 @@ Paper Content:
         
         return None
     
+    async def classify_starred_paper(self, paper: Paper, config: Config) -> str:
+        """
+        Classify a starred paper into one of the configured categories using title + abstract.
+        When multiple categories fit, choose the NARROWEST one.
+        Returns the category name, or 'Other' if none fits.
+        """
+        categories = getattr(config, 'star_categories', None) or [
+            "高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"
+        ]
+        categories = list(categories) + ["Other"]
+        category_list_str = ", ".join(f'"{c}"' for c in categories[:-1])
+        
+        prompt = f"""Classify this paper into EXACTLY ONE category. Choose the NARROWEST/most specific match.
+
+Valid categories (use EXACT string): {category_list_str}, "Other"
+
+Rule: When a paper fits multiple categories (e.g. video sparse attention -> both "efficient video generation" and "attention mechanism"), choose the NARROWEST. Use "Other" only if it fits NONE of the above.
+
+Paper Title: {paper.title}
+Abstract: {paper.abstract[:1500]}
+
+Respond with JSON only: {{"category": "exact_category_name"}}"""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=config.model,
+                messages=[
+                    {"role": "system", "content": "You are a precise classifier. Respond ONLY with valid JSON: {\"category\": \"category_name\"}"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                max_tokens=100,
+                response_format={"type": "json_object"},
+            )
+            result = response.choices[0].message.content.strip()
+            data = json.loads(result)
+            cat = data.get("category", "").strip()
+            if cat in categories:
+                print(f"  Classified {paper.id} -> {cat}")
+                return cat
+            # Fuzzy fallback: model might return slight variation
+            for valid_cat in categories:
+                if valid_cat in cat or cat in valid_cat:
+                    return valid_cat
+            print(f"  Classification fallback to Other for {paper.id}: model returned '{cat}'")
+            return "Other"
+        except json.JSONDecodeError as e:
+            # Fallback: extract category from raw response
+            raw = response.choices[0].message.content.strip()
+            for cat in categories:
+                if cat in raw:
+                    print(f"  Classified {paper.id} -> {cat} (from raw parse)")
+                    return cat
+            print(f"  Classification JSON parse failed for {paper.id}: {e}, fallback to Other")
+            return "Other"
+        except Exception as e:
+            print(f"  Classification error for {paper.id}: {e}")
+            return "Other"
+    
     def _save_paper(self, paper: Paper):
         """Save paper to JSON file"""
         file_path = self.data_dir / f"{paper.id}.json"

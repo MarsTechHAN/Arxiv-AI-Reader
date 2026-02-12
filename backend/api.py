@@ -148,6 +148,7 @@ class UpdateConfigRequest(BaseModel):
     max_tokens: Optional[int] = None
     concurrent_papers: Optional[int] = None
     min_relevance_score_for_stage2: Optional[float] = None
+    star_categories: Optional[List[str]] = None
 
 
 class UpdateRelevanceRequest(BaseModel):
@@ -178,20 +179,21 @@ async def health_check():
 
 
 @app.get("/papers", response_model=List[dict])
-async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: str = "false"):
+async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: str = "false", category: str = None):
     """
     List papers for timeline.
     sort_by: 'relevance' (default), 'latest'
     keyword: filter by keyword
-    starred_only: 'true' to return only starred papers, 'false' to exclude starred papers
+    starred_only: 'true' to return only starred papers (optionally filtered by category)
+    category: when starred_only=true, filter by star_category (e.g. '高效视频生成', 'Other')
+    When starred_only=false: show ALL papers (star is just categorization, starred papers remain in main list)
     
     PERFORMANCE OPTIMIZATION: Use metadata scanning first, then load only needed papers.
     """
     starred_only_bool = starred_only.lower() == 'true'
     
     # Step 1: Scan metadata first (fast - only reads minimal JSON fields)
-    # This avoids loading all paper files into memory
-    max_scan = 10000 if starred_only_bool else 2000  # Scan more for starred, less for normal
+    max_scan = 10000 if starred_only_bool else 5000
     metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=True)
     
     # Debug: log metadata stats
@@ -199,7 +201,6 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
         total_starred = sum(1 for m in metadata_list if m.get('is_starred', False))
         total_hidden = sum(1 for m in metadata_list if m.get('is_hidden', False))
         print(f"[DEBUG] Total metadata: {len(metadata_list)}, starred: {total_starred}, hidden: {total_hidden}")
-        # If no starred papers found, force refresh cache
         if total_starred == 0 and len(metadata_list) > 0:
             print("[DEBUG] No starred papers in cache, forcing cache refresh...")
             fetcher._refresh_metadata_cache()
@@ -207,12 +208,15 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
             total_starred = sum(1 for m in metadata_list if m.get('is_starred', False))
             print(f"[DEBUG] After refresh: {len(metadata_list)} total, {total_starred} starred")
     
-    # Step 2: Filter by starred/hidden status using metadata (no file loading)
+    # Step 2: Filter - star is just categorization; main list shows ALL non-hidden papers
     if starred_only_bool:
         filtered_metadata = [m for m in metadata_list if m.get('is_starred', False) and not m.get('is_hidden', False)]
-        print(f"[DEBUG] Filtered starred metadata: {len(filtered_metadata)}")
+        if category:
+            filtered_metadata = [m for m in filtered_metadata if m.get('star_category', 'Other') == category]
+        print(f"[DEBUG] Filtered starred metadata: {len(filtered_metadata)} (category={category})")
     else:
-        filtered_metadata = [m for m in metadata_list if not m.get('is_starred', False) and not m.get('is_hidden', False)]
+        # Main list: show ALL papers (starred + non-starred), only exclude hidden
+        filtered_metadata = [m for m in metadata_list if not m.get('is_hidden', False)]
     
     # Step 3: Filter by keyword if provided (still using metadata)
     if keyword:
@@ -292,10 +296,11 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
             "published_date": p.published_date,
             "is_starred": p.is_starred,
             "is_hidden": p.is_hidden,
+            "star_category": getattr(p, 'star_category', 'Other'),
             "created_at": p.created_at,
             "has_qa": len(p.qa_pairs) > 0,
-            "detailed_summary": p.detailed_summary,  # For Stage 2 status detection
-            "tags": getattr(p, 'tags', []),  # AI-generated tags
+            "detailed_summary": p.detailed_summary,
+            "tags": getattr(p, 'tags', []),
         }
         for p in papers
     ]
@@ -440,7 +445,13 @@ async def update_config(request: UpdateConfigRequest):
     if request.concurrent_papers is not None:
         config.concurrent_papers = max(1, min(50, request.concurrent_papers))  # 1-50 range
     if request.min_relevance_score_for_stage2 is not None:
-        config.min_relevance_score_for_stage2 = max(0.0, min(10.0, request.min_relevance_score_for_stage2))  # 0-10 range
+        config.min_relevance_score_for_stage2 = max(0.0, min(10.0, request.min_relevance_score_for_stage2))
+    if request.star_categories is not None:
+        old_categories = set(config.star_categories or [])
+        config.star_categories = request.star_categories
+        new_categories = set(config.star_categories)
+        if old_categories != new_categories:
+            asyncio.create_task(reclassify_all_starred_papers(config))
     
     config.save(config_path)
     
@@ -575,6 +586,8 @@ async def search_papers(q: str, limit: int = 50):
         title = meta.get('title', '')  # May not be in cache, will load if needed
         abstract = meta.get('abstract', '')
         detailed_summary = meta.get('detailed_summary', '')
+        one_line_summary = meta.get('one_line_summary', '')
+        preview_text = meta.get('preview_text', '')
         authors = meta.get('authors', [])
         tags = meta.get('tags', [])
         extracted_keywords = meta.get('extracted_keywords', [])
@@ -583,6 +596,8 @@ async def search_papers(q: str, limit: int = 50):
         title_score = 0.0
         abstract_score = 0.0
         summary_score = 0.0
+        one_line_score = 0.0
+        fulltext_score = 0.0
         author_score = 0.0
         tag_score = 0.0
         
@@ -602,9 +617,17 @@ async def search_papers(q: str, limit: int = 50):
         if abstract:
             abstract_score = _calculate_similarity(q, abstract)
         
-        # Detailed summary matching
+        # Detailed summary matching (AI-generated)
         if detailed_summary:
             summary_score = _calculate_similarity(q, detailed_summary) * 1.5  # Higher weight
+        
+        # One-line summary matching (AI-generated)
+        if one_line_summary:
+            one_line_score = _calculate_similarity(q, one_line_summary) * 1.2
+        
+        # Full-text matching (preview: abstract + first ~2000 chars of paper)
+        if preview_text:
+            fulltext_score = _calculate_similarity(q, preview_text) * 0.8
         
         # Author matching
         authors_text = ' '.join(authors).lower()
@@ -628,6 +651,8 @@ async def search_papers(q: str, limit: int = 50):
             title_score +
             abstract_score +
             summary_score +
+            one_line_score +
+            fulltext_score +
             author_score +
             tag_score
         )
@@ -720,13 +745,22 @@ async def unhide_paper(paper_id: str):
 
 @app.post("/papers/{paper_id}/star")
 async def star_paper(paper_id: str):
-    """Star a paper"""
+    """Star a paper and classify it (or unstar)"""
     try:
         paper = fetcher.load_paper(paper_id)
-        paper.is_starred = not paper.is_starred  # Toggle
-        fetcher.save_paper(paper)  # This updates cache automatically
-        print(f"[DEBUG] Starred paper {paper_id}: is_starred={paper.is_starred}")
-        return {"message": "论文已收藏" if paper.is_starred else "取消收藏", "is_starred": paper.is_starred}
+        paper.is_starred = not paper.is_starred
+        if paper.is_starred:
+            config = Config.load(config_path)
+            paper.star_category = await analyzer.classify_starred_paper(paper, config)
+            print(f"[DEBUG] Starred {paper_id} -> category: {paper.star_category}")
+        else:
+            paper.star_category = "Other"
+        fetcher.save_paper(paper)
+        return {
+            "message": "论文已收藏" if paper.is_starred else "取消收藏",
+            "is_starred": paper.is_starred,
+            "star_category": paper.star_category,
+        }
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
 
@@ -752,6 +786,30 @@ async def update_relevance(paper_id: str, request: UpdateRelevanceRequest):
 
 
 # ============ Background Tasks ============
+
+async def reclassify_all_starred_papers(config: Config):
+    """Re-classify all starred papers when categories change"""
+    try:
+        metadata_list = fetcher.list_papers_metadata(max_files=10000, check_stale=True)
+        starred = [m for m in metadata_list if m.get('is_starred', False)]
+        if not starred:
+            print("✓ No starred papers to reclassify")
+            return
+        print(f"\n🏷️ Reclassifying {len(starred)} starred papers...")
+        for meta in starred:
+            try:
+                paper = fetcher.load_paper(meta['id'])
+                paper.star_category = await analyzer.classify_starred_paper(paper, config)
+                fetcher.save_paper(paper)
+                print(f"  ✓ {paper.id} -> {paper.star_category}")
+            except Exception as e:
+                print(f"  ✗ Failed {meta.get('id', '?')}: {e}")
+        print("✓ Reclassification complete")
+    except Exception as e:
+        print(f"✗ Reclassification error: {e}")
+        import traceback
+        traceback.print_exc()
+
 
 async def recheck_negative_keywords(config: Config, negative_keywords: set):
     """

@@ -24,6 +24,12 @@
         </div>
     </header>
 
+    <!-- Pull-to-refresh indicator -->
+    <div id="pullRefreshIndicator" class="pull-refresh-indicator">
+        <div class="pull-refresh-spinner"></div>
+        <span>松开刷新</span>
+    </div>
+
     <!-- Update notification -->
     <div id="updateNotification" class="update-notification" style="display: none;">
         <span>🎉 有新的论文更新！</span>
@@ -31,12 +37,14 @@
         <button onclick="dismissUpdate()" class="btn-small btn-dismiss">×</button>
     </div>
 
-    <!-- Tabs -->
+    <!-- Tabs: All papers fixed left, categories scrollable -->
     <div class="tabs-container">
-        <div class="container">
+        <div class="tabs-wrapper">
             <div class="tabs">
-                <button class="tab-btn active" data-tab="all" id="tabAll">📄 全部论文</button>
-                <button class="tab-btn" data-tab="starred" id="tabStarred">⭐ 收藏</button>
+                <button class="tab-btn tab-all active" data-tab="all" id="tabAll">全部论文</button>
+                <div class="tabs-scroll">
+                    <div id="categoryTabsContainer" class="tabs-scroll-inner"></div>
+                </div>
             </div>
         </div>
     </div>
@@ -160,6 +168,13 @@
                     <label>Min Relevance Score for Stage 2 (0-10)</label>
                     <input type="number" id="minRelevanceScoreForStage2" class="input" 
                            min="0" max="10" step="0.5" placeholder="6">
+                </div>
+                
+                <h3>Star Categories (for AI classification, one per line, narrowest first)</h3>
+                <div class="form-group">
+                    <label>Star Categories - papers are classified into these when starred</label>
+                    <textarea id="starCategories" class="textarea" rows="5"
+                              placeholder="高效视频生成&#10;LLM稀疏注意力&#10;注意力机制&#10;Roll-out方法"></textarea>
                 </div>
             </div>
             <div class="modal-footer">

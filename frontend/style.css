@@ -71,29 +71,69 @@ body.modal-open {
     color: var(--text-muted);
 }
 
-/* Tabs */
+/* Tabs: All papers fixed left, category tabs horizontally scrollable */
 .tabs-container {
     background: var(--bg-light);
     border-bottom: 1px solid var(--border);
 }
 
+.tabs-wrapper {
+    max-width: 100%;
+    overflow: hidden;
+}
+
 .tabs {
     display: flex;
-    gap: 0;
+    align-items: stretch;
     border-bottom: 2px solid var(--border);
 }
 
-.tab-btn {
+.tab-btn.tab-all {
+    flex-shrink: 0;
     padding: 12px 24px;
+    margin-bottom: -2px;
+}
+
+.tabs-scroll {
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+}
+
+.tabs-scroll::-webkit-scrollbar {
+    height: 6px;
+}
+
+.tabs-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.tabs-scroll::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+
+.tabs-scroll-inner {
+    display: flex;
+    gap: 0;
+    min-width: min-content;
+}
+
+.tab-btn {
+    padding: 12px 20px;
     background: transparent;
     border: none;
     border-bottom: 2px solid transparent;
     color: var(--text-muted);
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 500;
     cursor: pointer;
     transition: all 0.2s;
     margin-bottom: -2px;
+    flex-shrink: 0;
 }
 
 .tab-btn:hover {
@@ -1406,6 +1446,47 @@ body.modal-open {
 
 body.pdf-preview-open {
     overflow: hidden;
+}
+
+/* Pull-to-refresh */
+.pull-refresh-indicator {
+    position: fixed;
+    top: 0;
+    left: 50%;
+    transform: translateX(-50%) translateY(-100%);
+    z-index: 500;
+    background: var(--bg-light);
+    border: 1px solid var(--border);
+    border-top: none;
+    border-radius: 0 0 12px 12px;
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-shadow: 0 4px 12px var(--shadow);
+    transition: transform 0.3s ease;
+}
+
+.pull-refresh-indicator.visible {
+    transform: translateX(-50%) translateY(0);
+}
+
+.pull-refresh-spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid var(--border);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.pull-refresh-indicator.loading .pull-refresh-spinner {
+    animation: spin 1s linear infinite;
+}
+
+.pull-refresh-indicator span {
+    font-size: 14px;
+    color: var(--text-muted);
 }
 
 /* Starred Papers Section */

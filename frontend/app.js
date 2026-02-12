@@ -9,7 +9,8 @@ let currentSortBy = 'relevance';
 let currentKeyword = null;
 let hasMorePapers = true;
 let isLoadingMore = false;
-let currentTab = 'all';  // 'all' or 'starred'
+let currentTab = 'all';  // 'all' or category name (e.g. '高效视频生成', 'Other')
+let starCategories = ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
 let currentPaperList = [];  // Store current paper list for navigation
 let currentPaperIndex = -1;  // Current paper index in the list
 
@@ -25,22 +26,20 @@ const fetchBtn = document.getElementById('fetchBtn');
 const configModal = document.getElementById('configModal');
 const paperModal = document.getElementById('paperModal');
 const tabAll = document.getElementById('tabAll');
-const tabStarred = document.getElementById('tabStarred');
+const categoryTabsContainer = document.getElementById('categoryTabsContainer');
 
 // Initialize
-document.addEventListener('DOMContentLoaded', () => {
-    // Sync sortSelect with currentSortBy on initialization
+document.addEventListener('DOMContentLoaded', async () => {
     if (sortSelect) {
         currentSortBy = sortSelect.value;
     }
-    
-    // Restore search state from URL or sessionStorage
     restoreSearchState();
-    
-    loadPapers();
+    await loadConfigAndRenderTabs();
     setupEventListeners();
     setupInfiniteScroll();
-    checkDeepLink();  // Check if URL has paper ID parameter
+    setupPullToRefresh();
+    loadPapers();
+    checkDeepLink();
 });
 
 // Event Listeners
@@ -237,9 +236,99 @@ function setupEventListeners() {
     if (tabAll) {
         tabAll.addEventListener('click', () => switchTab('all'));
     }
-    if (tabStarred) {
-        tabStarred.addEventListener('click', () => switchTab('starred'));
+}
+
+async function loadConfigAndRenderTabs() {
+    try {
+        const response = await fetch(`${API_BASE}/config`);
+        const config = await response.json();
+        starCategories = config.star_categories || ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
+        renderCategoryTabs();
+    } catch (e) {
+        console.warn('Failed to load config for tabs:', e);
+        renderCategoryTabs();
     }
+}
+
+function renderCategoryTabs() {
+    if (!categoryTabsContainer) return;
+    categoryTabsContainer.innerHTML = '';
+    const categories = [...starCategories, 'Other'];
+    categories.forEach(cat => {
+        const btn = document.createElement('button');
+        btn.className = 'tab-btn';
+        btn.dataset.tab = cat;
+        btn.textContent = cat;
+        btn.title = `收藏 · ${cat}`;
+        btn.addEventListener('click', () => switchTab(cat));
+        categoryTabsContainer.appendChild(btn);
+    });
+}
+
+// Pull-to-refresh (fix for category tabs)
+function setupPullToRefresh() {
+    const indicator = document.getElementById('pullRefreshIndicator');
+    if (!indicator) return;
+    
+    let startY = 0;
+    let pulling = false;
+    
+    const handleStart = (e) => {
+        if (window.scrollY <= 10) {
+            startY = e.touches ? e.touches[0].clientY : e.clientY;
+            pulling = true;
+        }
+    };
+    
+    const handleMove = (e) => {
+        if (!pulling || window.scrollY > 10) return;
+        const y = e.touches ? e.touches[0].clientY : e.clientY;
+        const pullDist = y - startY;
+        if (pullDist > 60) {
+            indicator.classList.add('visible');
+        } else if (pullDist < 30) {
+            indicator.classList.remove('visible');
+        }
+    };
+    
+    const doRefresh = () => {
+        indicator.classList.add('loading');
+        currentPage = 0;
+        hasMorePapers = true;
+        const searchQuery = searchInput.value.trim();
+        (searchQuery ? searchPapers(searchQuery) : loadPapers(0, true))
+            .finally(() => indicator.classList.remove('visible', 'loading'));
+    };
+    
+    const handleEnd = () => {
+        if (!pulling) return;
+        pulling = false;
+        if (indicator.classList.contains('visible')) doRefresh();
+        else indicator.classList.remove('visible');
+    };
+    
+    document.addEventListener('touchstart', handleStart, { passive: true });
+    document.addEventListener('touchmove', handleMove, { passive: true });
+    document.addEventListener('touchend', handleEnd);
+    
+    // Mouse support for desktop
+    document.addEventListener('mousedown', (e) => {
+        if (window.scrollY <= 10) {
+            startY = e.clientY;
+            pulling = true;
+        }
+    });
+    document.addEventListener('mousemove', (e) => {
+        if (!pulling || window.scrollY > 10) return;
+        const pullDist = e.clientY - startY;
+        if (pullDist > 60) indicator.classList.add('visible');
+        else if (pullDist < 30) indicator.classList.remove('visible');
+    });
+    document.addEventListener('mouseup', () => {
+        if (pulling && indicator.classList.contains('visible')) doRefresh();
+        pulling = false;
+        indicator.classList.remove('visible');
+    });
 }
 
 // Infinite scroll
@@ -270,28 +359,22 @@ function setupInfiniteScroll() {
 
 // Switch Tab
 function switchTab(tab) {
-    if (currentTab === tab) return;  // Already on this tab
+    if (currentTab === tab) return;
     
     currentTab = tab;
     currentPage = 0;
     hasMorePapers = true;
     
-    // Update tab buttons
-    if (tab === 'all') {
-        tabAll.classList.add('active');
-        tabStarred.classList.remove('active');
-    } else {
-        tabStarred.classList.add('active');
-        tabAll.classList.remove('active');
-    }
+    if (tabAll) tabAll.classList.toggle('active', tab === 'all');
+    categoryTabsContainer?.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tab);
+    });
     
-    // Clear search when switching tabs
     searchInput.value = '';
     currentKeyword = null;
     clearKeywordBtn.style.display = 'none';
     clearSearchState();
     
-    // Load papers for the selected tab
     loadPapers(0, true);
 }
 
@@ -305,9 +388,11 @@ async function loadPapers(page = 0, shouldScroll = true) {
     }
     
     try {
-        // Determine if we're loading starred papers
-        const isStarredTab = currentTab === 'starred';
-        let url = `${API_BASE}/papers?skip=${page * 20}&limit=20&sort_by=${currentSortBy}&starred_only=${isStarredTab ? 'true' : 'false'}`;
+        const isCategoryTab = currentTab !== 'all';
+        let url = `${API_BASE}/papers?skip=${page * 20}&limit=20&sort_by=${currentSortBy}&starred_only=${isCategoryTab ? 'true' : 'false'}`;
+        if (isCategoryTab) {
+            url += `&category=${encodeURIComponent(currentTab)}`;
+        }
         if (currentKeyword) {
             url += `&keyword=${encodeURIComponent(currentKeyword)}`;
         }
@@ -330,11 +415,10 @@ async function loadPapers(page = 0, shouldScroll = true) {
         if (papers.length === 0) {
             hasMorePapers = false;
             if (page > 0) {
-                return; // No more papers to add
+                return;
             }
-            // Page 0 with no papers - show empty state
-            const emptyMessage = isStarredTab 
-                ? '<p style="text-align: center; color: var(--text-muted); padding: 40px;">暂无收藏的论文</p>'
+            const emptyMessage = isCategoryTab 
+                ? `<p style="text-align: center; color: var(--text-muted); padding: 40px;">暂无「${escapeHtml(currentTab)}」分类的论文</p>`
                 : '<p style="text-align: center; color: var(--text-muted); padding: 40px;">暂无论文</p>';
             timeline.innerHTML = emptyMessage;
             return;
@@ -877,6 +961,10 @@ async function openConfigModal() {
         document.getElementById('concurrentPapers').value = config.concurrent_papers || 10;
         document.getElementById('minRelevanceScoreForStage2').value = config.min_relevance_score_for_stage2 || 6;
         
+        // Star categories
+        const sc = config.star_categories || ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
+        document.getElementById('starCategories').value = sc.join('\n');
+        
         configModal.classList.add('active');
         document.body.classList.add('modal-open');
     } catch (error) {
@@ -917,6 +1005,10 @@ async function saveConfig() {
     // Analysis settings
     const concurrentPapers = parseInt(document.getElementById('concurrentPapers').value);
     const minRelevanceScoreForStage2 = parseFloat(document.getElementById('minRelevanceScoreForStage2').value);
+    
+    const starCategoriesInput = document.getElementById('starCategories');
+    const starCategoriesList = starCategoriesInput ? starCategoriesInput.value
+        .split('\n').map(s => s.trim()).filter(s => s) : [];
     
     // Validation
     if (isNaN(temperature) || temperature < 0 || temperature > 2) {
@@ -959,11 +1051,17 @@ async function saveConfig() {
                 fetch_interval: fetchInterval,
                 max_papers_per_fetch: maxPapersPerFetch,
                 concurrent_papers: concurrentPapers,
-                min_relevance_score_for_stage2: minRelevanceScoreForStage2
+                min_relevance_score_for_stage2: minRelevanceScoreForStage2,
+                star_categories: starCategoriesList.length > 0 ? starCategoriesList : ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法']
             })
         });
         
         const result = await response.json();
+        
+        if (starCategoriesList.length > 0) {
+            starCategories = starCategoriesList;
+            renderCategoryTabs();
+        }
         
         closeModal(configModal);
         showSuccess(result.message || 'Configuration saved');
@@ -1049,9 +1147,8 @@ async function toggleStar(paperId) {
                 }
             }
             
-            // If starred and we're on 'all' tab, remove from timeline
-            // If unstarred and we're on 'starred' tab, remove from timeline
-            if ((isStarred && currentTab === 'all') || (!isStarred && currentTab === 'starred')) {
+            // Only remove card when unstarring on a category tab (starred papers stay in main list)
+            if (!isStarred && currentTab !== 'all') {
                 card.style.transition = 'opacity 0.3s ease-out';
                 card.style.opacity = '0';
                 setTimeout(() => {
