@@ -45,7 +45,15 @@ def _calculate_similarity(query: str, text: str) -> float:
 
 def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
                search_full_text: bool = True, search_generated_only: bool = False) -> list:
-    """Core search logic."""
+    """Core search logic. Uses store FTS when available (SQLite), else in-memory scan."""
+    store = getattr(fetcher, "store", None)
+    if store and hasattr(store, "search") and not search_generated_only:
+        fts_results = store.search(q.strip(), limit=limit, search_full_text=search_full_text)
+        if fts_results:
+            if ids_only:
+                return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in fts_results]
+            return fts_results
+
     q_lower = q.lower()
     metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
     results = []
@@ -165,8 +173,16 @@ def search_generated_content(query: str, limit: int = 50, ids_only: bool = False
 def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = False, max_scan: int = 2000) -> list:
     """
     Search within actual full paper html_content.
-    Loads each paper from disk - slower but searches entire paper text.
+    Uses store FTS when available (SQLite), else loads each paper from disk.
     """
+    store = getattr(fetcher, "store", None)
+    if store and hasattr(store, "search"):
+        fts_results = store.search(q.strip(), limit=limit, search_full_text=True)
+        if fts_results:
+            if ids_only:
+                return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in fts_results]
+            return fts_results
+
     q_lower = q.lower()
     metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=True)
     results = []

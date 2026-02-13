@@ -30,14 +30,14 @@ class DeepSeekAnalyzer:
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not set")
         
-        # Configure httpx client with connection pool for better concurrency
+        # Configure httpx client with connection pool for high concurrency (stage1+stage2)
         http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=30.0),  # 5min total, 30s connect
             limits=httpx.Limits(
-                max_keepalive_connections=100,  # Keep connections alive
-                max_connections=200,  # Max concurrent connections
+                max_keepalive_connections=200,
+                max_connections=500,  # Support stage1(256)+stage2(128) concurrent
             ),
-            http2=True,  # Enable HTTP/2 for better performance
+            http2=True,
         )
         
         self.client = AsyncOpenAI(
@@ -682,24 +682,25 @@ Paper Content:
         else:
             print(f"  Stage 2: Resuming for {paper.id} (summary exists)")
         
-        # 2. Ask preset questions, skip already answered, save after each
+        # 2. Preset questions: summary above was first (pre-fill KV cache); all preset Qs concurrent
         already_answered = {qa.question for qa in paper.qa_pairs}
-        for question in config.preset_questions:
-            if question in already_answered:
-                continue
-            answer = await self._ask_question_with_retry(
-                cache_prefix=cache_prefix,
-                question=question,
-                config=config,
-                cache_id=paper.id
+        pending = [q for q in config.preset_questions if q not in already_answered]
+        if not pending:
+            return paper
+
+        async def ask_one(q: str) -> tuple[str, Optional[str]]:
+            ans = await self._ask_question_with_retry(
+                cache_prefix=cache_prefix, question=q, config=config, cache_id=paper.id
             )
-            if answer is None:
-                print(f"  Stage 2 FAILED for {paper.id}, Q: {question[:40]}")
-                continue
-            paper.qa_pairs.append(QAPair(question=question, answer=answer))
-            already_answered.add(question)
-            print(f"  Stage 2: Answered '{question[:40]}...' for {paper.id}")
-            self._save_paper(paper)  # Incremental save after each answer
+            return (q, ans)
+
+        results = await asyncio.gather(*[ask_one(q) for q in pending])
+        for q, ans in results:
+            if ans is not None:
+                paper.qa_pairs.append(QAPair(question=q, answer=ans))
+                print(f"  Stage 2: Answered '{q[:40]}...' for {paper.id}")
+        if any(ans is not None for _, ans in results):
+            self._save_paper(paper)
         
         return paper
     
@@ -1424,6 +1425,77 @@ Respond with JSON only: {{"category": "exact_category_name"}}"""
         with open(file_path, 'w') as f:
             json.dump(paper.to_dict(), f, indent=2, ensure_ascii=False)
     
+    async def run_streaming_fetch_and_analyze(
+        self, fetcher, config: Config, max_papers_per_category: int = 100
+    ) -> int:
+        """
+        Decoupled pipeline: fetch streams papers to stage1 queue; stage1 passes relevant
+        to stage2 queue. Stage1 can start before fetch completes; stage2 can start
+        before stage1 completes. Uses separate concurrency: stage1 (default 256),
+        stage2 (default 128).
+        Returns total papers processed through stage1.
+        """
+        n1 = getattr(config, "stage1_concurrency", 256)
+        n2 = getattr(config, "stage2_concurrency", 128)
+        min_score = getattr(config, "min_relevance_score_for_stage2", 6.0)
+        stage1_queue: asyncio.Queue = asyncio.Queue()
+        stage2_queue: asyncio.Queue = asyncio.Queue()
+        sem1 = asyncio.Semaphore(n1)
+        sem2 = asyncio.Semaphore(n2)
+
+        async def stage1_worker() -> None:
+            while True:
+                paper = await stage1_queue.get()
+                if paper is None:
+                    break
+                try:
+                    async with sem1:
+                        await self.stage1_filter(paper, config)
+                    if paper.is_relevant and paper.relevance_score >= min_score:
+                        await stage2_queue.put(paper)
+                except Exception as e:
+                    print(f"  Stage 1 error for {paper.id}: {e}")
+                finally:
+                    stage1_queue.task_done()
+
+        async def stage2_worker() -> None:
+            while True:
+                paper = await stage2_queue.get()
+                if paper is None:
+                    break
+                try:
+                    async with sem2:
+                        await self.stage2_qa(paper, config)
+                except Exception as e:
+                    print(f"  Stage 2 error for {paper.id}: {e}")
+                finally:
+                    stage2_queue.task_done()
+
+        n_workers1 = min(n1, 128)
+        n_workers2 = min(n2, 128)
+        stage1_tasks = [asyncio.create_task(stage1_worker()) for _ in range(n_workers1)]
+        stage2_tasks = [asyncio.create_task(stage2_worker()) for _ in range(n_workers2)]
+        print(f"\n🔍 Stage 1 workers: {len(stage1_tasks)}, Stage 2 workers: {len(stage2_tasks)}")
+
+        async def run_fetch() -> int:
+            async def on_paper(p: Paper) -> None:
+                await stage1_queue.put(p)
+            papers = await fetcher.fetch_latest(
+                max_papers_per_category, on_new_paper=on_paper
+            )
+            return len(papers)
+
+        fetch_task = asyncio.create_task(run_fetch())
+        total_fetched = await fetch_task
+        for _ in range(len(stage1_tasks)):
+            await stage1_queue.put(None)
+        await asyncio.gather(*stage1_tasks)
+        for _ in range(len(stage2_tasks)):
+            await stage2_queue.put(None)
+        await asyncio.gather(*stage2_tasks)
+        print(f"✓ Pipeline complete: {total_fetched} papers through stage1")
+        return total_fetched
+
     async def process_papers(
         self,
         papers: List[Paper],
@@ -1431,67 +1503,39 @@ Respond with JSON only: {{"category": "exact_category_name"}}"""
         skip_stage1: bool = False
     ) -> List[Paper]:
         """
-        Process multiple papers concurrently with proper concurrency control.
-        
-        Stage 1: Filter papers with controlled concurrency
-        Stage 2: Deep analysis only for relevant papers with controlled concurrency
-        
-        Args:
-            papers: List of papers to process
-            config: Configuration
-            skip_stage1: If True, skip Stage 1 and go directly to Stage 2 for all papers
+        Process papers with separate stage concurrency. Uses stage1_concurrency
+        and stage2_concurrency from config (default 256/128).
         """
         if not papers:
             return papers
-        
-        concurrent = config.concurrent_papers
-        
-        # Stage 1: Filter papers (unless skipped)
+        n1 = getattr(config, "stage1_concurrency", 256)
+        n2 = getattr(config, "stage2_concurrency", 128)
+        min_score = getattr(config, "min_relevance_score_for_stage2", 6.0)
+        sem1 = asyncio.Semaphore(n1)
+        sem2 = asyncio.Semaphore(n2)
+
         if not skip_stage1:
-            print(f"\n🔍 Stage 1: Filtering {len(papers)} papers (concurrent={concurrent})...")
-            
-            # Use semaphore to control concurrency
-            semaphore = asyncio.Semaphore(concurrent)
-            
-            async def stage1_with_semaphore(paper: Paper) -> Paper:
-                async with semaphore:
-                    return await self.stage1_filter(paper, config)
-            
-            stage1_tasks = [stage1_with_semaphore(paper) for paper in papers]
-            papers = await asyncio.gather(*stage1_tasks)
-            
-            # Find relevant papers with score >= min_relevance_score_for_stage2
-            min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
-            relevant_papers = [
-                p for p in papers 
-                if p.is_relevant and p.relevance_score >= min_score
-            ]
-            
-            low_score_count = len([p for p in papers if p.is_relevant and p.relevance_score < min_score])
+            print(f"\n🔍 Stage 1: Filtering {len(papers)} papers (concurrent={n1})...")
+            async def stage1_one(p: Paper) -> Paper:
+                async with sem1:
+                    return await self.stage1_filter(p, config)
+            papers = list(await asyncio.gather(*[stage1_one(p) for p in papers]))
+            relevant_papers = [p for p in papers if p.is_relevant and p.relevance_score >= min_score]
+            low = len([p for p in papers if p.is_relevant and p.relevance_score < min_score])
             print(f"✓ Found {len(relevant_papers)} papers with score >= {min_score} for deep analysis")
-            if low_score_count > 0:
-                print(f"  Skipped {low_score_count} relevant papers with score < {min_score}")
+            if low > 0:
+                print(f"  Skipped {low} relevant papers with score < {min_score}")
         else:
-            # Skip Stage 1, treat all papers as relevant for Stage 2
-            print(f"\n🔍 Skipping Stage 1, directly processing {len(papers)} papers for Stage 2...")
+            print(f"\n🔍 Skipping Stage 1, {len(papers)} papers for Stage 2...")
             relevant_papers = papers
-        
-        # Stage 2: Deep analysis for relevant papers
+
         if relevant_papers:
-            print(f"\n📚 Stage 2: Deep analysis of {len(relevant_papers)} papers (concurrent={concurrent})...")
-            
-            # Use semaphore to control concurrency (better than batching)
-            semaphore = asyncio.Semaphore(concurrent)
-            
-            async def stage2_with_semaphore(paper: Paper) -> Paper:
-                async with semaphore:
-                    return await self.stage2_qa(paper, config)
-            
-            stage2_tasks = [stage2_with_semaphore(paper) for paper in relevant_papers]
-            await asyncio.gather(*stage2_tasks)
-            
+            print(f"\n📚 Stage 2: Deep analysis of {len(relevant_papers)} papers (concurrent={n2})...")
+            async def stage2_one(p: Paper) -> Paper:
+                async with sem2:
+                    return await self.stage2_qa(p, config)
+            await asyncio.gather(*[stage2_one(p) for p in relevant_papers])
             print(f"✓ Completed Stage 2 analysis for {len(relevant_papers)} papers")
-        
         return papers
 
 

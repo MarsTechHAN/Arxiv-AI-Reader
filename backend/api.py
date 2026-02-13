@@ -204,7 +204,6 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
         total_hidden = sum(1 for m in metadata_list if m.get('is_hidden', False))
         print(f"[DEBUG] Total metadata: {len(metadata_list)}, starred: {total_starred}, hidden: {total_hidden}")
         if total_starred == 0 and len(metadata_list) > 0:
-            print("[DEBUG] No starred papers in cache, forcing cache refresh...")
             fetcher._refresh_metadata_cache()
             metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=False)
             total_starred = sum(1 for m in metadata_list if m.get('is_starred', False))
@@ -878,7 +877,41 @@ async def search_papers(q: str, limit: int = 50):
             print(f"✗ Failed to fetch arXiv paper {arxiv_id}: {e}")
             raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found on arXiv")
     
-    # Normal search using cached metadata
+    # Try store FTS first (SQLite), else fall back to metadata scan
+    store = getattr(fetcher, "store", None)
+    if store and hasattr(store, "search"):
+        fts_results = store.search(q, limit=limit, search_full_text=True)
+        if fts_results:
+            config = Config.load(config_path)
+            results = []
+            for r in fts_results:
+                try:
+                    paper = fetcher.load_paper(r["id"])
+                    results.append({
+                        "id": paper.id,
+                        "title": paper.title,
+                        "authors": paper.authors,
+                        "abstract": paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract,
+                        "url": paper.url,
+                        "is_relevant": paper.is_relevant,
+                        "relevance_score": paper.relevance_score,
+                        "extracted_keywords": paper.extracted_keywords,
+                        "one_line_summary": paper.one_line_summary,
+                        "published_date": paper.published_date,
+                        "is_starred": paper.is_starred,
+                        "is_hidden": paper.is_hidden,
+                        "created_at": paper.created_at,
+                        "has_qa": len(paper.qa_pairs) > 0,
+                        "detailed_summary": paper.detailed_summary,
+                        "tags": getattr(paper, "tags", []),
+                        "stage2_pending": _stage2_status(paper, config)[1],
+                        "search_score": r.get("search_score", 0),
+                    })
+                except Exception as e:
+                    print(f"Warning: Failed to load paper {r.get('id', '')}: {e}")
+            return results
+
+    # Fallback: metadata scan (JSON store or FTS returned empty)
     config = Config.load(config_path)
     q_lower = q.lower()
     metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
@@ -1009,14 +1042,11 @@ async def trigger_fetch():
     async def fetch_and_analyze():
         try:
             config = Config.load(config_path)
-            print(f"\n📡 Manual fetch triggered...")
-            papers = await fetcher.fetch_latest(config.max_papers_per_fetch)
-            if papers:
-                print(f"✓ Fetched {len(papers)} papers, starting analysis...")
-                await analyzer.process_papers(papers, config)
-                print(f"✓ Manual fetch and analysis complete")
-            else:
-                print(f"✓ No new papers found")
+            print(f"\n📡 Manual fetch triggered (streaming pipeline)...")
+            n = await analyzer.run_streaming_fetch_and_analyze(
+                fetcher, config, config.max_papers_per_fetch
+            )
+            print(f"✓ Manual fetch and analysis complete ({n} papers)")
         except Exception as e:
             print(f"✗ Manual fetch error: {e}")
             import traceback
@@ -1223,23 +1253,17 @@ async def background_fetcher():
     # First run: check for pending deep analysis (non-blocking)
     asyncio.create_task(check_pending_deep_analysis())
     
-    # Main fetch loop
+    # Main fetch loop (streaming pipeline: fetch streams to stage1, stage1 to stage2)
     while True:
         try:
             config = Config.load(config_path)
-            
-            # Fetch new papers
             print(f"\n📡 Fetching papers... [{datetime.now().strftime('%H:%M:%S')}]")
-            papers = await fetcher.fetch_latest(config.max_papers_per_fetch)
-            
-            # Start analysis asynchronously (don't wait)
-            if papers:
-                print(f"✓ Fetched {len(papers)} papers, starting analysis in background...")
-                asyncio.create_task(analyze_papers_task(papers, config))
-            else:
+            # run_streaming_fetch_and_analyze: stage1 starts before fetch completes
+            n = await analyzer.run_streaming_fetch_and_analyze(
+                fetcher, config, config.max_papers_per_fetch
+            )
+            if n == 0:
                 print(f"✓ No new papers to analyze")
-            
-            # Sleep before next fetch (analysis runs in parallel)
             await asyncio.sleep(config.fetch_interval)
         
         except Exception as e:

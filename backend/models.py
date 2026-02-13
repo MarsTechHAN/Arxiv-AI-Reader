@@ -98,7 +98,9 @@ class Config:
     model: str = "deepseek-chat"
     temperature: float = 0.3
     max_tokens: int = 2000
-    concurrent_papers: int = 3  # Number of papers to analyze concurrently
+    concurrent_papers: int = 3  # Legacy, used when not using pipeline
+    stage1_concurrency: int = 256  # Max concurrent Stage 1 filter tasks
+    stage2_concurrency: int = 128  # Max concurrent Stage 2 deep analysis tasks
     min_relevance_score_for_stage2: float = 6.0  # Minimum relevance score for Stage 2 deep analysis
 
     # Star categories for AI classification (narrowest first)

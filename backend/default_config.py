@@ -34,7 +34,9 @@ DEFAULT_CONFIG = {
     "temperature": 0.3,
     "max_tokens": 2000,
     "concurrent_papers": 10,
-    "min_relevance_score_for_stage2": 6,  # Minimum score to proceed to Stage 2 deep analysis
+    "stage1_concurrency": 256,
+    "stage2_concurrency": 128,
+    "min_relevance_score_for_stage2": 6,
     "star_categories": [
         "高效视频生成", "LLM稀疏注意力", "注意力机制", "Roll-out方法"
     ],  # AI classification categories for starred papers (narrowest first)
