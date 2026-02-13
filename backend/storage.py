@@ -276,6 +276,7 @@ class SQLitePaperStore:
         self._metadata_cache: Dict[str, dict] = {}
         self._cache_lock = Lock()
         self._cache_initialized = False
+        self._trigram_available = False
         self._local = local()
         self._write_queue = queue.Queue()
         self._write_stop = threading.Event()
@@ -348,6 +349,9 @@ class SQLitePaperStore:
         self._use_fts_contentless = self._create_fts_table(conn)
         self._ensure_fts_contentless(conn)
         conn.commit()
+        self._trigram_available = self._ensure_fts_trigram(conn)
+        if self._trigram_available:
+            conn.commit()
         self._migrate_from_json()
         self._merge_duplicate_versions_sqlite(conn)
         conn.commit()
@@ -458,6 +462,47 @@ class SQLitePaperStore:
         except Exception as e:
             print(f"Warning: FTS contentless check failed: {e}")
 
+    def _ensure_fts_trigram(self, conn) -> bool:
+        """Create and populate papers_fts_trigram for ngram/fuzzy search. Returns True if available."""
+        import sqlite3
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='papers_fts_trigram'"
+        ).fetchone():
+            return True
+        try:
+            conn.execute("""
+                CREATE VIRTUAL TABLE papers_fts_trigram USING fts5(
+                    paper_id UNINDEXED,
+                    content,
+                    tokenize='trigram'
+                )
+            """)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS papers_fts_trigram_map (rowid INTEGER PRIMARY KEY, paper_id TEXT UNIQUE NOT NULL)"
+            )
+            rows = conn.execute("SELECT id, data FROM papers").fetchall()
+            for pid, blob in rows:
+                try:
+                    data = json.loads(_decompress(blob).decode("utf-8"))
+                    paper = Paper.from_dict(data)
+                    content = self._fts_content(paper)
+                    conn.execute(
+                        "INSERT INTO papers_fts_trigram(paper_id, content) VALUES (?, ?)",
+                        (pid, content),
+                    )
+                    rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    conn.execute(
+                        "INSERT OR REPLACE INTO papers_fts_trigram_map (rowid, paper_id) VALUES (?, ?)",
+                        (rid, pid),
+                    )
+                except Exception as e:
+                    print(f"Warning: Trigram FTS insert failed for {pid}: {e}")
+            return True
+        except sqlite3.OperationalError as e:
+            if "trigram" in str(e).lower() or "tokenize" in str(e).lower():
+                return False
+            raise
+
     def _migrate_from_json(self) -> None:
         """Import existing JSON papers into SQLite on first use (batch)."""
         if not self.json_dir.exists():
@@ -518,6 +563,21 @@ class SQLitePaperStore:
                 "INSERT OR REPLACE INTO papers_fts_map (rowid, paper_id) VALUES (?, ?)",
                 (rid, paper.id),
             )
+            if getattr(self, "_trigram_available", False):
+                try:
+                    conn.execute(
+                        "INSERT INTO papers_fts_trigram(paper_id, content) VALUES (?, ?)",
+                        (paper.id, content),
+                    )
+                    tri_rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    conn.execute(
+                        "INSERT OR REPLACE INTO papers_fts_trigram_map (rowid, paper_id) VALUES (?, ?)",
+                        (tri_rid, paper.id),
+                    )
+                except Exception as te:
+                    print(f"Warning: Trigram FTS insert failed for {paper.id}: {te}")
+                except Exception as te:
+                    print(f"Warning: Trigram FTS insert failed for {paper.id}: {te}")
         except Exception as e:
             print(f"Warning: FTS insert failed for {paper.id}: {e}")
         if commit:
@@ -606,6 +666,16 @@ class SQLitePaperStore:
                 conn.execute("DELETE FROM papers_fts_map WHERE paper_id = ?", (paper_id,))
             else:
                 conn.execute("DELETE FROM papers_fts WHERE paper_id = ?", (paper_id,))
+            if getattr(self, "_trigram_available", False):
+                tri_rows = conn.execute(
+                    "SELECT rowid FROM papers_fts_trigram_map WHERE paper_id = ?",
+                    (paper_id,),
+                ).fetchall()
+                for (rid,) in tri_rows:
+                    conn.execute("DELETE FROM papers_fts_trigram WHERE rowid = ?", (rid,))
+                conn.execute(
+                    "DELETE FROM papers_fts_trigram_map WHERE paper_id = ?", (paper_id,)
+                )
         except Exception:
             conn.execute("DELETE FROM papers_fts WHERE paper_id = ?", (paper_id,))
 
@@ -669,24 +739,24 @@ class SQLitePaperStore:
         return meta_list[:max_files]
 
     def search(self, query: str, limit: int, search_full_text: bool) -> List[dict]:
-        """FTS5 search. Uses rowid+map for contentless, paper_id for full FTS."""
+        """FTS5 search with phrase support and optional trigram merge."""
         import sqlite3
         from search_utils import normalize_fts_query
         conn = self._get_conn()
         q_clean = normalize_fts_query(query.strip())
         if not q_clean:
             return []
+        score_by_pid: Dict[str, float] = {}
         try:
             use_contentless = not conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='papers_fts_content'"
             ).fetchone()
             if use_contentless:
-                # FTS5 bm25 returns negative scores; best matches are closest to 0
                 rows = conn.execute(
                     """SELECT rowid, bm25(papers_fts) as score
                        FROM papers_fts WHERE papers_fts MATCH ?
                        ORDER BY score DESC LIMIT ?""",
-                    (q_clean, limit),
+                    (q_clean, limit * 2),
                 ).fetchall()
                 pid_list = []
                 for rid, _ in rows:
@@ -700,17 +770,42 @@ class SQLitePaperStore:
                     """SELECT paper_id, bm25(papers_fts) as score
                        FROM papers_fts WHERE papers_fts MATCH ?
                        ORDER BY score DESC LIMIT ?""",
-                    (q_clean, limit),
+                    (q_clean, limit * 2),
                 ).fetchall()
+            for pid, s in rows:
+                sc = -float(s) if s else 0.0
+                score_by_pid[pid] = max(score_by_pid.get(pid, 0), sc)
+            if getattr(self, "_trigram_available", False):
+                from search_utils import tokenize
+                q_trigram = " ".join(tokenize(query.strip(), stem=False)) or q_clean
+                if q_trigram:
+                    try:
+                        tri_rows = conn.execute(
+                            """SELECT rowid, bm25(papers_fts_trigram) as score
+                               FROM papers_fts_trigram WHERE papers_fts_trigram MATCH ?
+                               ORDER BY score DESC LIMIT ?""",
+                            (q_trigram, limit * 2),
+                        ).fetchall()
+                        for rid, s in tri_rows:
+                            r = conn.execute(
+                                "SELECT paper_id FROM papers_fts_trigram_map WHERE rowid = ?",
+                                (rid,),
+                            ).fetchone()
+                            if r:
+                                pid = r[0]
+                                sc = -float(s) if s else 0.0
+                                score_by_pid[pid] = max(
+                                    score_by_pid.get(pid, 0), sc * 0.7
+                                )
+                    except sqlite3.OperationalError:
+                        pass
         except sqlite3.OperationalError as e:
             if "syntax error" in str(e).lower() or "fts5" in str(e).lower():
                 return []
             raise
+        rows = sorted(score_by_pid.items(), key=lambda x: -x[1])[:limit]
         results = []
-        for r in rows:
-            pid = r[0]
-            score_val = r[1]
-            score = -float(score_val) if score_val else 0.0
+        for pid, score in rows:
             try:
                 paper = self.load_paper(pid)
                 meta = self._metadata_cache.get(pid, {})
