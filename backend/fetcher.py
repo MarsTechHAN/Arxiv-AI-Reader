@@ -1,8 +1,8 @@
 """
-arXiv fetcher - dead simple, no bullshit.
+arXiv fetcher - uses arXiv API directly (no RSS).
 
-Fetches latest papers every 5 minutes.
-Downloads HTML version for DeepSeek analysis.
+Fetches latest papers via API. When no new papers, backfills older papers
+at low rate to expand library over time.
 """
 
 import asyncio
@@ -13,67 +13,66 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import json
 from datetime import datetime
+from urllib.parse import quote
 import os
 from threading import Lock
 
 from models import Paper
 
+ARXIV_API_RATE_DELAY = 3.0  # sec between API calls (arXiv recommends 3s)
+BACKFILL_BATCH_SIZE = 20
+
 
 class ArxivFetcher:
     """
-    Fetches papers from arXiv.
-    Simple and effective.
+    Fetches papers from arXiv via API.
+    Latest first; backfills older papers when no new ones.
     """
     
     def __init__(self, data_dir: str = "data/papers"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         
-        # State file to track last query time for each category
         self.state_file = self.data_dir.parent / "fetcher_state.json"
         
-        # In-memory metadata cache: {paper_id: {metadata dict}}
-        # Only stores lightweight metadata, not full Paper objects
         self._metadata_cache: Dict[str, dict] = {}
-        self._cache_lock = Lock()  # Thread-safe cache updates
+        self._cache_lock = Lock()
         self._cache_initialized = False
+        self._backfill_category_idx = 0
         
-        # arXiv RSS feed URLs for different categories
         self.categories = [
-            "cs.AI",  # Artificial Intelligence
-            "cs.CV",  # Computer Vision
-            "cs.LG",  # Machine Learning
-            "cs.CL",  # Computation and Language
-            "cs.NE",  # Neural and Evolutionary Computing
+            "cs.AI",
+            "cs.CV",
+            "cs.LG",
+            "cs.CL",
+            "cs.NE",
         ]
         
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         }
         
-        # Initialize cache on startup
         self._refresh_metadata_cache()
     
-    def _load_query_state(self) -> Dict[str, str]:
-        """
-        Load query state from file.
-        Returns dict mapping category to last query end time (ISO format).
-        """
+    def _load_query_state(self) -> dict:
+        """Load state: {cat: {"backfill_start": int, "backfill_done": bool}}"""
         if not self.state_file.exists():
             return {}
-        
         try:
             with open(self.state_file, 'r') as f:
-                return json.load(f)
+                raw = json.load(f)
         except Exception as e:
             print(f"  ⚠️  Failed to load query state: {e}")
             return {}
+        state = {}
+        for cat, val in (raw or {}).items():
+            if isinstance(val, dict) and "backfill_start" in val:
+                state[cat] = val
+            else:
+                state[cat] = {"backfill_start": 100, "backfill_done": False}
+        return state
     
-    def _save_query_state(self, state: Dict[str, str]):
-        """
-        Save query state to file.
-        state: dict mapping category to last query end time (ISO format).
-        """
+    def _save_query_state(self, state: dict):
         try:
             with open(self.state_file, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -82,339 +81,155 @@ class ArxivFetcher:
     
     async def fetch_latest(self, max_papers_per_category: int = 100) -> List[Paper]:
         """
-        Fetch latest papers from arXiv.
-        Always checks the most recent N papers (index 0 onwards) in each category.
-        Skips papers that already exist locally.
-        Returns list of Paper objects.
+        Fetch latest papers via arXiv API. When no new papers, backfill older
+        papers at low rate to expand library.
         """
         papers = []
-        
-        async with httpx.AsyncClient(headers=self.headers, timeout=30.0, follow_redirects=True) as client:
-            for category in self.categories:
-                # IMPORTANT: Use HTTPS, not HTTP (http returns 301 redirect with empty body)
-                rss_url = f"https://export.arxiv.org/rss/{category}"
-                print(f"  📂 Fetching category: {category}")
-                
-                try:
-                    response = await client.get(rss_url)
-                    
-                    if response.status_code != 200:
-                        print(f"  ✗ HTTP {response.status_code} for {category}")
-                        continue
-                    
-                    # Check response content
-                    if not response.text or len(response.text) < 100:
-                        print(f"  ⚠️  Empty or too short response for {category} (length: {len(response.text) if response.text else 0})")
-                        continue
-                    
-                    feed = feedparser.parse(response.text)
-                    
-                    # Check for parsing errors
-                    if hasattr(feed, 'bozo') and feed.bozo:
-                        bozo_exception = getattr(feed, 'bozo_exception', None)
-                        if bozo_exception:
-                            print(f"  ⚠️  RSS parsing error for {category}: {bozo_exception}")
-                        else:
-                            print(f"  ⚠️  RSS parsing error for {category} (unknown)")
-                    
-                    # Get entries from feedparser
-                    # feedparser always provides 'entries' as a list
-                    total_entries = len(feed.entries) if hasattr(feed, 'entries') and feed.entries else 0
-                    
-                    # If no entries, try using arXiv API as fallback
-                    if total_entries == 0:
-                        # Check if it's a weekend (RSS feed is empty on weekends)
-                        feed_title = getattr(feed.feed, 'title', 'Unknown') if hasattr(feed, 'feed') else 'Unknown'
-                        feed_type = getattr(feed, 'version', 'Unknown')
-                        
-                        # Check if response actually contains item tags
-                        if '<item>' in response.text or '<entry>' in response.text:
-                            # Feed has items but feedparser didn't parse them
-                            item_count = response.text.count('<item>') + response.text.count('<entry>')
-                            print(f"  ⚠️  Feed has {item_count} items but feedparser found 0 (feed title: {feed_title}, type: {feed_type})")
-                            print(f"     Response length: {len(response.text)}, preview: {response.text[:300]}...")
-                        else:
-                            # RSS feed is empty, try arXiv API as fallback
-                            print(f"  ⚠️  No entries in RSS feed for {category}, trying arXiv API...")
-                            try:
-                                api_papers = await self._fetch_from_api(client, category, max_papers_per_category)
-                                if api_papers:
-                                    papers.extend(api_papers)
-                                    print(f"     ✓ Fetched {len(api_papers)} papers from arXiv API")
-                                else:
-                                    print(f"     ⚠️  No new papers found in {category} (RSS empty, API also empty)")
-                            except Exception as api_error:
-                                print(f"     ✗ Failed to fetch from arXiv API: {api_error}")
-                        continue
-                    else:
-                        print(f"     Found {total_entries} papers in RSS feed")
-                    
-                    # Always check from index 0 (latest papers)
-                    check_count = min(max_papers_per_category, total_entries)
-                    fetched_count = 0
-                    
-                    for idx in range(check_count):
-                        entry = feed.entries[idx]
-                        
-                        # Extract arXiv ID
-                        if not hasattr(entry, 'id'):
-                            continue
-                        
-                        # RSS format: "oai:arXiv.org:2510.08619v1" or URL format
-                        # API format: "http://arxiv.org/abs/2510.08619v1"
-                        if 'oai:arXiv.org:' in entry.id:
-                            arxiv_id = entry.id.split('oai:arXiv.org:')[-1]
-                        else:
-                            arxiv_id = entry.id.split('/abs/')[-1]
-                        
-                        # Check if any version exists
-                        exists, existing_id = self._any_version_exists(arxiv_id)
-                        
-                        if exists:
-                            # Check if this is a newer version
-                            if existing_id != arxiv_id:
-                                # Compare versions: extract version numbers
-                                existing_version = 0
-                                new_version = 0
-                                
-                                if 'v' in existing_id:
-                                    try:
-                                        existing_version = int(existing_id.rsplit('v', 1)[1])
-                                    except:
-                                        pass
-                                
-                                if 'v' in arxiv_id:
-                                    try:
-                                        new_version = int(arxiv_id.rsplit('v', 1)[1])
-                                    except:
-                                        pass
-                                
-                                # If new version is newer, delete old version and save new one
-                                if new_version > existing_version:
-                                    old_file = self.data_dir / f"{existing_id}.json"
-                                    if old_file.exists():
-                                        old_file.unlink()
-                                        print(f"     🔄 Replaced {existing_id} with newer version {arxiv_id}")
-                                    # Continue to save new version below
-                                else:
-                                    # Old version is same or newer, skip
-                                    continue
-                            else:
-                                # Exact match, skip
-                                continue
-                        
-                        # Download HTML version
-                        html_content = await self._fetch_html(client, arxiv_id)
-                        
-                        # Extract preview text (first 2000 chars from abstract + intro)
-                        preview_text = self._extract_preview(html_content, entry.summary)
-                        
-                        # Extract published date
-                        published_date = getattr(entry, 'published', '')
-                        
-                        paper = Paper(
-                            id=arxiv_id,
-                            title=entry.title,
-                            authors=self._extract_authors(entry),
-                            abstract=entry.summary,
-                            url=entry.link,
-                            html_url=f"https://arxiv.org/html/{arxiv_id}",
-                            html_content=html_content,
-                            preview_text=preview_text,
-                            published_date=published_date,
-                        )
-                        
-                        # Save immediately
-                        self._save_paper(paper)
-                        papers.append(paper)
-                        fetched_count += 1
-                        
-                        print(f"     ✓ {arxiv_id} - {paper.title[:60]}...")
-                    
-                    print(f"     Fetched {fetched_count} new papers (checked latest {check_count})")
-                
-                except Exception as e:
-                    print(f"  ✗ Error fetching {category}: {e}")
-                    continue
+        async with httpx.AsyncClient(headers=self.headers, timeout=60.0, follow_redirects=True) as client:
+            for i, category in enumerate(self.categories):
+                if i > 0:
+                    await asyncio.sleep(ARXIV_API_RATE_DELAY)
+                cat_papers = await self._fetch_latest_api(client, category, max_papers_per_category)
+                papers.extend(cat_papers)
+            
+            if not papers:
+                backfill_papers = await self._fetch_backfill_batch(client, max_papers_per_category)
+                papers.extend(backfill_papers)
         
         return papers
     
-    async def _fetch_from_api(self, client: httpx.AsyncClient, category: str, max_papers: int = 100) -> List[Paper]:
-        """
-        Fetch latest papers from arXiv API when RSS feed is empty.
-        Uses incremental query: queries one day at a time, moving backward if no papers found.
-        Saves query state to avoid duplicate queries.
-        """
-        from urllib.parse import quote
-        from datetime import datetime, timedelta
-        
-        papers = []
-        max_days_back = 30  # Maximum days to search back
-        days_searched = 0
-        
-        # Load query state
-        query_state = self._load_query_state()
-        
-        # Get last query end time for this category
-        # State format: {category: "end_time_iso"} - last successful query end time
-        if category in query_state:
-            try:
-                last_end_time = datetime.fromisoformat(query_state[category])
-            except:
-                last_end_time = datetime.now()
-        else:
-            # First time querying this category, start from now
-            last_end_time = datetime.now()
-        
-        # Start querying from last_end_time backward (one day at a time)
-        current_end_time = last_end_time
-        current_start_time = current_end_time - timedelta(days=1)
-        
-        # Continue querying backward until we find papers or reach max_days_back
-        while days_searched < max_days_back:
-            # Format dates for arXiv API (YYYYMMDDHHMMSS)
-            start_date_str = current_start_time.strftime("%Y%m%d%H%M%S")
-            end_date_str = current_end_time.strftime("%Y%m%d%H%M%S")
-            
-            # Build search query with date range
-            search_query = f"cat:{category} AND submittedDate:[{start_date_str} TO {end_date_str}]"
-            api_url = f"https://export.arxiv.org/api/query?search_query={quote(search_query)}&start=0&max_results={max_papers}&sortBy=submittedDate&sortOrder=descending"
-            
-            print(f"     Querying {category} from {current_start_time.strftime('%Y-%m-%d %H:%M')} to {current_end_time.strftime('%Y-%m-%d %H:%M')}")
-            
-            try:
-                response = await client.get(api_url)
-                if response.status_code != 200:
-                    if response.status_code == 429:
-                        # Rate limited, try simpler query without date range
-                        print(f"     ⚠️  Rate limited, using simpler query...")
-                        search_query = f"cat:{category}"
-                        api_url = f"https://export.arxiv.org/api/query?search_query={quote(search_query)}&start=0&max_results={max_papers}&sortBy=submittedDate&sortOrder=descending"
-                        response = await client.get(api_url)
-                        if response.status_code != 200:
-                            print(f"     ✗ arXiv API returned {response.status_code}")
-                            break
-                    else:
-                        print(f"     ✗ arXiv API returned {response.status_code}")
-                        break
-                
-                feed = feedparser.parse(response.text)
-                
-                if not feed.entries:
-                    print(f"     No papers found in this time range, moving backward 1 day...")
-                    days_searched += 1
-                    # Move backward: next query will be one day earlier
-                    current_end_time = current_start_time
-                    current_start_time = current_end_time - timedelta(days=1)
-                    continue
-                
-                print(f"     Found {len(feed.entries)} papers in API response")
-                
-                new_papers_in_batch = 0
-                
-                for entry in feed.entries:
-                    # Extract arXiv ID from entry.id (format: "http://arxiv.org/abs/2510.08619v1")
-                    if not hasattr(entry, 'id'):
-                        continue
-                    
-                    arxiv_id = entry.id.split('/abs/')[-1] if '/abs/' in entry.id else entry.id.split('/')[-1]
-                    
-                    # Check if any version exists
-                    exists, existing_id = self._any_version_exists(arxiv_id)
-                    
-                    if exists:
-                        # Check if this is a newer version
-                        if existing_id != arxiv_id:
-                            # Compare versions: extract version numbers
-                            existing_version = 0
-                            new_version = 0
-                            
-                            if 'v' in existing_id:
-                                try:
-                                    existing_version = int(existing_id.rsplit('v', 1)[1])
-                                except:
-                                    pass
-                            
-                            if 'v' in arxiv_id:
-                                try:
-                                    new_version = int(arxiv_id.rsplit('v', 1)[1])
-                                except:
-                                    pass
-                            
-                            # If new version is newer, delete old version and save new one
-                            if new_version > existing_version:
-                                old_file = self.data_dir / f"{existing_id}.json"
-                                if old_file.exists():
-                                    old_file.unlink()
-                                    print(f"     🔄 Replaced {existing_id} with newer version {arxiv_id}")
-                                # Continue to save new version below
-                            else:
-                                # Old version is same or newer, skip
-                                continue
-                        else:
-                            # Exact match, skip
-                            continue
-                    
-                    new_papers_in_batch += 1
-                    
-                    # Download HTML version
-                    html_content = await self._fetch_html(client, arxiv_id)
-                    
-                    # Extract preview text
-                    preview_text = self._extract_preview(html_content, entry.summary)
-                    
-                    # Extract published date
-                    published_date = getattr(entry, 'published', '')
-                    
-                    paper = Paper(
-                        id=arxiv_id,
-                        title=entry.title,
-                        authors=self._extract_authors(entry),
-                        abstract=entry.summary,
-                        url=entry.link,
-                        html_url=f"https://arxiv.org/html/{arxiv_id}",
-                        html_content=html_content,
-                        preview_text=preview_text,
-                        published_date=published_date,
-                    )
-                    
-                    # Save immediately
-                    self._save_paper(paper)
-                    papers.append(paper)
-                    
-                    print(f"     ✓ {arxiv_id} - {paper.title[:60]}...")
-                
-                # Update query state: record the end time of this query
-                # Next time we'll start from current_start_time (one day earlier)
-                query_state[category] = current_start_time.isoformat()
-                self._save_query_state(query_state)
-                
-                # If found new papers, we can stop searching backward
-                if new_papers_in_batch > 0:
-                    print(f"     Found {new_papers_in_batch} new papers, stopping backward search")
-                    break
-                else:
-                    # No new papers in this batch, continue searching backward
-                    days_searched += 1
-                    current_end_time = current_start_time
-                    current_start_time = current_end_time - timedelta(days=1)
-                    continue
-                
-            except Exception as e:
-                print(f"     ✗ Error fetching from arXiv API: {e}")
-                # On error, move to next day and continue
-                days_searched += 1
-                current_end_time = current_start_time
-                current_start_time = current_end_time - timedelta(days=1)
-                continue
-        
-        # If we've searched max_days_back without finding papers, update state to prevent re-querying
-        if days_searched >= max_days_back and len(papers) == 0:
-            print(f"     Reached max search limit ({max_days_back} days), updating state")
-            query_state[category] = current_start_time.isoformat()
-            self._save_query_state(query_state)
-        
+    async def _fetch_latest_api(
+        self, client: httpx.AsyncClient, category: str, max_papers: int
+    ) -> List[Paper]:
+        """Fetch latest papers from arXiv API (start=0, newest first)."""
+        search_query = f"cat:{category}"
+        api_url = (
+            f"https://export.arxiv.org/api/query?search_query={quote(search_query)}"
+            f"&start=0&max_results={max_papers}&sortBy=submittedDate&sortOrder=descending"
+        )
+        print(f"  📂 {category} (API latest)")
+        papers, _ = await self._query_api_and_save(client, api_url, category)
         return papers
+    
+    async def _fetch_backfill_batch(
+        self, client: httpx.AsyncClient, max_papers_per_category: int
+    ) -> List[Paper]:
+        """Fetch one batch of older papers when no new latest. Low rate."""
+        state = self._load_query_state()
+        candidates = [
+            c for c in self.categories
+            if not state.get(c, {}).get("backfill_done", False)
+        ]
+        if not candidates:
+            print("  ✓ All categories backfilled")
+            return []
+        
+        idx = self._backfill_category_idx % len(candidates)
+        self._backfill_category_idx += 1
+        category = candidates[idx]
+        
+        cat_state = state.setdefault(category, {"backfill_start": max_papers_per_category, "backfill_done": False})
+        start = int(cat_state.get("backfill_start", max_papers_per_category))
+        
+        search_query = f"cat:{category}"
+        api_url = (
+            f"https://export.arxiv.org/api/query?search_query={quote(search_query)}"
+            f"&start={start}&max_results={BACKFILL_BATCH_SIZE}&sortBy=submittedDate&sortOrder=descending"
+        )
+        
+        print(f"  📂 {category} (backfill start={start})")
+        await asyncio.sleep(ARXIV_API_RATE_DELAY)
+        papers, has_more = await self._query_api_and_save(
+            client, api_url, category, is_backfill=True
+        )
+        
+        cat_state["backfill_start"] = start + BACKFILL_BATCH_SIZE
+        if not has_more:
+            cat_state["backfill_done"] = True
+            print(f"     Reached end for {category}")
+        self._save_query_state(state)
+        return papers
+    
+    async def _query_api_and_save(
+        self,
+        client: httpx.AsyncClient,
+        api_url: str,
+        category: str,
+        is_backfill: bool = False,
+    ) -> tuple[List[Paper], bool]:
+        """Query arXiv API and save new papers. Returns (papers, has_more)."""
+        papers = []
+        entries = []
+        try:
+            response = await client.get(api_url)
+            if response.status_code != 200:
+                print(f"     ✗ HTTP {response.status_code}")
+                return [], False
+            if not response.text or len(response.text) < 100:
+                print(f"     ✗ Empty/short response")
+                return [], False
+            
+            feed = feedparser.parse(response.text)
+            entries = getattr(feed, "entries", []) or []
+            print(f"     Got {len(entries)} entries")
+            
+            for entry in entries:
+                if not hasattr(entry, "id"):
+                    continue
+                arxiv_id = (
+                    entry.id.split("/abs/")[-1]
+                    if "/abs/" in entry.id
+                    else entry.id.split("oai:arXiv.org:")[-1] if "oai:arXiv.org:" in entry.id else entry.id.split("/")[-1]
+                )
+                
+                exists, existing_id = self._any_version_exists(arxiv_id)
+                if exists:
+                    if existing_id != arxiv_id:
+                        ev = pv = 0
+                        try:
+                            ev = int(existing_id.rsplit("v", 1)[1]) if "v" in existing_id else 0
+                        except Exception:
+                            pass
+                        try:
+                            pv = int(arxiv_id.rsplit("v", 1)[1]) if "v" in arxiv_id else 0
+                        except Exception:
+                            pass
+                        if pv > ev:
+                            old_file = self.data_dir / f"{existing_id}.json"
+                            if old_file.exists():
+                                old_file.unlink()
+                                print(f"     🔄 Replaced {existing_id} with {arxiv_id}")
+                        else:
+                            continue
+                    else:
+                        continue
+                
+                published_date = getattr(entry, "published", "")
+                html_content = await self._fetch_html(client, arxiv_id)
+                preview_text = self._extract_preview(html_content, entry.summary)
+                link = getattr(entry, "link", f"https://arxiv.org/abs/{arxiv_id}")
+                
+                paper = Paper(
+                    id=arxiv_id,
+                    title=entry.title,
+                    authors=self._extract_authors(entry),
+                    abstract=entry.summary,
+                    url=link,
+                    html_url=f"https://arxiv.org/html/{arxiv_id}",
+                    html_content=html_content,
+                    preview_text=preview_text,
+                    published_date=published_date,
+                )
+                self._save_paper(paper)
+                papers.append(paper)
+                print(f"     ✓ {arxiv_id} - {paper.title[:60]}...")
+            
+            if papers:
+                print(f"     Saved {len(papers)} new papers")
+        except Exception as e:
+            print(f"     ✗ Error: {e}")
+        has_more = len(entries) >= BACKFILL_BATCH_SIZE if is_backfill else True
+        return papers, has_more
     
     async def _fetch_html(self, client: httpx.AsyncClient, arxiv_id: str) -> str:
         """
