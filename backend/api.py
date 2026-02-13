@@ -562,40 +562,9 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 
 def _calculate_similarity(query: str, text: str) -> float:
-    """
-    Calculate text similarity score (0-1).
-    Uses simple word overlap and frequency.
-    """
-    if not text:
-        return 0.0
-    
-    query_lower = query.lower()
-    text_lower = text.lower()
-    
-    # Exact match bonus
-    if query_lower in text_lower:
-        exact_bonus = 0.3
-    else:
-        exact_bonus = 0.0
-    
-    # Word overlap score
-    query_words = set(query_lower.split())
-    text_words = set(text_lower.split())
-    
-    if not query_words:
-        return 0.0
-    
-    # Calculate Jaccard similarity (intersection over union)
-    intersection = len(query_words & text_words)
-    union = len(query_words | text_words)
-    jaccard = intersection / union if union > 0 else 0.0
-    
-    # Word frequency score (how many query words appear in text)
-    word_freq_score = sum(1 for word in query_words if word in text_lower) / len(query_words)
-    
-    # Combined score
-    similarity = (jaccard * 0.4 + word_freq_score * 0.3 + exact_bonus)
-    return min(1.0, similarity)
+    """Tokenized BM25-like scoring via search_utils."""
+    from search_utils import score_text
+    return score_text(query, text, exact_phrase_bonus=0.3)
 
 
 def _mcp_format_search_result(p: dict, include_all: bool = True) -> dict:
@@ -924,7 +893,8 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
 
     # Fallback: metadata scan (JSON store or FTS returned empty)
     config = Config.load(config_path)
-    q_lower = q.lower()
+    from search_utils import tokenize_query
+    query_token_set = set(tokenize_query(q))
     metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
     
     results = []
@@ -984,10 +954,8 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
         # Author matching
         authors_text = ' '.join(authors).lower()
         if authors_text:
-            # Check if query matches any author name
-            query_words = set(q_lower.split())
             author_match = any(
-                any(word in author.lower() for word in query_words)
+                any(word in author.lower() for word in query_token_set)
                 for author in authors
             )
             if author_match:

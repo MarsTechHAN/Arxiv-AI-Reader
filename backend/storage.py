@@ -530,8 +530,9 @@ class SQLitePaperStore:
     def search(self, query: str, limit: int, search_full_text: bool) -> List[dict]:
         """FTS5 search. Uses rowid+map for contentless, paper_id for full FTS."""
         import sqlite3
+        from search_utils import normalize_fts_query
         conn = self._get_conn()
-        q_clean = query.strip().replace('"', '""')
+        q_clean = normalize_fts_query(query.strip())
         if not q_clean:
             return []
         try:

@@ -26,21 +26,9 @@ def _get_fetcher():
 
 
 def _calculate_similarity(query: str, text: str) -> float:
-    """Calculate text similarity score (0-1)."""
-    if not text:
-        return 0.0
-    query_lower = query.lower()
-    text_lower = text.lower()
-    exact_bonus = 0.3 if query_lower in text_lower else 0.0
-    query_words = set(query_lower.split())
-    text_words = set(text_lower.split())
-    if not query_words:
-        return 0.0
-    intersection = len(query_words & text_words)
-    union = len(query_words | text_words)
-    jaccard = intersection / union if union > 0 else 0.0
-    word_freq_score = sum(1 for w in query_words if w in text_lower) / len(query_words)
-    return min(1.0, jaccard * 0.4 + word_freq_score * 0.3 + exact_bonus)
+    """Tokenized BM25-like scoring via search_utils."""
+    from search_utils import score_text
+    return score_text(query, text, exact_phrase_bonus=0.3)
 
 
 def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
@@ -54,10 +42,11 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
                 return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in fts_results]
             return fts_results
 
-    q_lower = q.lower()
     metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
     results = []
     arxiv_id_pattern = r'^\d{4}\.\d{4,5}(v\d+)?$'
+    from search_utils import tokenize_query
+    query_token_set = set(tokenize_query(q))
 
     if re.match(arxiv_id_pattern, q.strip()):
         arxiv_id = q.strip()
@@ -111,7 +100,7 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
         one_line_score = _calculate_similarity(q, one_line_summary) * 1.2 if one_line_summary else 0.0
         fulltext_score = _calculate_similarity(q, preview_text) * 0.8 if preview_text and search_full_text else 0.0
         author_score = 0.8 if any(
-            any(w in a.lower() for w in set(q_lower.split()))
+            any(w in a.lower() for w in query_token_set)
             for a in authors
         ) else 0.0
         tags_text = ' '.join(tags + extracted_keywords).lower()
