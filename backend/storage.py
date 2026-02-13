@@ -418,15 +418,13 @@ class SQLitePaperStore:
             print(f"✓ Migration complete: {migrated} papers")
 
     def _fts_content(self, paper: Paper) -> str:
-        """FTS index: title, authors, original abstract, AI summaries (required); plus preview, html, tags, keywords."""
+        """FTS index: title, authors, abstract, AI summaries, tags, keywords only (no full text)."""
         parts = [
             paper.title or "",
             paper.abstract or "",
             " ".join(paper.authors or []),
             paper.one_line_summary or "",
             paper.detailed_summary or "",
-            paper.preview_text or "",
-            paper.html_content or "",
             " ".join(getattr(paper, "tags", []) or []),
             " ".join(paper.extracted_keywords or []),
         ]

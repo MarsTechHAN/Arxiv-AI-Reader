@@ -170,7 +170,6 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
         abstract = meta.get('abstract', '')
         detailed_summary = meta.get('detailed_summary', '')
         one_line_summary = meta.get('one_line_summary', '')
-        preview_text = meta.get('preview_text', '')
         authors = meta.get('authors', [])
         tags = meta.get('tags', [])
         extracted_keywords = meta.get('extracted_keywords', [])
@@ -184,18 +183,17 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
             if not _calculate_similarity(q, searchable):
                 continue
 
-        # Core fields: title, authors, abstract, AI summaries
+        # Core fields only: title, authors, abstract, AI summaries, tags (no full text)
         title_score = _calculate_similarity(q, title) * 2.0 if title else 0.0
         abstract_score = _calculate_similarity(q, abstract) if abstract else 0.0
         summary_score = _calculate_similarity(q, detailed_summary) * 1.5 if detailed_summary else 0.0
         one_line_score = _calculate_similarity(q, one_line_summary) * 1.2 if one_line_summary else 0.0
         authors_text = ' '.join(authors or [])
         author_score = _calculate_similarity(q, authors_text) * 1.2 if authors_text else 0.0
-        fulltext_score = _calculate_similarity(q, preview_text) * 0.8 if preview_text and search_full_text else 0.0
         tags_text = ' '.join(tags + extracted_keywords).lower()
         tag_score = _calculate_similarity(q, tags_text) * 1.2 if tags_text else 0.0
 
-        total_score = title_score + abstract_score + summary_score + one_line_score + fulltext_score + author_score + tag_score
+        total_score = title_score + abstract_score + summary_score + one_line_score + author_score + tag_score
         if total_score <= 0:
             continue
 

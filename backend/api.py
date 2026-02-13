@@ -704,10 +704,49 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {str(e)}")
 
 
+def _query_has_cjk(text: str) -> bool:
+    """True if text contains CJK (Chinese/Japanese/Korean) characters."""
+    if not text:
+        return False
+    for c in text:
+        if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af':
+            return True
+    return False
+
+
 def _calculate_similarity(query: str, text: str) -> float:
     """Tokenized BM25-like scoring via search_utils."""
     from search_utils import score_text
     return score_text(query, text, exact_phrase_bonus=0.3)
+
+
+def _score_substring_only(query: str, meta: dict) -> float:
+    """Fast scoring for CJK: substring match on title, authors, abstract, AI summary only (no full text)."""
+    if not query:
+        return 0.0
+    q = query.strip().lower()
+    if not q:
+        return 0.0
+    score = 0.0
+    title = (meta.get("title") or "").lower()
+    abstract = (meta.get("abstract") or "").lower()
+    detailed = (meta.get("detailed_summary") or "").lower()
+    one_line = (meta.get("one_line_summary") or "").lower()
+    authors_text = " ".join(meta.get("authors") or []).lower()
+    tags_text = " ".join((meta.get("tags") or []) + (meta.get("extracted_keywords") or [])).lower()
+    if q in title:
+        score += 2.0
+    if q in abstract:
+        score += 1.0
+    if q in detailed:
+        score += 1.5
+    if q in one_line:
+        score += 1.2
+    if q in authors_text:
+        score += 1.2
+    if q in tags_text:
+        score += 1.2
+    return score
 
 
 def _mcp_format_search_result(p: dict, include_all: bool = True) -> dict:
@@ -987,8 +1026,8 @@ def _paper_matches_tab_filter(paper_or_meta, category: str = None, starred_only:
 
 
 @app.get("/search")
-async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", category: str = None, starred_only: str = "false"):
-    """Search papers by keyword, full-text, or arXiv ID. category+starred_only restrict to tab content."""
+async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "relevance", category: str = None, starred_only: str = "false"):
+    """Search papers by keyword. Searches ALL papers. Returns [skip:skip+limit]. category+starred_only restrict to tab content."""
     config = await asyncio.to_thread(Config.load, config_path)
     q = q.strip()
 
@@ -1053,11 +1092,12 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
     starred_only_bool = starred_only.lower() == "true"
     tab_filter = category or starred_only_bool
 
-    # Try store FTS first (SQLite), else fall back to metadata scan
+    # Try store FTS first (SQLite). Skip FTS for CJK - FTS5 unicode61 doesn't match Chinese.
     store = getattr(fetcher, "store", None)
-    if store and hasattr(store, "search"):
-        # Request more FTS results; boost title matches (FTS bm25 underweights title)
-        fts_limit = max(limit * 50, 500)
+    use_fts = store and hasattr(store, "search") and not _query_has_cjk(q)
+    if use_fts:
+        # Request enough FTS results for pagination; search full corpus
+        fts_limit = max(limit * 100, 1000, skip + limit)
         fts_results = await asyncio.to_thread(store.search, q, fts_limit, True)
         if fts_results:
             config = await asyncio.to_thread(Config.load, config_path)
@@ -1093,9 +1133,9 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
                     sort_key = (0 if title_match else 1, -pub_dt.timestamp(), -score)
                 scored.append((sort_key, score, r["id"]))
             scored.sort(key=lambda x: x[0])
-            # Load only top papers for response
+            # Paginate: [skip:skip+limit]
             results = []
-            for _sort_key, score, pid in scored[:limit]:
+            for _sort_key, score, pid in scored[skip:skip + limit]:
                 try:
                     paper = await asyncio.to_thread(fetcher.load_paper, pid)
                     results.append({
@@ -1128,131 +1168,73 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
                 results.sort(key=_get_result_date, reverse=True)
             return results
 
-    # Fallback: metadata scan (JSON store or FTS returned empty)
-    # Default search must match at least: title, authors, original abstract, AI-generated summaries
+    # Fallback: metadata scan (JSON store or FTS returned empty). Optimized: collect scores first, load only top N.
     config = await asyncio.to_thread(Config.load, config_path)
-    from search_utils import tokenize_query
-    query_token_set = set(tokenize_query(q))
     metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, SCAN_ALL, True)
     if tab_filter:
         metadata_list = [m for m in metadata_list if _paper_matches_tab_filter(m, category, starred_only_bool)]
 
-    results = []
+    is_cjk = _query_has_cjk(q)
+    scored: List[tuple] = []  # (paper_id, score, meta for sort key)
+
     for meta in metadata_list:
-        # Skip hidden papers
         if meta.get('is_hidden', False):
             continue
-        
-        # Get cached data
         paper_id = meta.get('id', '')
-        title = meta.get('title', '')  # May not be in cache, will load if needed
-        abstract = meta.get('abstract', '')  # Original abstract
-        detailed_summary = meta.get('detailed_summary', '')  # AI-generated detailed summary
-        one_line_summary = meta.get('one_line_summary', '')  # AI-generated one-line summary
-        preview_text = meta.get('preview_text', '')
-        authors = meta.get('authors', [])
-        tags = meta.get('tags', [])
-        extracted_keywords = meta.get('extracted_keywords', [])
-        
-        # Core search fields: title, authors, abstract, AI summaries
-        title_score = 0.0
-        abstract_score = 0.0
-        summary_score = 0.0
-        one_line_score = 0.0
-        fulltext_score = 0.0
-        author_score = 0.0
-        tag_score = 0.0
-        
-        # 1. Title
-        if title:
-            title_score = _calculate_similarity(q, title) * 2.0
+        if is_cjk:
+            total_score = _score_substring_only(q, meta)
         else:
-            try:
-                paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
-                title = paper.title
-                title_score = _calculate_similarity(q, title) * 2.0
-            except Exception:
-                pass
-        
-        # 2. Original abstract
-        if abstract:
-            abstract_score = _calculate_similarity(q, abstract)
-        
-        # 3. AI-generated summaries (detailed + one-line)
-        if detailed_summary:
-            summary_score = _calculate_similarity(q, detailed_summary) * 1.5
-        if one_line_summary:
-            one_line_score = _calculate_similarity(q, one_line_summary) * 1.2
-        
-        # 4. Authors
-        authors_text = ' '.join(authors or [])
-        if authors_text:
-            author_score = _calculate_similarity(q, authors_text) * 1.2
-        
-        # Extended: full-text preview, tags
-        if preview_text:
-            fulltext_score = _calculate_similarity(q, preview_text) * 0.8
-        
-        # Tag matching
-        tags_text = ' '.join(tags + extracted_keywords).lower()
-        if tags_text:
-            tag_score = _calculate_similarity(q, tags_text) * 1.2
-        
-        # Combined score
-        # Substring fallback: ensure substring match in title/abstract is never missed
-        substring_bonus = 0.0
-        q_lower = q.lower()
-        if q_lower and not title:
-            try:
-                p = await asyncio.to_thread(fetcher.load_paper, paper_id)
-                title = p.title or ''
-            except Exception:
-                pass
-        if title and q_lower in title.lower():
-            substring_bonus = 1.5
-        elif abstract and q_lower in abstract.lower():
-            substring_bonus = 0.8
+            title = meta.get('title', '')
+            abstract = meta.get('abstract', '')
+            detailed_summary = meta.get('detailed_summary', '')
+            one_line_summary = meta.get('one_line_summary', '')
+            authors_text = ' '.join(meta.get('authors') or [])
+            tags_text = ' '.join((meta.get('tags') or []) + (meta.get('extracted_keywords') or []))
+            title_score = _calculate_similarity(q, title) * 2.0 if title else 0.0
+            abstract_score = _calculate_similarity(q, abstract) if abstract else 0.0
+            summary_score = _calculate_similarity(q, detailed_summary) * 1.5 if detailed_summary else 0.0
+            one_line_score = _calculate_similarity(q, one_line_summary) * 1.2 if one_line_summary else 0.0
+            author_score = _calculate_similarity(q, authors_text) * 1.2 if authors_text else 0.0
+            tag_score = _calculate_similarity(q, tags_text) * 1.2 if tags_text else 0.0
+            q_lower = q.lower()
+            substring_bonus = 1.5 if (title and q_lower in title.lower()) else (0.8 if (abstract and q_lower in abstract.lower()) else 0.0)
+            total_score = title_score + abstract_score + summary_score + one_line_score + author_score + tag_score + substring_bonus
 
-        total_score = (
-            title_score +
-            abstract_score +
-            summary_score +
-            one_line_score +
-            fulltext_score +
-            author_score +
-            tag_score +
-            substring_bonus
-        )
-
-        # Only include papers with non-zero score
         if total_score > 0:
-            # Load full paper for response (only if needed)
-            try:
-                paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
-                results.append({
-                    "id": paper.id,
-                    "title": paper.title,
-                    "authors": paper.authors,
-                    "abstract": paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract,
-                    "url": paper.url,
-                    "is_relevant": paper.is_relevant,
-                    "relevance_score": paper.relevance_score,
-                    "extracted_keywords": paper.extracted_keywords,
-                    "one_line_summary": paper.one_line_summary,
-                    "published_date": paper.published_date,
-                    "is_starred": paper.is_starred,
-                    "is_hidden": paper.is_hidden,
-                    "created_at": paper.created_at,
-                    "has_qa": len(paper.qa_pairs) > 0,
-                    "detailed_summary": paper.detailed_summary,
-                    "tags": getattr(paper, 'tags', []),
-                    "stage2_pending": _stage2_status(paper, config)[1],
-                    "search_score": total_score,
-                })
-            except Exception as e:
-                print(f"Warning: Failed to load paper {paper_id} for search: {e}")
-                continue
-    
+            pub_dt = _parse_sort_date(meta.get('published_date', '')) or _parse_sort_date(meta.get('created_at', '')) or datetime.fromtimestamp(0, tz=timezone.utc)
+            scored.append((paper_id, total_score, meta.get('is_relevant') is True, pub_dt))
+
+    # Sort: relevance first, then score, then date. Paginate [skip:skip+limit].
+    scored.sort(key=lambda x: (x[2], x[1], x[3].timestamp() if hasattr(x[3], 'timestamp') else 0), reverse=True)
+    top_scored = scored[skip:skip + limit]
+
+    results = []
+    for paper_id, total_score, _unused1, _unused2 in top_scored:
+        try:
+            paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
+            results.append({
+                "id": paper.id,
+                "title": paper.title,
+                "authors": paper.authors,
+                "abstract": paper.abstract[:200] + "..." if len(paper.abstract) > 200 else paper.abstract,
+                "url": paper.url,
+                "is_relevant": paper.is_relevant,
+                "relevance_score": paper.relevance_score,
+                "extracted_keywords": paper.extracted_keywords,
+                "one_line_summary": paper.one_line_summary,
+                "published_date": paper.published_date,
+                "is_starred": paper.is_starred,
+                "is_hidden": paper.is_hidden,
+                "created_at": paper.created_at,
+                "has_qa": len(paper.qa_pairs) > 0,
+                "detailed_summary": paper.detailed_summary,
+                "tags": getattr(paper, 'tags', []),
+                "stage2_pending": _stage2_status(paper, config)[1],
+                "search_score": total_score,
+            })
+        except Exception as e:
+            print(f"Warning: Failed to load paper {paper_id} for search: {e}")
+
     if sort_by == "latest":
         def _get_result_date(r):
             d = _parse_sort_date(r.get("published_date", ""))

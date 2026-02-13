@@ -10,6 +10,7 @@ let currentKeyword = null;
 let hasMorePapers = true;
 let isLoadingMore = false;
 let currentTab = 'all';  // 'all' or category name (e.g. '高效视频生成', 'Other')
+let currentSearchQuery = null;  // When set, we're in search mode; scroll loads more search results
 let starCategories = ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
 let currentPaperList = [];  // Store current paper list for navigation
 let currentPaperIndex = -1;  // Current paper index in the list
@@ -65,6 +66,7 @@ function setupEventListeners() {
             if (val) {
                 searchPapers(val);
             } else {
+                currentSearchQuery = null;
                 currentPage = 0;
                 loadPapers();
             }
@@ -371,10 +373,13 @@ function setupInfiniteScroll() {
         // Only load if: not already loading, has more papers, and near bottom
         if (distanceFromBottom < threshold && !isLoadingMore && hasMorePapers) {
             isLoadingMore = true;
-            currentPage++;
-            
             try {
-                await loadPapers(currentPage);
+                if (currentSearchQuery) {
+                    await loadMoreSearchResults();
+                } else {
+                    currentPage++;
+                    await loadPapers(currentPage);
+                }
             } finally {
                 isLoadingMore = false;
             }
@@ -398,10 +403,9 @@ function switchTab(tab) {
     const cached = restoreSearchResults(tab);
     if (cached && cached.query) {
         searchInput.value = cached.query;
+        currentSearchQuery = cached.query;
         currentKeyword = null;
         clearKeywordBtn.style.display = 'none';
-        hasMorePapers = false;
-        hideEndMarker();
         renderSearchResults(cached.results);
     } else {
         searchInput.value = '';
@@ -418,6 +422,7 @@ async function loadPapers(page = 0, shouldScroll = true) {
     // Clear search state when loading normal papers list
     if (page === 0) {
         clearSearchState();
+        currentSearchQuery = null;
     }
     
     try {
@@ -544,20 +549,17 @@ async function searchPapers(query) {
     clearSearchState();  // Invalidate stale cache before new search
     showLoading(true);
     currentPage = 0;
+    currentSearchQuery = query;
     hasMorePapers = false;
     hideEndMarker();
 
     if (isAiSearch) {
         await searchPapersAiStream(query);
+        currentSearchQuery = null;
     } else {
         try {
-            const isCategoryTab = currentTab !== 'all';
-            let searchUrl = `${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50&sort_by=${currentSortBy || 'relevance'}`;
-            if (isCategoryTab) {
-                searchUrl += `&starred_only=true&category=${encodeURIComponent(currentTab)}`;
-            }
-            const response = await fetch(searchUrl);
-            const results = await response.json();
+            const results = await fetchSearchPage(query, 0);
+            hasMorePapers = results.length >= 50;
             saveSearchResults(query, results || []);
             renderSearchResults(results);
         } catch (error) {
@@ -566,6 +568,43 @@ async function searchPapers(query) {
         }
     }
     showLoading(false);
+}
+
+async function fetchSearchPage(query, skip) {
+    const isCategoryTab = currentTab !== 'all';
+    let url = `${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50&skip=${skip}&sort_by=${currentSortBy || 'relevance'}`;
+    if (isCategoryTab) {
+        url += `&starred_only=true&category=${encodeURIComponent(currentTab)}`;
+    }
+    const response = await fetch(url);
+    return response.json();
+}
+
+async function loadMoreSearchResults() {
+    if (!currentSearchQuery || currentPaperList.length === 0) return;
+    showLoading(true);
+    try {
+        const skip = currentPaperList.length;
+        const results = await fetchSearchPage(currentSearchQuery, skip);
+        hasMorePapers = results.length >= 50;
+        if (results.length === 0) {
+            showEndMarker();
+            return;
+        }
+        results.forEach(paper => {
+            timeline.appendChild(createPaperCard(paper));
+            if (!currentPaperList.includes(paper.id)) currentPaperList.push(paper.id);
+        });
+        const merged = restoreSearchResults(currentTab)?.results || [];
+        merged.push(...results);
+        saveSearchResults(currentSearchQuery, merged);
+        if (!hasMorePapers) showEndMarker();
+    } catch (e) {
+        console.error('Load more search failed:', e);
+        hasMorePapers = false;
+    } finally {
+        showLoading(false);
+    }
 }
 
 function _searchStateKey(tab) {
@@ -784,7 +823,8 @@ function renderSearchResults(results) {
             timeline.appendChild(createPaperCard(paper));
         });
         currentPaperList = results.map(p => p.id);
-        showEndMarker();
+        hasMorePapers = results.length >= 50;
+        if (!hasMorePapers) showEndMarker();
     }
     loadMoreBtn.style.display = 'none';
 }
@@ -1938,6 +1978,7 @@ function clearSearchState() {
 function resetToDefaultState() {
     if (searchInput) searchInput.value = '';
     currentKeyword = null;
+    currentSearchQuery = null;
     if (clearKeywordBtn) clearKeywordBtn.style.display = 'none';
     clearSearchState();
     const statusContainer = document.getElementById('searchStatusContainer');
@@ -1953,6 +1994,7 @@ function restoreSearchState() {
     if (cached && timeline) {
         if (cached.query && searchInput) {
             searchInput.value = cached.query;
+            currentSearchQuery = cached.query;
         }
         renderSearchResults(cached.results);
         return true;
