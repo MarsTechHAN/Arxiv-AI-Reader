@@ -176,7 +176,7 @@ All configuration is in `backend/data/config.json`. On first run, default config
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `filter_keywords` | `List[str]` | See below | Keywords for relevance filtering (Stage 1) |
-| `negative_keywords` | `List[str]` | See below | Auto-reject papers containing these terms |
+| `negative_keywords` | `List[str]` | See below | Reference for LLM scoring (tend to lower score if present, no auto-blocking) |
 | `preset_questions` | `List[str]` | See below | Questions to ask in Stage 2 analysis |
 | `system_prompt` | `str` | - | Fixed prompt for DeepSeek (optimized for KV cache) |
 | `fetch_interval` | `int` | `300` | Seconds between fetches (300 = 5 minutes) |

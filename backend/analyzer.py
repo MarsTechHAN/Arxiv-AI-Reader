@@ -15,17 +15,17 @@ import time
 import httpx
 
 from models import Paper, QAPair, Config
+from typing import Callable
 
 
 class DeepSeekAnalyzer:
     """
     Two-stage analysis with KV cache optimization.
-    
     Key insight: Keep "system_prompt + content" fixed,
     only change the question to maximize cache hits.
     """
-    
-    def __init__(self, api_key: str = None):
+
+    def __init__(self, api_key: str = None, save_paper: Optional[Callable[[Paper], None]] = None):
         self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not set")
@@ -48,7 +48,8 @@ class DeepSeekAnalyzer:
         
         self.data_dir = Path("data/papers")
         self.data_dir.mkdir(parents=True, exist_ok=True)
-    
+        self._save_paper_cb = save_paper
+
     def _estimate_tokens(self, text: str) -> int:
         """
         Estimate token count from text.
@@ -459,29 +460,17 @@ Search the paper corpus and return the most relevant papers. Use appropriate too
         """
         Stage 1: Quick filter.
         Determines if paper is relevant based on keywords.
-        First checks negative keywords - if matched, score=1 (irrelevant).
-        
+        Negative keywords are passed to LLM as scoring reference only (no auto-blocking).
         Retry logic: Up to 3 attempts with exponential backoff.
         Failed records are NOT saved.
         """
-        # Check negative keywords first (fast path for rejection)
+        neg_hint = ""
         if config.negative_keywords:
-            searchable_text = f"{paper.title} {paper.preview_text}".lower()
-            for neg_kw in config.negative_keywords:
-                if neg_kw.lower() in searchable_text:
-                    paper.is_relevant = False
-                    paper.relevance_score = 1.0
-                    paper.extracted_keywords = [f"❌ {neg_kw}"]
-                    paper.one_line_summary = f"论文包含负面关键词「{neg_kw}」，自动标记为不相关"
-                    self._save_paper(paper)
-                    print(f"  Stage 1: ✗ Negative keyword '{neg_kw}' matched - {paper.id}")
-                    return paper
-        
-        # Normal analysis if no negative keywords matched
+            neg_hint = f"\n负面关键词（出现则倾向低分，但由你综合判断）：{', '.join(config.negative_keywords)}\n"
         prompt = f"""分析这篇论文预览，判断它与以下关键词的相关性：
 
 关键词：{', '.join(config.filter_keywords)}
-
+{neg_hint}
 论文标题：{paper.title}
 论文预览：
 {paper.preview_text}
@@ -709,38 +698,32 @@ Paper Content:
         paper: Paper,
         question: str,
         config: Config,
-        parent_qa_id: Optional[int] = None
+        parent_qa_id: Optional[int] = None,
+        fetcher=None,
     ):
         """
         Ask a custom question about a paper with streaming response.
         Yields chunks of the answer as they arrive.
-        
-        Supports:
-        - Reasoning mode: prefix question with "think:" to use deepseek-reasoner
-        - Follow-up: provide parent_qa_id to build conversation context
+        fetcher: optional, use shared fetcher so ref papers use same store (SQLite).
         """
         import re
         
-        # Check for reasoning mode (case-insensitive "think:" prefix)
         is_reasoning = False
         original_question = question
         if question.lower().startswith("think:"):
             is_reasoning = True
-            question = question[6:].strip()  # Remove "think:" prefix
+            question = question[6:].strip()
         
-        # Extract arXiv IDs from question (format: [2510.09212] or [2510.09212v1])
         arxiv_id_pattern = r'\[(\d{4}\.\d{4,5}(?:v\d+)?)\]'
         referenced_ids = re.findall(arxiv_id_pattern, question)
-        
-        # If references found, fetch and analyze them
         referenced_papers = []
         id_to_title = {}
         
         if referenced_ids:
             print(f"🔗 Detected {len(referenced_ids)} referenced papers: {referenced_ids}")
-            
-            from fetcher import ArxivFetcher
-            fetcher = ArxivFetcher()
+            if fetcher is None:
+                from fetcher import ArxivFetcher
+                fetcher = ArxivFetcher()
             
             for ref_id in referenced_ids:
                 try:
@@ -974,28 +957,25 @@ Paper Content:
         self,
         paper: Paper,
         question: str,
-        config: Config
+        config: Config,
+        fetcher=None,
     ) -> str:
         """
-        Ask a custom question about a paper.
-        Supports cross-paper comparison by detecting arXiv IDs in question (e.g., [2510.09212]).
-        Referenced papers will be fetched and included in context.
+        Ask a custom question about a paper. Supports cross-paper comparison.
+        fetcher: optional, use shared fetcher so ref papers use same store.
         """
         import re
         
-        # Extract arXiv IDs from question (format: [2510.09212] or [2510.09212v1])
         arxiv_id_pattern = r'\[(\d{4}\.\d{4,5}(?:v\d+)?)\]'
         referenced_ids = re.findall(arxiv_id_pattern, question)
-        
-        # If references found, fetch and analyze them
         referenced_papers = []
-        id_to_title = {}  # Map ID to short title for replacement
+        id_to_title = {}
         
         if referenced_ids:
             print(f"🔗 Detected {len(referenced_ids)} referenced papers: {referenced_ids}")
-            
-            from fetcher import ArxivFetcher
-            fetcher = ArxivFetcher()
+            if fetcher is None:
+                from fetcher import ArxivFetcher
+                fetcher = ArxivFetcher()
             
             for ref_id in referenced_ids:
                 try:
@@ -1420,10 +1400,13 @@ Respond with JSON only: {{"category": "exact_category_name"}}"""
             return "Other"
     
     def _save_paper(self, paper: Paper):
-        """Save paper to JSON file"""
-        file_path = self.data_dir / f"{paper.id}.json"
-        with open(file_path, 'w') as f:
-            json.dump(paper.to_dict(), f, indent=2, ensure_ascii=False)
+        """Save paper via store (SQLite/JSON). Must use fetcher.save_paper when using SQLite."""
+        if self._save_paper_cb:
+            self._save_paper_cb(paper)
+        else:
+            file_path = self.data_dir / f"{paper.id}.json"
+            with open(file_path, 'w') as f:
+                json.dump(paper.to_dict(), f, indent=2, ensure_ascii=False)
     
     async def run_streaming_fetch_and_analyze(
         self, fetcher, config: Config, max_papers_per_category: int = 100
@@ -1548,7 +1531,7 @@ async def analyze_new_papers():
     
     config = Config.load("data/config.json")
     fetcher = ArxivFetcher()
-    analyzer = DeepSeekAnalyzer()
+    analyzer = DeepSeekAnalyzer(save_paper=fetcher.save_paper)
     
     # Find unanalyzed papers (is_relevant is None)
     all_papers = fetcher.list_papers(limit=1000)

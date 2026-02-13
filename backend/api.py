@@ -115,9 +115,9 @@ async def selective_gzip_middleware(request: Request, call_next):
 # Note: We don't add global GZipMiddleware because it buffers StreamingResponse
 # Compression for non-streaming endpoints can be handled by reverse proxy (nginx)
 
-# Global instances
+# Global instances (analyzer uses fetcher.save_paper so writes go to SQLite when enabled)
 fetcher = ArxivFetcher()
-analyzer = DeepSeekAnalyzer()
+analyzer = DeepSeekAnalyzer(save_paper=fetcher.save_paper)
 config_path = Path("data/config.json")
 
 # Serve frontend static files FIRST (before other routes)
@@ -345,7 +345,7 @@ async def ask_question(paper_id: str, request: AskQuestionRequest):
         paper = fetcher.load_paper(paper_id)
         config = Config.load(config_path)
         
-        answer = await analyzer.ask_custom_question(paper, request.question, config)
+        answer = await analyzer.ask_custom_question(paper, request.question, config, fetcher=fetcher)
         
         return {
             "question": request.question,
@@ -381,10 +381,11 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
                 last_yield_time = None
                 
                 async for chunk_data in analyzer.ask_custom_question_stream(
-                    paper, 
-                    request.question, 
+                    paper,
+                    request.question,
                     config,
-                    parent_qa_id=request.parent_qa_id
+                    parent_qa_id=request.parent_qa_id,
+                    fetcher=fetcher,
                 ):
                     # chunk_data is now a dict: {"type": "thinking"/"content", "chunk": "..."}
                     chunk_count += 1
@@ -438,7 +439,6 @@ async def get_config():
 async def update_config(request: UpdateConfigRequest):
     """Update configuration - supports all config options"""
     config = Config.load(config_path)
-    old_negative_keywords = set(config.negative_keywords or [])
     
     # Update all provided fields
     if request.filter_keywords is not None:
@@ -473,17 +473,6 @@ async def update_config(request: UpdateConfigRequest):
         config.mcp_search_url = request.mcp_search_url.strip() or None
     
     config.save(config_path)
-    
-    # Check if negative keywords changed
-    new_negative_keywords = set(config.negative_keywords or [])
-    if new_negative_keywords != old_negative_keywords:
-        # Trigger background task to recheck papers with new negative keywords
-        asyncio.create_task(recheck_negative_keywords(config, new_negative_keywords))
-        return {
-            "message": "Config updated. Re-checking papers with new negative keywords in background...",
-            "config": config.to_dict()
-        }
-    
     return {"message": "Config updated", "config": config.to_dict()}
 
 
@@ -1149,6 +1138,11 @@ async def update_relevance(paper_id: str, request: UpdateRelevanceRequest):
         raise HTTPException(status_code=404, detail="Paper not found")
 
 
+@app.post("/papers/reprocess-negative-keyword-blocked")
+async def reprocess_negative_keyword_blocked_endpoint(background_tasks: BackgroundTasks):
+    """Re-run Stage 1 for papers that were auto-blocked by negative keywords. Uses LLM to re-score."""
+    background_tasks.add_task(reprocess_negative_keyword_blocked)
+    return {"message": "Reprocessing started. Check server logs for progress."}
 
 
 # ============ Background Tasks ============
@@ -1177,49 +1171,29 @@ async def reclassify_all_starred_papers(config: Config):
         traceback.print_exc()
 
 
-async def recheck_negative_keywords(config: Config, negative_keywords: set):
+NEGATIVE_KEYWORD_BLOCK_PATTERN = "论文包含负面关键词"
+
+
+async def reprocess_negative_keyword_blocked():
     """
-    Re-check papers with new negative keywords.
-    Update papers that match new negative keywords to be marked as not relevant.
-    Only check papers with relevance_score >= min_relevance_score_for_stage2.
+    Re-run Stage 1 for papers that were auto-blocked by the old negative keyword strategy.
+    Uses LLM to re-score (negative keywords now only as reference).
     """
     try:
-        min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+        config = Config.load(config_path)
         all_papers = fetcher.list_papers(limit=10000)
-        
-        # Filter papers: is_relevant=True and score >= threshold
-        relevant_papers = [
-            p for p in all_papers 
-            if p.is_relevant is True and p.relevance_score >= min_score
-        ]
-        
-        if not relevant_papers:
-            print("✓ No papers to recheck")
+        blocked = [p for p in all_papers if NEGATIVE_KEYWORD_BLOCK_PATTERN in (p.one_line_summary or "")]
+        if not blocked:
+            print("✓ No papers to reprocess (none were auto-blocked by negative keywords)")
             return
-        
-        print(f"\n🔍 Rechecking {len(relevant_papers)} papers with new negative keywords: {negative_keywords}")
-        
-        updated_count = 0
-        for paper in relevant_papers:
-            # Check if paper matches any negative keyword
-            searchable_text = f"{paper.title} {paper.preview_text}".lower()
-            
-            for neg_kw in negative_keywords:
-                if neg_kw.lower() in searchable_text:
-                    # Update paper to not relevant
-                    paper.is_relevant = False
-                    paper.relevance_score = 1.0
-                    paper.extracted_keywords = [f"❌ {neg_kw}"] + paper.extracted_keywords
-                    paper.one_line_summary = f"论文包含负面关键词「{neg_kw}」，自动标记为不相关"
-                    fetcher.save_paper(paper)
-                    updated_count += 1
-                    print(f"  ✗ Updated {paper.id}: matched negative keyword '{neg_kw}'")
-                    break  # Only need to match one negative keyword
-        
-        print(f"✓ Recheck complete: {updated_count} papers updated to not relevant")
-    
+        for p in blocked:
+            if not p.preview_text:
+                p.preview_text = (p.abstract or "")[:2000]
+        print(f"\n🔄 Reprocessing {len(blocked)} papers that were auto-blocked by negative keywords...")
+        await analyzer.process_papers(blocked, config)
+        print(f"✓ Reprocess complete: {len(blocked)} papers re-scored by LLM")
     except Exception as e:
-        print(f"✗ Error rechecking negative keywords: {e}")
+        print(f"✗ Reprocess error: {e}")
         import traceback
         traceback.print_exc()
 
