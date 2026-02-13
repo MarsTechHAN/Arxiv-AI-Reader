@@ -36,7 +36,7 @@ class ArxivFetcher:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.data_dir.parent / "fetcher_state.json"
         self.store = store or get_paper_store(data_dir=str(self.data_dir), db_path=str(self.data_dir.parent / "papers.db"))
-        self._backfill_category_idx = 0
+        self._backfill_category_idx = self._load_backfill_idx()
         
         self.categories = [
             "cs.AI",
@@ -50,6 +50,17 @@ class ArxivFetcher:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         }
     
+    def _load_backfill_idx(self) -> int:
+        """Load persisted backfill rotation index."""
+        if not self.state_file.exists():
+            return 0
+        try:
+            with open(self.state_file, 'r') as f:
+                raw = json.load(f)
+            return int(raw.get("_backfill_category_idx", 0))
+        except Exception:
+            return 0
+
     def _load_query_state(self) -> dict:
         """Load state: {cat: {"backfill_start": int, "backfill_done": bool}}"""
         if not self.state_file.exists():
@@ -62,6 +73,8 @@ class ArxivFetcher:
             return {}
         state = {}
         for cat, val in (raw or {}).items():
+            if cat == "_backfill_category_idx":
+                continue
             if isinstance(val, dict) and "backfill_start" in val:
                 state[cat] = val
             else:
@@ -70,8 +83,9 @@ class ArxivFetcher:
     
     def _save_query_state(self, state: dict):
         try:
+            out = {**state, "_backfill_category_idx": self._backfill_category_idx}
             with open(self.state_file, 'w') as f:
-                json.dump(state, f, indent=2)
+                json.dump(out, f, indent=2)
         except Exception as e:
             print(f"  ⚠️  Failed to save query state: {e}")
     
