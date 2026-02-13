@@ -9,6 +9,33 @@ from models import Paper, QAPair
 from .db import get_serving_db
 
 
+def overlay_paper_from_dict(paper: Paper, overlay: dict) -> Paper:
+    """Apply pre-fetched overlay dict (no DB call)."""
+    if not overlay:
+        return paper
+    if overlay.get("is_relevant") is not None:
+        paper.is_relevant = bool(overlay["is_relevant"])
+    if overlay.get("relevance_score") is not None:
+        paper.relevance_score = float(overlay["relevance_score"])
+    if overlay.get("extracted_keywords") is not None:
+        paper.extracted_keywords = overlay["extracted_keywords"]
+    if overlay.get("one_line_summary"):
+        paper.one_line_summary = overlay["one_line_summary"]
+    if overlay.get("detailed_summary"):
+        paper.detailed_summary = overlay["detailed_summary"]
+    if overlay.get("tags") is not None:
+        paper.tags = overlay["tags"]
+    if overlay.get("qa_pairs"):
+        paper.qa_pairs = [QAPair(**qa) if isinstance(qa, dict) else qa for qa in overlay["qa_pairs"]]
+    if overlay.get("is_starred") is not None:
+        paper.is_starred = bool(overlay["is_starred"])
+    if overlay.get("is_hidden") is not None:
+        paper.is_hidden = bool(overlay["is_hidden"])
+    if overlay.get("star_category"):
+        paper.star_category = overlay["star_category"]
+    return paper
+
+
 def overlay_paper(paper: Paper, user_id: int) -> Paper:
     """
     Overlay user-specific results onto paper. Returns paper with merged fields.

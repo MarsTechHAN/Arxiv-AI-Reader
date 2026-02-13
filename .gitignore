@@ -239,5 +239,5 @@ backend/data/config.json
 frontend_dist/
 
 # Dtabase file
-*.db-journal
+*.db*
 backend/data/fetcher_state.json

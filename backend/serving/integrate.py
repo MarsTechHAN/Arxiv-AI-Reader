@@ -3,6 +3,7 @@ Serving mode integration. Minimal api.py changes via helpers and app extension.
 Enable: ARXIV_SERVING_MODE=1
 """
 
+import asyncio
 import os
 from contextvars import ContextVar
 from typing import Optional, Tuple
@@ -26,13 +27,18 @@ config_path = Path("data/config.json")
 
 
 def get_user_and_config(request: Request, fallback_config_path: Path = None) -> Tuple[Optional[int], Config]:
-    """Get (user_id, config) for request. In non-serving mode, user_id is always None."""
+    """Get (user_id, config) for request. In non-serving mode, user_id is always None. Sync - use get_user_and_config_async in async handlers."""
     if not SERVING_MODE:
         return None, Config.load(str(fallback_config_path or config_path))
     from .middleware import get_current_user_id
     from .config_resolver import get_config_for_user
     user_id = get_current_user_id(request)
     return user_id, get_config_for_user(user_id, fallback_config_path or config_path)
+
+
+async def get_user_and_config_async(request: Request, fallback_config_path: Path = None) -> Tuple[Optional[int], Config]:
+    """Async wrapper - runs get_user_and_config in thread pool to avoid blocking."""
+    return await asyncio.to_thread(get_user_and_config, request, fallback_config_path or config_path)
 
 
 def overlay_paper_for_user(paper: Paper, user_id: Optional[int]) -> Paper:
@@ -51,19 +57,21 @@ def save_paper_for_user(paper: Paper, user_id: Optional[int]) -> None:
     save_paper_user_result_from_paper(paper, user_id)
 
 
-def ensure_one_line_tasks(papers: list, user_id: Optional[int], config: Config, analyzer, fetcher) -> list:
+def ensure_one_line_tasks(papers: list, user_id: Optional[int], config: Config, analyzer, fetcher, overlays: Optional[dict] = None) -> list:
     """
     Return list of asyncio tasks to run stage1 for papers missing one_line for user.
-    Caller can asyncio.gather(*tasks) or let them run in background.
+    If overlays dict is provided (e.g. from get_user_paper_overlays), use it to avoid sync DB calls.
     """
     import asyncio
     if not SERVING_MODE or user_id is None:
         return []
-    from .db import get_serving_db
-    db = get_serving_db()
     tasks = []
     for paper in papers:
-        r = db.get_paper_user_result(paper.id, user_id)
+        if overlays is not None:
+            r = overlays.get(paper.id, {})
+        else:
+            from .db import get_serving_db
+            r = get_serving_db().get_paper_user_result(paper.id, user_id) or {}
         if r and r.get("one_line_summary"):
             continue
         if paper.one_line_summary:
@@ -74,8 +82,8 @@ def ensure_one_line_tasks(papers: list, user_id: Optional[int], config: Config, 
             set_serving_user_id(user_id)
             try:
                 analyzed = await analyzer.stage1_filter(pp, config)
-                save_paper_for_user(analyzed, user_id)
-                fetcher.save_paper(analyzed)
+                await asyncio.to_thread(save_paper_for_user, analyzed, user_id)
+                await asyncio.to_thread(fetcher.save_paper, analyzed)
             finally:
                 set_serving_user_id(None)
 

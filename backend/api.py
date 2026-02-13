@@ -21,7 +21,7 @@ from starlette.requests import Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 from pathlib import Path
 from datetime import datetime, timezone
 from dateutil import parser as date_parser
@@ -133,7 +133,8 @@ async def selective_gzip_middleware(request: Request, call_next):
 # Global instances (analyzer uses fetcher.save_paper so writes go to SQLite when enabled)
 fetcher = ArxivFetcher()
 
-def _save_paper_cb(paper):
+def _save_paper_sync(paper):
+    """Sync save - run via asyncio.to_thread to avoid blocking event loop."""
     fetcher.save_paper(paper)
     try:
         from serving.integrate import SERVING_MODE, get_serving_user_id, save_paper_for_user
@@ -143,6 +144,10 @@ def _save_paper_cb(paper):
                 save_paper_for_user(paper, uid)
     except ImportError:
         pass
+
+def _save_paper_cb(paper):
+    """Non-blocking save: schedule in thread pool, return immediately."""
+    asyncio.create_task(asyncio.to_thread(_save_paper_sync, paper))
 
 analyzer = DeepSeekAnalyzer(save_paper=_save_paper_cb)
 config_path = Path("data/config.json")
@@ -218,22 +223,24 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
     When starred_only=false: show ALL papers (star is just categorization, starred papers remain in main list)
     
     PERFORMANCE OPTIMIZATION: Use metadata scanning first, then load only needed papers.
+    All sync I/O runs in thread pool to avoid blocking event loop.
     """
     starred_only_bool = starred_only.lower() == 'true'
-    user_id, config = (None, Config.load(config_path))
+    user_id, config = None, None
     try:
-        from serving.integrate import get_user_and_config, overlay_paper_for_user, ensure_one_line_tasks
-        user_id, config = get_user_and_config(request, config_path)
+        from serving.integrate import get_user_and_config_async, overlay_paper_for_user, ensure_one_line_tasks
+        user_id, config = await get_user_and_config_async(request, config_path)
     except ImportError:
-        pass
+        user_id, config = None, await asyncio.to_thread(Config.load, config_path)
 
     # Step 1: Scan metadata first (fast - only reads minimal JSON fields)
     max_scan = 10000 if starred_only_bool else 5000
-    metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=True)
+    metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, max_scan, True)
+    overlays = {}
     if user_id:
         try:
             from serving.db import get_serving_db
-            overlays = get_serving_db().get_user_paper_overlays(user_id)
+            overlays = await asyncio.to_thread(get_serving_db().get_user_paper_overlays, user_id)
             for m in metadata_list:
                 o = overlays.get(m.get("id"), {})
                 if o:
@@ -247,8 +254,8 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
         total_hidden = sum(1 for m in metadata_list if m.get('is_hidden', False))
         print(f"[DEBUG] Total metadata: {len(metadata_list)}, starred: {total_starred}, hidden: {total_hidden}")
         if total_starred == 0 and len(metadata_list) > 0:
-            fetcher._refresh_metadata_cache()
-            metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=False)
+            await asyncio.to_thread(fetcher._refresh_metadata_cache)
+            metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, max_scan, False)
             total_starred = sum(1 for m in metadata_list if m.get('is_starred', False))
             print(f"[DEBUG] After refresh: {len(metadata_list)} total, {total_starred} starred")
     
@@ -315,24 +322,27 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
     # Step 5: Paginate (still using metadata)
     paginated_metadata = filtered_metadata[skip:skip + limit]
     
-    # Step 6: NOW load only the papers we actually need (lazy loading)
-    papers = []
-    for meta in paginated_metadata:
+    # Step 6: Load papers in parallel (non-blocking)
+    async def _load_one(meta):
         try:
-            paper = fetcher.load_paper(meta['id'])
-            if user_id:
+            paper = await asyncio.to_thread(fetcher.load_paper, meta['id'])
+            if user_id and overlays:
                 try:
-                    paper = overlay_paper_for_user(paper, user_id)  # noqa: F821
+                    from serving.paper_overlay import overlay_paper_from_dict
+                    paper = overlay_paper_from_dict(paper, overlays.get(meta['id'], {}))
                 except Exception:
                     pass
-            papers.append(paper)
+            return paper
         except Exception as e:
             print(f"Warning: Failed to load paper {meta['id']}: {e}")
-            continue
+            return None
+
+    loaded = await asyncio.gather(*[_load_one(m) for m in paginated_metadata])
+    papers = [p for p in loaded if p is not None]
 
     if user_id:
         try:
-            for t in ensure_one_line_tasks(papers, user_id, config, analyzer, fetcher):
+            for t in ensure_one_line_tasks(papers, user_id, config, analyzer, fetcher, overlays=overlays):
                 asyncio.create_task(t)
         except (ImportError, NameError):
             pass
@@ -376,17 +386,15 @@ def _stage2_status(paper: Paper, config: Config) -> tuple:
 
 @app.get("/papers/{paper_id}", response_model=dict)
 async def get_paper(request: Request, paper_id: str):
-    """
-    Get full paper details including Q&A.
-    """
+    """Get full paper details including Q&A."""
     try:
-        user_id, config = (None, Config.load(config_path))
+        user_id, config = None, None
         try:
-            from serving.integrate import get_user_and_config, overlay_paper_for_user
-            user_id, config = get_user_and_config(request, config_path)
+            from serving.integrate import get_user_and_config_async, overlay_paper_for_user
+            user_id, config = await get_user_and_config_async(request, config_path)
         except ImportError:
-            pass
-        paper = fetcher.load_paper(paper_id)
+            config = await asyncio.to_thread(Config.load, config_path)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         if user_id:
             paper = overlay_paper_for_user(paper, user_id)
         d = paper.to_dict()
@@ -398,17 +406,15 @@ async def get_paper(request: Request, paper_id: str):
 
 @app.post("/papers/{paper_id}/request_full_summary")
 async def request_full_summary(request: Request, paper_id: str):
-    """
-    User clicked to request full summary. Triggers Stage 2 on demand (serving mode).
-    """
-    user_id, config = (None, Config.load(config_path))
+    """User clicked to request full summary. Triggers Stage 2 on demand (serving mode)."""
+    user_id, config = None, None
     try:
-        from serving.integrate import get_user_and_config, overlay_paper_for_user, set_serving_user_id
-        user_id, config = get_user_and_config(request, config_path)
+        from serving.integrate import get_user_and_config_async, overlay_paper_for_user, set_serving_user_id
+        user_id, config = await get_user_and_config_async(request, config_path)
     except ImportError:
-        pass
+        config = await asyncio.to_thread(Config.load, config_path)
     try:
-        paper = fetcher.load_paper(paper_id)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         if user_id:
             paper = overlay_paper_for_user(paper, user_id)
             set_serving_user_id(user_id)
@@ -417,19 +423,19 @@ async def request_full_summary(request: Request, paper_id: str):
             if user_id:
                 try:
                     from serving.paper_overlay import save_paper_user_result_from_paper
-                    save_paper_user_result_from_paper(paper, user_id)
+                    await asyncio.to_thread(save_paper_user_result_from_paper, paper, user_id)
                 except ImportError:
                     pass
-            fetcher.save_paper(paper)
+            await asyncio.to_thread(fetcher.save_paper, paper)
         if paper.is_relevant and (not paper.detailed_summary or not paper.detailed_summary.strip()):
             await analyzer.stage2_qa(paper, config)
             if user_id:
                 try:
                     from serving.paper_overlay import save_paper_user_result_from_paper
-                    save_paper_user_result_from_paper(paper, user_id)
+                    await asyncio.to_thread(save_paper_user_result_from_paper, paper, user_id)
                 except ImportError:
                     pass
-            fetcher.save_paper(paper)
+            await asyncio.to_thread(fetcher.save_paper, paper)
         return {"ok": True, "paper_id": paper_id}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
@@ -439,18 +445,15 @@ async def request_full_summary(request: Request, paper_id: str):
 
 @app.post("/papers/{paper_id}/ask")
 async def ask_question(http_request: Request, paper_id: str, request: AskQuestionRequest):
-    """
-    Ask a custom question about a paper.
-    Uses KV cache for efficiency.
-    """
+    """Ask a custom question about a paper. Uses KV cache for efficiency."""
     try:
-        user_id, config = (None, Config.load(config_path))
+        user_id, config = None, None
         try:
-            from serving.integrate import get_user_and_config, overlay_paper_for_user
-            user_id, config = get_user_and_config(http_request, config_path)
+            from serving.integrate import get_user_and_config_async, overlay_paper_for_user
+            user_id, config = await get_user_and_config_async(http_request, config_path)
         except ImportError:
-            pass
-        paper = fetcher.load_paper(paper_id)
+            config = await asyncio.to_thread(Config.load, config_path)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         if user_id:
             paper = overlay_paper_for_user(paper, user_id)
         
@@ -470,22 +473,15 @@ async def ask_question(http_request: Request, paper_id: str, request: AskQuestio
 
 @app.post("/papers/{paper_id}/ask_stream")
 async def ask_question_stream(http_request: Request, paper_id: str, request: AskQuestionRequest):
-    """
-    Ask a custom question about a paper with streaming response.
-    Uses Server-Sent Events (SSE) for real-time streaming.
-    
-    Supports:
-    - Reasoning mode: prefix question with "think:" to use deepseek-reasoner
-    - Follow-up: provide parent_qa_id to build conversation context
-    """
+    """Ask a custom question with SSE streaming. Supports think: prefix and follow-up."""
     try:
-        user_id, config = (None, Config.load(config_path))
+        user_id, config = None, None
         try:
-            from serving.integrate import get_user_and_config, overlay_paper_for_user
-            user_id, config = get_user_and_config(http_request, config_path)
+            from serving.integrate import get_user_and_config_async, overlay_paper_for_user
+            user_id, config = await get_user_and_config_async(http_request, config_path)
         except ImportError:
-            pass
-        paper = fetcher.load_paper(paper_id)
+            config = await asyncio.to_thread(Config.load, config_path)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         if user_id:
             paper = overlay_paper_for_user(paper, user_id)
         
@@ -548,28 +544,28 @@ async def ask_question_stream(http_request: Request, paper_id: str, request: Ask
 async def get_config(request: Request):
     """Get current configuration"""
     try:
-        from serving.integrate import get_user_and_config
-        _, config = get_user_and_config(request, config_path)
+        from serving.integrate import get_user_and_config_async
+        _, config = await get_user_and_config_async(request, config_path)
     except ImportError:
-        config = Config.load(config_path)
+        config = await asyncio.to_thread(Config.load, config_path)
     return config.to_dict()
 
 
 @app.put("/config")
 async def update_config(http_request: Request, request: UpdateConfigRequest):
-    """Update configuration - supports all config options"""
-    user_id, config = (None, Config.load(config_path))
+    """Update configuration - supports all config options. All DB/file I/O runs in thread pool."""
+    user_id, config = None, None
     try:
-        from serving.integrate import get_user_and_config
+        from serving.integrate import get_user_and_config_async
         from serving.db import get_serving_db
-        user_id, config = get_user_and_config(http_request, config_path)
+        user_id, config = await get_user_and_config_async(http_request, config_path)
     except ImportError:
-        pass
+        config = await asyncio.to_thread(Config.load, config_path)
     if user_id:
-        cfg = get_serving_db().get_user_config(user_id)
+        cfg = await asyncio.to_thread(get_serving_db().get_user_config, user_id)
         config = cfg if cfg else Config(**DEFAULT_CONFIG)
     else:
-        config = Config.load(config_path)
+        config = await asyncio.to_thread(Config.load, config_path)
 
     # Update all provided fields
     if request.filter_keywords is not None:
@@ -606,11 +602,11 @@ async def update_config(http_request: Request, request: UpdateConfigRequest):
     if user_id:
         try:
             from serving.db import get_serving_db
-            get_serving_db().save_user_config(user_id, config)
+            await asyncio.to_thread(get_serving_db().save_user_config, user_id, config)
         except ImportError:
-            config.save(config_path)
+            await asyncio.to_thread(config.save, config_path)
     else:
-        config.save(config_path)
+        await asyncio.to_thread(config.save, config_path)
     return {"message": "Config updated", "config": config.to_dict()}
 
 
@@ -669,9 +665,9 @@ async def upload_pdf(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="PDF file is too small or empty")
         
         paper = _parse_pdf_to_paper(content, file.filename or "paper.pdf")
-        fetcher.save_paper(paper)
-        
-        config = Config.load(config_path)
+        await asyncio.to_thread(fetcher.save_paper, paper)
+
+        config = await asyncio.to_thread(Config.load, config_path)
         asyncio.create_task(analyzer.process_papers([paper], config))
         
         return [{
@@ -717,7 +713,8 @@ def _mcp_format_search_result(p: dict, include_all: bool = True) -> dict:
 
 
 async def _mcp_tool_executor(fetcher, name: str, args: dict,
-                            from_date: str = None, to_date: str = None, sort_by: str = "relevance") -> dict | list:
+                            from_date: str = None, to_date: str = None, sort_by: str = "relevance",
+                            category: str = None, starred_only: bool = False) -> Union[dict, list]:
     """Execute MCP search tools. Returns minimal format for AI, or full dict for get_paper."""
     from mcp_server import _do_search, _do_search_full_text
 
@@ -729,28 +726,37 @@ async def _mcp_tool_executor(fetcher, name: str, args: dict,
     sb = args.get("sort_by") or sort_by
 
     if name == "search_papers":
-        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=True, search_generated_only=False,
-                        from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
+        raw = await asyncio.to_thread(
+            _do_search, q, fetcher, limit, False, True, False, fd, td, sb, skip_val,
+            category=category, starred_only=starred_only
+        )
         return [_mcp_format_search_result(p) for p in raw]
     elif name == "search_generated_content":
-        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=False, search_generated_only=True,
-                        from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
+        raw = await asyncio.to_thread(
+            _do_search, q, fetcher, limit, False, False, True, fd, td, sb, skip_val,
+            category=category, starred_only=starred_only
+        )
         return [_mcp_format_search_result(p) for p in raw]
     elif name == "search_full_text":
         max_scan = min(int(args.get("max_scan", 1500)), 2000)
-        raw = _do_search_full_text(q, fetcher, limit=limit, ids_only=False, max_scan=max_scan,
-                                  from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
+        raw = await asyncio.to_thread(
+            _do_search_full_text, q, fetcher, limit, False, max_scan, fd, td, sb, skip_val,
+            category=category, starred_only=starred_only
+        )
         return [_mcp_format_search_result(p) for p in raw]
     elif name == "get_paper_ids_by_query":
-        raw = _do_search(q, fetcher, limit=min(limit, 30), ids_only=True, from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
+        raw = await asyncio.to_thread(
+            _do_search, q, fetcher, min(limit, 30), True, True, False, fd, td, sb, skip_val,
+            category=category, starred_only=starred_only
+        )
         return [r["id"] for r in raw]
     elif name == "get_paper":
         arxiv_id = (args.get("arxiv_id", "") or "").strip()
         if not arxiv_id:
             return {"error": "arxiv_id required"}
         try:
-            if fetcher._paper_exists(arxiv_id):
-                paper = fetcher.load_paper(arxiv_id)
+            if await asyncio.to_thread(fetcher._paper_exists, arxiv_id):
+                paper = await asyncio.to_thread(fetcher.load_paper, arxiv_id)
             else:
                 paper = await fetcher.fetch_single_paper(arxiv_id)
         except Exception as e:
@@ -769,11 +775,10 @@ async def _mcp_tool_executor(fetcher, name: str, args: dict,
 
 
 @app.get("/search/ai/stream")
-async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance"):
-    """
-    AI search with streaming progress. from_date/to_date: ISO date (YYYY-MM-DD). sort_by: relevance or latest.
-    """
-    config = Config.load(config_path)
+async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance",
+                           category: str = None, starred_only: str = "false"):
+    """AI search with streaming progress. category+starred_only restrict to tab content."""
+    config = await asyncio.to_thread(Config.load, config_path)
     inner_q = q.strip()
     for prefix in ("ai:", "ai："):
         if inner_q.lower().startswith(prefix):
@@ -785,8 +790,10 @@ async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_da
             yield f"data: {json.dumps({'type': 'error', 'message': 'Empty query'})}\n\n"
         return StreamingResponse(empty_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
+    starred_only_bool = starred_only.lower() == "true"
     async def tool_executor(name, args):
-        return await _mcp_tool_executor(fetcher, name, args, from_date=from_date, to_date=to_date, sort_by=sort_by)
+        return await _mcp_tool_executor(fetcher, name, args, from_date=from_date, to_date=to_date, sort_by=sort_by,
+                                        category=category, starred_only=starred_only_bool)
 
     async def event_gen():
         try:
@@ -828,9 +835,12 @@ async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_da
             yield f"data: {json.dumps({'type': 'progress', 'message': '加载结果中...'})}\n\n"
 
             results = []
+            _tab_filter = category or starred_only_bool
             for pid in final_ids:
                 try:
-                    full = fetcher.load_paper(pid)
+                    full = await asyncio.to_thread(fetcher.load_paper, pid)
+                    if _tab_filter and not _paper_matches_tab_filter(full, category, starred_only_bool):
+                        continue
                     results.append({
                         "id": full.id,
                         "title": full.title,
@@ -870,11 +880,13 @@ async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_da
     )
 
 
-async def _run_ai_search(inner_q: str, limit: int, config, fetcher, from_date: str = None, to_date: str = None, sort_by: str = "relevance"):
+async def _run_ai_search(inner_q: str, limit: int, config, fetcher, from_date: str = None, to_date: str = None, sort_by: str = "relevance",
+                         category: str = None, starred_only: bool = False):
     """Core AI search logic. Returns list of paper dicts."""
 
     async def tool_executor_sync(name, args):
-        return await _mcp_tool_executor(fetcher, name, args, from_date=from_date, to_date=to_date, sort_by=sort_by)
+        return await _mcp_tool_executor(fetcher, name, args, from_date=from_date, to_date=to_date, sort_by=sort_by,
+                                       category=category, starred_only=starred_only)
 
     task_result = await analyzer.ai_search_with_mcp_tools(
         inner_q, tool_executor_sync, config, limit=limit, on_progress=None
@@ -884,9 +896,12 @@ async def _run_ai_search(inner_q: str, limit: int, config, fetcher, from_date: s
     else:
         final_ids = task_result or []
     results = []
+    _tab_filter = category or starred_only
     for pid in final_ids:
         try:
-            full = fetcher.load_paper(pid)
+            full = await asyncio.to_thread(fetcher.load_paper, pid)
+            if _tab_filter and not _paper_matches_tab_filter(full, category, starred_only):
+                continue
             results.append({
                 "id": full.id,
                 "title": full.title,
@@ -917,11 +932,10 @@ async def _run_ai_search(inner_q: str, limit: int, config, fetcher, from_date: s
 
 
 @app.get("/search/ai")
-async def search_ai_nostream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance"):
-    """
-    Non-streaming AI search. from_date/to_date: YYYY-MM-DD. sort_by: relevance or latest.
-    """
-    config = Config.load(config_path)
+async def search_ai_nostream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance",
+                             category: str = None, starred_only: str = "false"):
+    """Non-streaming AI search. category+starred_only restrict to tab content."""
+    config = await asyncio.to_thread(Config.load, config_path)
     inner_q = q.strip()
     for prefix in ("ai:", "ai："):
         if inner_q.lower().startswith(prefix):
@@ -929,7 +943,8 @@ async def search_ai_nostream(q: str, limit: int = 50, from_date: str = None, to_
             break
     if not inner_q:
         return []
-    results = await _run_ai_search(inner_q, limit, config, fetcher, from_date=from_date, to_date=to_date, sort_by=sort_by)
+    results = await _run_ai_search(inner_q, limit, config, fetcher, from_date=from_date, to_date=to_date, sort_by=sort_by,
+                                   category=category, starred_only=starred_only.lower() == "true")
     return results
 
 
@@ -948,13 +963,24 @@ def _parse_sort_date(date_str):
         return None
 
 
+def _paper_matches_tab_filter(paper_or_meta, category: str = None, starred_only: bool = False) -> bool:
+    """Check if paper/meta matches tab filter (category tab = starred + star_category)."""
+    if not category and not starred_only:
+        return True
+    is_starred = paper_or_meta.get("is_starred", False) if isinstance(paper_or_meta, dict) else getattr(paper_or_meta, "is_starred", False)
+    if not is_starred:
+        return False
+    if category:
+        sc = paper_or_meta.get("star_category", "Other") if isinstance(paper_or_meta, dict) else getattr(paper_or_meta, "star_category", "Other")
+        if sc != category:
+            return False
+    return True
+
+
 @app.get("/search")
-async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
-    """
-    Search papers by keyword, full-text, or arXiv ID.
-    For AI search use GET /search/ai/stream?q=ai:query
-    """
-    config = Config.load(config_path)
+async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", category: str = None, starred_only: str = "false"):
+    """Search papers by keyword, full-text, or arXiv ID. category+starred_only restrict to tab content."""
+    config = await asyncio.to_thread(Config.load, config_path)
     q = q.strip()
 
     # Check if query is an arXiv ID (format: YYMM.NNNNN or YYMM.NNNNNvN)
@@ -968,7 +994,7 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
             paper = await fetcher.fetch_single_paper(arxiv_id)
             
             # Trigger analysis in background
-            config = Config.load(config_path)
+            config = await asyncio.to_thread(Config.load, config_path)
             
             # Check if Stage 1 is needed (is_relevant is None)
             needs_stage1 = paper.is_relevant is None
@@ -985,6 +1011,11 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
                     print(f"📚 Started background Stage 2 analysis for {arxiv_id}")
                     asyncio.create_task(analyzer.process_papers([paper], config, skip_stage1=True))
             
+            # Apply tab filter
+            if category or starred_only.lower() == "true":
+                if not _paper_matches_tab_filter(paper, category, starred_only.lower() == "true"):
+                    return []
+
             # Return the paper
             return [{
                 "id": paper.id,
@@ -1010,16 +1041,24 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
             print(f"✗ Failed to fetch arXiv paper {arxiv_id}: {e}")
             raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found on arXiv")
     
+    starred_only_bool = starred_only.lower() == "true"
+    tab_filter = category or starred_only_bool
+
     # Try store FTS first (SQLite), else fall back to metadata scan
     store = getattr(fetcher, "store", None)
     if store and hasattr(store, "search"):
-        fts_results = store.search(q, limit=limit, search_full_text=True)
+        fts_limit = limit * 5 if tab_filter else limit
+        fts_results = await asyncio.to_thread(store.search, q, fts_limit, True)
         if fts_results:
-            config = Config.load(config_path)
+            config = await asyncio.to_thread(Config.load, config_path)
             results = []
             for r in fts_results:
                 try:
-                    paper = fetcher.load_paper(r["id"])
+                    paper = await asyncio.to_thread(fetcher.load_paper, r["id"])
+                    if tab_filter and not _paper_matches_tab_filter(paper, category, starred_only_bool):
+                        continue
+                    if len(results) >= limit:
+                        break
                     results.append({
                         "id": paper.id,
                         "title": paper.title,
@@ -1053,11 +1092,13 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
             return results
 
     # Fallback: metadata scan (JSON store or FTS returned empty)
-    config = Config.load(config_path)
+    config = await asyncio.to_thread(Config.load, config_path)
     from search_utils import tokenize_query
     query_token_set = set(tokenize_query(q))
-    metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
-    
+    metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, 5000, True)
+    if tab_filter:
+        metadata_list = [m for m in metadata_list if _paper_matches_tab_filter(m, category, starred_only_bool)]
+
     results = []
     for meta in metadata_list:
         # Skip hidden papers
@@ -1090,7 +1131,7 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
         else:
             # Load paper to get title if not cached
             try:
-                paper = fetcher.load_paper(paper_id)
+                paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
                 title = paper.title
                 title_score = _calculate_similarity(q, title) * 2.0
             except:
@@ -1142,7 +1183,7 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
         if total_score > 0:
             # Load full paper for response (only if needed)
             try:
-                paper = fetcher.load_paper(paper_id)
+                paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
                 results.append({
                     "id": paper.id,
                     "title": paper.title,
@@ -1187,7 +1228,7 @@ async def trigger_fetch():
     """
     async def fetch_and_analyze():
         try:
-            config = Config.load(config_path)
+            config = await asyncio.to_thread(Config.load, config_path)
             print(f"\n📡 Manual fetch triggered (streaming pipeline)...")
             n = await analyzer.run_streaming_fetch_and_analyze(
                 fetcher, config, config.max_papers_per_fetch
@@ -1204,12 +1245,13 @@ async def trigger_fetch():
     return {"message": "Fetch triggered", "status": "running"}
 
 
-def _maybe_save_user_paper(paper, request: Request):
+async def _maybe_save_user_paper(paper, request: Request):
+    """Save paper for user in serving mode. Non-blocking."""
     try:
-        from serving.integrate import get_user_and_config, save_paper_for_user
-        user_id, _ = get_user_and_config(request, config_path)
+        from serving.integrate import get_user_and_config_async, save_paper_for_user
+        user_id, _ = await get_user_and_config_async(request, config_path)
         if user_id:
-            save_paper_for_user(paper, user_id)
+            await asyncio.to_thread(save_paper_for_user, paper, user_id)
     except ImportError:
         pass
 
@@ -1218,10 +1260,10 @@ def _maybe_save_user_paper(paper, request: Request):
 async def hide_paper(request: Request, paper_id: str):
     """Hide a paper"""
     try:
-        paper = fetcher.load_paper(paper_id)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         paper.is_hidden = True
-        fetcher.save_paper(paper)
-        _maybe_save_user_paper(paper, request)
+        await asyncio.to_thread(fetcher.save_paper, paper)
+        await _maybe_save_user_paper(paper, request)
         return {"message": "Paper hidden", "paper_id": paper_id}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
@@ -1231,10 +1273,10 @@ async def hide_paper(request: Request, paper_id: str):
 async def unhide_paper(request: Request, paper_id: str):
     """Unhide a paper"""
     try:
-        paper = fetcher.load_paper(paper_id)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         paper.is_hidden = False
-        fetcher.save_paper(paper)
-        _maybe_save_user_paper(paper, request)
+        await asyncio.to_thread(fetcher.save_paper, paper)
+        await _maybe_save_user_paper(paper, request)
         return {"message": "Paper unhidden", "paper_id": paper_id}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
@@ -1244,13 +1286,13 @@ async def unhide_paper(request: Request, paper_id: str):
 async def star_paper(request: Request, paper_id: str):
     """Star a paper and classify it (or unstar)"""
     try:
-        user_id, config = (None, Config.load(config_path))
+        user_id, config = None, None
         try:
-            from serving.integrate import get_user_and_config
-            user_id, config = get_user_and_config(request, config_path)
+            from serving.integrate import get_user_and_config_async
+            user_id, config = await get_user_and_config_async(request, config_path)
         except ImportError:
-            pass
-        paper = fetcher.load_paper(paper_id)
+            config = await asyncio.to_thread(Config.load, config_path)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         if user_id:
             from serving.paper_overlay import overlay_paper
             paper = overlay_paper(paper, user_id)
@@ -1260,8 +1302,8 @@ async def star_paper(request: Request, paper_id: str):
             print(f"[DEBUG] Starred {paper_id} -> category: {paper.star_category}")
         else:
             paper.star_category = "Other"
-        fetcher.save_paper(paper)
-        _maybe_save_user_paper(paper, request)
+        await asyncio.to_thread(fetcher.save_paper, paper)
+        await _maybe_save_user_paper(paper, request)
         return {
             "message": "论文已收藏" if paper.is_starred else "取消收藏",
             "is_starred": paper.is_starred,
@@ -1275,12 +1317,12 @@ async def star_paper(request: Request, paper_id: str):
 async def update_relevance(http_request: Request, paper_id: str, body: UpdateRelevanceRequest):
     """Update paper relevance status and score manually"""
     try:
-        paper = fetcher.load_paper(paper_id)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         paper.is_relevant = body.is_relevant
         paper.relevance_score = max(0, min(10, body.relevance_score))  # Clamp 0-10
         paper.updated_at = datetime.now().isoformat()
-        fetcher.save_paper(paper)
-        _maybe_save_user_paper(paper, http_request)
+        await asyncio.to_thread(fetcher.save_paper, paper)
+        await _maybe_save_user_paper(paper, http_request)
         return {
             "message": "论文相关性已更新",
             "is_relevant": paper.is_relevant,
@@ -1300,9 +1342,9 @@ async def reprocess_negative_keyword_blocked_endpoint(background_tasks: Backgrou
 # ============ Background Tasks ============
 
 async def reclassify_all_starred_papers(config: Config):
-    """Re-classify all starred papers when categories change"""
+    """Re-classify all starred papers when categories change. DB/IO runs in thread pool."""
     try:
-        metadata_list = fetcher.list_papers_metadata(max_files=10000, check_stale=True)
+        metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, 10000, True)
         starred = [m for m in metadata_list if m.get('is_starred', False)]
         if not starred:
             print("✓ No starred papers to reclassify")
@@ -1310,9 +1352,9 @@ async def reclassify_all_starred_papers(config: Config):
         print(f"\n🏷️ Reclassifying {len(starred)} starred papers...")
         for meta in starred:
             try:
-                paper = fetcher.load_paper(meta['id'])
+                paper = await asyncio.to_thread(fetcher.load_paper, meta['id'])
                 paper.star_category = await analyzer.classify_starred_paper(paper, config)
-                fetcher.save_paper(paper)
+                await asyncio.to_thread(fetcher.save_paper, paper)
                 print(f"  ✓ {paper.id} -> {paper.star_category}")
             except Exception as e:
                 print(f"  ✗ Failed {meta.get('id', '?')}: {e}")
@@ -1327,13 +1369,10 @@ NEGATIVE_KEYWORD_BLOCK_PATTERN = "论文包含负面关键词"
 
 
 async def reprocess_negative_keyword_blocked():
-    """
-    Re-run Stage 1 for papers that were auto-blocked by the old negative keyword strategy.
-    Uses LLM to re-score (negative keywords now only as reference).
-    """
+    """Re-run Stage 1 for papers auto-blocked by old negative keyword strategy."""
     try:
-        config = Config.load(config_path)
-        all_papers = fetcher.list_papers(limit=10000)
+        config = await asyncio.to_thread(Config.load, config_path)
+        all_papers = await asyncio.to_thread(fetcher.list_papers, 0, 10000)
         blocked = [p for p in all_papers if NEGATIVE_KEYWORD_BLOCK_PATTERN in (p.one_line_summary or "")]
         if not blocked:
             print("✓ No papers to reprocess (none were auto-blocked by negative keywords)")
@@ -1351,14 +1390,10 @@ async def reprocess_negative_keyword_blocked():
 
 
 async def check_pending_deep_analysis():
-    """
-    Check for papers marked as relevant but lacking deep analysis (Stage 2).
-    Only process papers with score >= min_relevance_score_for_stage2.
-    Process these papers with priority on startup.
-    """
+    """Check for papers needing Stage 2. Process with priority on startup."""
     try:
-        config = Config.load(config_path)
-        all_papers = fetcher.list_papers(limit=10000)
+        config = await asyncio.to_thread(Config.load, config_path)
+        all_papers = await asyncio.to_thread(fetcher.list_papers, 0, 10000)
         
         # Find papers needing Stage 2 (no summary or incomplete preset Q&As)
         pending_papers = [
@@ -1416,7 +1451,7 @@ async def background_fetcher():
 
     while True:
         try:
-            config = Config.load(config_path)
+            config = await asyncio.to_thread(Config.load, config_path)
             print(f"\n📡 Fetching papers... [{datetime.now().strftime('%H:%M:%S')}]")
             if serving:
                 per_cat = max(10, config.max_papers_per_fetch // max(1, len(fetcher.categories)))

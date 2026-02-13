@@ -71,20 +71,37 @@ def _calculate_similarity(query: str, text: str) -> float:
     return score_text(query, text, exact_phrase_bonus=0.3)
 
 
+def _meta_matches_tab(meta: dict, category: Optional[str] = None, starred_only: bool = False) -> bool:
+    if not category and not starred_only:
+        return True
+    if not meta.get("is_starred", False):
+        return False
+    if category and meta.get("star_category", "Other") != category:
+        return False
+    return True
+
+
 def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
                search_full_text: bool = True, search_generated_only: bool = False,
                from_date: Optional[str] = None, to_date: Optional[str] = None,
-               sort_by: str = "relevance", skip: int = 0) -> list:
+               sort_by: str = "relevance", skip: int = 0,
+               category: Optional[str] = None, starred_only: bool = False) -> list:
     """Core search logic. Uses store FTS when available (SQLite), else in-memory scan."""
     from_date_dt = _parse_date(from_date) if from_date else None
     to_date_dt = _parse_date(to_date) if to_date else None
 
+    tab_filter = category or starred_only
     fetch_limit = limit + skip
     store = getattr(fetcher, "store", None)
     if store and hasattr(store, "search") and not search_generated_only:
-        fts_results = store.search(q.strip(), limit=fetch_limit * 3 if (from_date_dt or to_date_dt) else fetch_limit, search_full_text=search_full_text)
+        fts_limit = fetch_limit * 5 if tab_filter else fetch_limit
+        fts_results = store.search(q.strip(), limit=fts_limit * 3 if (from_date_dt or to_date_dt) else fts_limit, search_full_text=search_full_text)
         if fts_results:
             filtered = [r for r in fts_results if _paper_in_date_range(r, from_date_dt, to_date_dt)]
+            if tab_filter:
+                meta_list = fetcher.list_papers_metadata(max_files=5000, check_stale=False)
+                id_to_meta = {m["id"]: m for m in meta_list}
+                filtered = [r for r in filtered if _meta_matches_tab(id_to_meta.get(r["id"], {}), category, starred_only)]
             if from_date_dt or to_date_dt:
                 for r in filtered:
                     if "published_date" not in r:
@@ -114,6 +131,8 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
             return filtered
 
     metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
+    if tab_filter:
+        metadata_list = [m for m in metadata_list if _meta_matches_tab(m, category, starred_only)]
     results = []
     arxiv_id_pattern = r'^\d{4}\.\d{4,5}(v\d+)?$'
     from search_utils import tokenize_query
@@ -257,7 +276,8 @@ def search_generated_content(
 
 def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = False, max_scan: int = 2000,
                          from_date: Optional[str] = None, to_date: Optional[str] = None,
-                         sort_by: str = "relevance", skip: int = 0) -> list:
+                         sort_by: str = "relevance", skip: int = 0,
+                         category: Optional[str] = None, starred_only: bool = False) -> list:
     """
     Search within actual full paper html_content.
     Uses store FTS when available (SQLite), else loads each paper from disk.
@@ -265,12 +285,18 @@ def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = Fals
     from_date_dt = _parse_date(from_date) if from_date else None
     to_date_dt = _parse_date(to_date) if to_date else None
 
+    tab_filter = category or starred_only
     fetch_limit = limit + skip
     store = getattr(fetcher, "store", None)
     if store and hasattr(store, "search"):
-        fts_results = store.search(q.strip(), limit=fetch_limit * 3 if (from_date_dt or to_date_dt) else fetch_limit, search_full_text=True)
+        fts_limit = fetch_limit * 5 if tab_filter else fetch_limit
+        fts_results = store.search(q.strip(), limit=fts_limit * 3 if (from_date_dt or to_date_dt) else fts_limit, search_full_text=True)
         if fts_results:
             filtered = [r for r in fts_results if _paper_in_date_range(r, from_date_dt, to_date_dt)]
+            if tab_filter:
+                meta_list = fetcher.list_papers_metadata(max_files=5000, check_stale=False)
+                id_to_meta = {m["id"]: m for m in meta_list}
+                filtered = [r for r in filtered if _meta_matches_tab(id_to_meta.get(r["id"], {}), category, starred_only)]
             if sort_by == "latest":
                 from datetime import datetime, timezone
                 def _dt_key(r):
@@ -285,6 +311,8 @@ def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = Fals
 
     q_lower = q.lower()
     metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=True)
+    if tab_filter:
+        metadata_list = [m for m in metadata_list if _meta_matches_tab(m, category, starred_only)]
     results = []
 
     for meta in metadata_list[:max_scan]:

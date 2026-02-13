@@ -8,7 +8,10 @@ import zlib
 import os
 from pathlib import Path
 from typing import List, Dict, Optional, Protocol
-from threading import Lock
+from threading import Lock, local
+import threading
+import queue
+import atexit
 
 from models import Paper
 
@@ -198,9 +201,24 @@ class JSONPaperStore:
         self._refresh_metadata_cache()
 
 
+def _sqlite_connect(db_path: Path, wal: bool = True):
+    """Create SQLite connection with WAL mode for read concurrency."""
+    import sqlite3
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    if wal:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
+        except Exception:
+            pass
+    return conn
+
+
 class SQLitePaperStore:
     """
     SQLite backend with FTS5 full-text search and zlib-compressed storage.
+    Thread-safe: per-thread connections, WAL mode, write queue (reads prioritized).
     """
 
     def __init__(self, db_path: str = "data/papers.db", json_fallback_dir: str = "data/papers"):
@@ -210,15 +228,54 @@ class SQLitePaperStore:
         self._metadata_cache: Dict[str, dict] = {}
         self._cache_lock = Lock()
         self._cache_initialized = False
-        self._conn = None
+        self._local = local()
+        self._write_queue = queue.Queue()
+        self._write_stop = threading.Event()
+        self._write_thread = threading.Thread(target=self._write_worker, daemon=True)
+        self._write_thread.start()
+        atexit.register(self._stop_write_worker)
         self._init_db()
 
     def _get_conn(self):
+        """Per-thread connection for reads (thread-safe)."""
+        try:
+            conn = self._local.conn
+        except AttributeError:
+            conn = None
+        if conn is None:
+            conn = _sqlite_connect(self.db_path)
+            self._local.conn = conn
+        return conn
+
+    def _stop_write_worker(self):
+        self._write_stop.set()
+        self._write_queue.put(None)
+        if self._write_thread.is_alive():
+            self._write_thread.join(timeout=5)
+
+    def _write_worker(self):
+        """Dedicated thread for writes - reads never block on writes."""
         import sqlite3
-        if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+        conn = _sqlite_connect(self.db_path)
+        while not self._write_stop.is_set():
+            try:
+                item = self._write_queue.get(timeout=0.5)
+                if item is None:
+                    break
+                op, args = item
+                if op == "save":
+                    self._save_internal(args[0], conn=conn, commit=True)
+                elif op == "delete":
+                    self._fts_delete(conn, args[0])
+                    conn.execute("DELETE FROM papers WHERE id = ?", (args[0],))
+                    conn.commit()
+                    with self._cache_lock:
+                        self._metadata_cache.pop(args[0], None)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Warning: Write worker failed: {e}")
+        conn.close()
 
     def _init_db(self) -> None:
         import sqlite3
@@ -401,9 +458,9 @@ class SQLitePaperStore:
             conn.commit()
 
     def save_paper(self, paper: Paper) -> None:
+        """Queue write (non-blocking). Reads have priority; writes are deferred."""
         import time
         updated = time.time()
-        self._save_internal(paper)
         meta = {
             "id": paper.id,
             "file_path": self.db_path,
@@ -425,6 +482,7 @@ class SQLitePaperStore:
         }
         with self._cache_lock:
             self._metadata_cache[paper.id] = meta
+        self._write_queue.put(("save", (paper,)))
 
     def load_paper(self, arxiv_id: str) -> Paper:
         row = self._get_conn().execute("SELECT data FROM papers WHERE id = ?", (arxiv_id,)).fetchone()
@@ -468,12 +526,10 @@ class SQLitePaperStore:
             conn.execute("DELETE FROM papers_fts WHERE paper_id = ?", (paper_id,))
 
     def delete_paper(self, arxiv_id: str) -> None:
-        conn = self._get_conn()
-        self._fts_delete(conn, arxiv_id)
-        conn.execute("DELETE FROM papers WHERE id = ?", (arxiv_id,))
-        conn.commit()
+        """Queue delete (non-blocking). Reads have priority."""
         with self._cache_lock:
             self._metadata_cache.pop(arxiv_id, None)
+        self._write_queue.put(("delete", (arxiv_id,)))
 
     def list_papers(self, skip: int, limit: Optional[int]) -> List[Paper]:
         q = "SELECT id FROM papers ORDER BY updated_at DESC"
