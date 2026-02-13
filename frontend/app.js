@@ -567,7 +567,7 @@ async function searchPapers(query) {
         await searchPapersAiStream(query);
     } else {
         try {
-            const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50`);
+            const response = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&limit=50&sort_by=${currentSortBy || 'relevance'}`);
             const results = await response.json();
             saveSearchResults(query, results || []);
             renderSearchResults(results);

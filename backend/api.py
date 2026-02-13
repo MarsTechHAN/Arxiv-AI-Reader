@@ -815,8 +815,23 @@ async def search_ai_nostream(q: str, limit: int = 50):
     return results
 
 
+def _parse_sort_date(date_str):
+    """Parse date string to datetime (UTC) for sorting."""
+    if not date_str or not isinstance(date_str, str):
+        return None
+    try:
+        dt = date_parser.parse(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        return None
+
+
 @app.get("/search")
-async def search_papers(q: str, limit: int = 50):
+async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
     """
     Search papers by keyword, full-text, or arXiv ID.
     For AI search use GET /search/ai/stream?q=ai:query
@@ -909,6 +924,13 @@ async def search_papers(q: str, limit: int = 50):
                     })
                 except Exception as e:
                     print(f"Warning: Failed to load paper {r.get('id', '')}: {e}")
+            if sort_by == "latest":
+                def _get_result_date(r):
+                    d = _parse_sort_date(r.get("published_date", ""))
+                    return d or _parse_sort_date(r.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
+                results.sort(key=_get_result_date, reverse=True)
+            else:
+                results.sort(key=lambda x: x.get("search_score", 0), reverse=True)
             return results
 
     # Fallback: metadata scan (JSON store or FTS returned empty)
@@ -1027,8 +1049,13 @@ async def search_papers(q: str, limit: int = 50):
                 print(f"Warning: Failed to load paper {paper_id} for search: {e}")
                 continue
     
-    # Sort by search score (descending)
-    results.sort(key=lambda x: x["search_score"], reverse=True)
+    if sort_by == "latest":
+        def _get_result_date(r):
+            d = _parse_sort_date(r.get("published_date", ""))
+            return d or _parse_sort_date(r.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
+        results.sort(key=_get_result_date, reverse=True)
+    else:
+        results.sort(key=lambda x: x["search_score"], reverse=True)
     
     return results[:limit]
 
