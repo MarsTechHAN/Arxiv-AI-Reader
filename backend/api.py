@@ -1011,6 +1011,11 @@ def _parse_sort_date(date_str):
         return None
 
 
+def _relevance_sort_rank(is_relevant) -> int:
+    """0=relevant, 1=pending, 2=not_relevant. Not-relevant goes last."""
+    return 0 if is_relevant is True else (1 if is_relevant is None else 2)
+
+
 def _paper_matches_tab_filter(paper_or_meta, category: str = None, starred_only: bool = False) -> bool:
     """Check if paper/meta matches tab filter (category tab = starred + star_category)."""
     if not category and not starred_only:
@@ -1126,11 +1131,12 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
                 if title_match:
                     score += 10.0
                 pub_dt = _parse_dt(meta.get("published_date", ""))
-                # Sort: title matches first; within title matches: by date (newest) or score
+                # Sort: relevant first, pending, not_relevant last; then title_match, date/score
+                ir_rank = _relevance_sort_rank(meta.get("is_relevant"))
                 if sort_by == "latest":
-                    sort_key = (0 if title_match else 1, -pub_dt.timestamp(), -score)
+                    sort_key = (ir_rank, 0 if title_match else 1, -pub_dt.timestamp(), -score)
                 else:
-                    sort_key = (0 if title_match else 1, -pub_dt.timestamp(), -score)
+                    sort_key = (ir_rank, 0 if title_match else 1, -pub_dt.timestamp(), -score)
                 scored.append((sort_key, score, r["id"]))
             scored.sort(key=lambda x: x[0])
             # Paginate: [skip:skip+limit]
@@ -1160,12 +1166,14 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
                     })
                 except Exception as e:
                     print(f"Warning: Failed to load paper {pid}: {e}")
-            # Results already sorted by (title_match, date/score); for latest, re-sort by date
+            # Re-sort: not_relevant last; then by date or score
             if sort_by == "latest":
                 def _get_result_date(r):
                     d = _parse_sort_date(r.get("published_date", ""))
                     return d or _parse_sort_date(r.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
-                results.sort(key=_get_result_date, reverse=True)
+                results.sort(key=lambda r: (_relevance_sort_rank(r.get("is_relevant")), -_get_result_date(r).timestamp()))
+            else:
+                results.sort(key=lambda r: (_relevance_sort_rank(r.get("is_relevant")), -r.get("search_score", 0)))
             return results
 
     # Fallback: metadata scan (JSON store or FTS returned empty). Optimized: collect scores first, load only top N.
@@ -1202,14 +1210,14 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
 
         if total_score > 0:
             pub_dt = _parse_sort_date(meta.get('published_date', '')) or _parse_sort_date(meta.get('created_at', '')) or datetime.fromtimestamp(0, tz=timezone.utc)
-            scored.append((paper_id, total_score, meta.get('is_relevant') is True, pub_dt))
+            scored.append((paper_id, total_score, meta.get('is_relevant'), pub_dt))
 
-    # Sort: relevance first, then score, then date. Paginate [skip:skip+limit].
-    scored.sort(key=lambda x: (x[2], x[1], x[3].timestamp() if hasattr(x[3], 'timestamp') else 0), reverse=True)
+    # Sort: relevant first, pending, not_relevant last; then score, then date. Paginate [skip:skip+limit].
+    scored.sort(key=lambda x: (_relevance_sort_rank(x[2]), -x[1], -(x[3].timestamp() if hasattr(x[3], 'timestamp') else 0)))
     top_scored = scored[skip:skip + limit]
 
     results = []
-    for paper_id, total_score, _unused1, _unused2 in top_scored:
+    for paper_id, total_score, _ir, _pub in top_scored:
         try:
             paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
             results.append({
@@ -1239,11 +1247,9 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
         def _get_result_date(r):
             d = _parse_sort_date(r.get("published_date", ""))
             return d or _parse_sort_date(r.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
-        results.sort(key=_get_result_date, reverse=True)
+        results.sort(key=lambda r: (_relevance_sort_rank(r.get("is_relevant")), -_get_result_date(r).timestamp()))
     else:
-        # Relevance first (is_relevant=True), then by search match score
-        results.sort(key=lambda x: (x.get("is_relevant") is True, x.get("search_score", 0)), reverse=True)
-    
+        results.sort(key=lambda r: (_relevance_sort_rank(r.get("is_relevant")), -r.get("search_score", 0)))
     return results[:limit]
 
 
