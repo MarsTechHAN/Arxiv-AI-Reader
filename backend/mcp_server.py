@@ -93,6 +93,26 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
     tab_filter = category or starred_only
     fetch_limit = limit + skip
     store = getattr(fetcher, "store", None)
+    arxiv_id_pattern = r'^\d{4}\.\d{4,5}(v\d+)?$'
+    if re.match(arxiv_id_pattern, q.strip()):
+        arxiv_id = q.strip()
+        if store and hasattr(store, "any_version_exists"):
+            exists, latest_id = store.any_version_exists(arxiv_id)
+            if exists:
+                try:
+                    paper = fetcher.load_paper(latest_id, resolve_version=False)
+                    meta = {"published_date": getattr(paper, "published_date", "") or "", "is_starred": paper.is_starred, "star_category": getattr(paper, "star_category", "Other")}
+                    if not paper.is_hidden and _paper_in_date_range(meta, from_date_dt, to_date_dt) and (not tab_filter or _meta_matches_tab(meta, category, starred_only)):
+                        item = {"id": paper.id, "search_score": 1000.0}
+                        if not ids_only:
+                            item.update({"title": paper.title, "authors": paper.authors,
+                                         "abstract": (paper.abstract or "")[:300] + ("..." if len(paper.abstract or "") > 300 else ""),
+                                         "url": paper.url, "one_line_summary": paper.one_line_summary,
+                                         "detailed_summary": paper.detailed_summary,
+                                         "published_date": meta["published_date"]})
+                        return [item][skip:skip + limit]
+                except Exception:
+                    pass
     if store and hasattr(store, "search") and not search_generated_only:
         fts_limit = fetch_limit * 5 if tab_filter else fetch_limit
         fts_results = store.search(q.strip(), limit=fts_limit * 3 if (from_date_dt or to_date_dt) else fts_limit, search_full_text=search_full_text)
@@ -138,18 +158,20 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
 
     if re.match(arxiv_id_pattern, q.strip()):
         arxiv_id = q.strip()
-        for meta in metadata_list:
-            if meta.get('id', '').startswith(arxiv_id.split('v')[0]):
-                if meta.get('is_hidden', False):
-                    continue
+        store = getattr(fetcher, "store", None)
+        if store and hasattr(store, "any_version_exists"):
+            exists, latest_id = store.any_version_exists(arxiv_id)
+            if exists:
                 try:
-                    paper = fetcher.load_paper(meta['id'])
+                    paper = fetcher.load_paper(latest_id, resolve_version=False)
+                    if paper.is_hidden:
+                        return results
                     item = {"id": paper.id, "search_score": 1000.0}
                     if not ids_only:
                         item.update({
                             "title": paper.title,
                             "authors": paper.authors,
-                            "abstract": paper.abstract[:300] + "..." if len(paper.abstract) > 300 else paper.abstract,
+                            "abstract": paper.abstract[:300] + "..." if len(paper.abstract or "") > 300 else (paper.abstract or ""),
                             "url": paper.url,
                             "one_line_summary": paper.one_line_summary,
                             "detailed_summary": paper.detailed_summary,
@@ -158,7 +180,38 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
                     return results[:limit]
                 except Exception:
                     pass
-        return results
+        # Fallback: scan metadata for same base_id
+        base_id = arxiv_id.split('v')[0]
+        matching = [m for m in metadata_list
+                    if (m.get('id') == base_id or (m.get('id', '').startswith(base_id + 'v')))
+                    and not m.get('is_hidden', False)]
+        if not matching:
+            return results
+        def _vnum(mid):
+            try:
+                return int(mid.rsplit('v', 1)[1]) if 'v' in mid else 0
+            except (ValueError, IndexError):
+                return 0
+        latest_meta = max(matching, key=lambda m: _vnum(m.get('id', '')))
+        try:
+            paper = fetcher.load_paper(latest_meta['id'], resolve_version=False)
+        except Exception:
+            try:
+                paper = fetcher.load_paper(arxiv_id)
+            except Exception:
+                return results
+        item = {"id": paper.id, "search_score": 1000.0}
+        if not ids_only:
+            item.update({
+                "title": paper.title,
+                "authors": paper.authors,
+                "abstract": paper.abstract[:300] + "..." if len(paper.abstract or "") > 300 else (paper.abstract or ""),
+                "url": paper.url,
+                "one_line_summary": paper.one_line_summary,
+                "detailed_summary": paper.detailed_summary,
+            })
+        results.append(item)
+        return results[:limit]
 
     for meta in metadata_list:
         if meta.get('is_hidden', False):

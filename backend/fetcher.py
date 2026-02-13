@@ -312,15 +312,17 @@ class ArxivFetcher:
         """
         Fetch a single paper by arXiv ID.
         Uses arXiv API to get metadata, then downloads HTML.
-        Returns Paper object.
+        Treats 2602.08426, 2602.08426v1, etc. as same paper; returns latest version.
         Raises exception if paper not found or fetch fails.
         """
-        if self.store.paper_exists(arxiv_id):
-            return self.store.load_paper(arxiv_id)
+        exists, latest_id = self.store.any_version_exists(arxiv_id)
+        if exists:
+            return self.store.load_paper(latest_id, resolve_version=False)
         
+        base_id = self.store._get_base_id(arxiv_id)
         async with httpx.AsyncClient(headers=self.headers, timeout=30.0, follow_redirects=True) as client:
-            # Use arXiv API to get paper metadata
-            api_url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
+            # Use base_id to always fetch latest version from arXiv
+            api_url = f"https://export.arxiv.org/api/query?id_list={base_id}"
             
             try:
                 response = await client.get(api_url)
@@ -334,9 +336,14 @@ class ArxivFetcher:
                     raise Exception(f"Paper {arxiv_id} not found on arXiv")
                 
                 entry = feed.entries[0]
-                
+                # Extract actual id from response (arXiv returns latest, e.g. 2602.08426v2)
+                fetched_id = (
+                    entry.id.split("/abs/")[-1]
+                    if "/abs/" in entry.id
+                    else entry.id.split("oai:arXiv.org:")[-1] if "oai:arXiv.org:" in entry.id else entry.id.split("/")[-1]
+                )
                 # Download HTML version
-                html_content = await self._fetch_html(client, arxiv_id)
+                html_content = await self._fetch_html(client, fetched_id)
                 
                 # Extract preview text
                 preview_text = self._extract_preview(html_content, entry.summary)
@@ -344,21 +351,21 @@ class ArxivFetcher:
                 # Extract published date
                 published_date = getattr(entry, 'published', '')
                 
-                # Create Paper object
+                # Create Paper object (use fetched_id from API response = latest version)
                 paper = Paper(
-                    id=arxiv_id,
+                    id=fetched_id,
                     title=entry.title,
                     authors=self._extract_authors(entry),
                     abstract=entry.summary,
                     url=entry.link,
-                    html_url=f"https://arxiv.org/html/{arxiv_id}",
+                    html_url=f"https://arxiv.org/html/{fetched_id}",
                     html_content=html_content,
                     preview_text=preview_text,
                     published_date=published_date,
                 )
                 
                 self.store.save_paper(paper)
-                print(f"✓ Fetched single paper: {arxiv_id} - {paper.title[:60]}...")
+                print(f"✓ Fetched single paper: {fetched_id} - {paper.title[:60]}...")
                 
                 return paper
             
@@ -367,16 +374,16 @@ class ArxivFetcher:
                 raise
     
     def _paper_exists(self, arxiv_id: str) -> bool:
-        """Check if paper already exists"""
-        return self.store.paper_exists(arxiv_id)
+        """Check if any version of paper exists"""
+        return self.store.any_version_exists(arxiv_id)[0]
     
     def save_paper(self, paper: Paper):
         """Save paper to store"""
         self.store.save_paper(paper)
 
-    def load_paper(self, arxiv_id: str) -> Paper:
-        """Load paper from store"""
-        return self.store.load_paper(arxiv_id)
+    def load_paper(self, arxiv_id: str, resolve_version: bool = True) -> Paper:
+        """Load paper from store. resolve_version=True: 2602.08426 loads 2602.08426v2 if that's latest."""
+        return self.store.load_paper(arxiv_id, resolve_version=resolve_version)
     
     def list_papers(self, skip: int = 0, limit: int = 20) -> List[Paper]:
         """List papers with pagination. limit<=0 loads all."""

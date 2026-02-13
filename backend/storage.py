@@ -47,6 +47,7 @@ class JSONPaperStore:
         self._metadata_cache: Dict[str, dict] = {}
         self._cache_lock = Lock()
         self._cache_initialized = False
+        self._merge_done = False
 
     def save_paper(self, paper: Paper) -> None:
         file_path = self.data_dir / f"{paper.id}.json"
@@ -54,10 +55,19 @@ class JSONPaperStore:
             json.dump(paper.to_dict(), f, indent=2, ensure_ascii=False)
         self._update_cache_from_paper(paper, file_path)
 
-    def load_paper(self, arxiv_id: str) -> Paper:
-        file_path = self.data_dir / f"{arxiv_id}.json"
-        with open(file_path) as f:
-            return Paper.from_dict(json.load(f))
+    def load_paper(self, arxiv_id: str, resolve_version: bool = True) -> Paper:
+        """Load paper by id. If resolve_version=True and exact id not found, loads latest version of same base id."""
+        if self.paper_exists(arxiv_id):
+            file_path = self.data_dir / f"{arxiv_id}.json"
+            with open(file_path) as f:
+                return Paper.from_dict(json.load(f))
+        if resolve_version:
+            exists, latest_id = self.any_version_exists(arxiv_id)
+            if exists and latest_id:
+                file_path = self.data_dir / f"{latest_id}.json"
+                with open(file_path) as f:
+                    return Paper.from_dict(json.load(f))
+        raise FileNotFoundError(f"Paper {arxiv_id} not found")
 
     def paper_exists(self, arxiv_id: str) -> bool:
         return (self.data_dir / f"{arxiv_id}.json").exists()
@@ -65,15 +75,29 @@ class JSONPaperStore:
     def _get_base_id(self, arxiv_id: str) -> str:
         return arxiv_id.rsplit("v", 1)[0] if "v" in arxiv_id else arxiv_id
 
+    def _version_number(self, arxiv_id: str) -> int:
+        """Extract version for comparison. base_id=0, v1=1, v2=2. Higher=newer."""
+        if "v" not in arxiv_id:
+            return 0
+        try:
+            return int(arxiv_id.rsplit("v", 1)[1])
+        except (ValueError, IndexError):
+            return 0
+
     def any_version_exists(self, arxiv_id: str) -> tuple[bool, Optional[str]]:
+        """Returns (exists, latest_version_id). latest_version_id is the one with highest version number."""
         base_id = self._get_base_id(arxiv_id)
+        candidates: List[str] = []
         if self.paper_exists(arxiv_id):
-            return (True, arxiv_id)
+            candidates.append(arxiv_id)
         for f in self.data_dir.glob(f"{base_id}v*.json"):
-            return (True, f.stem)
+            candidates.append(f.stem)
         if self.paper_exists(base_id):
-            return (True, base_id)
-        return (False, None)
+            candidates.append(base_id)
+        if not candidates:
+            return (False, None)
+        latest = max(candidates, key=lambda x: self._version_number(x))
+        return (True, latest)
 
     def delete_paper(self, arxiv_id: str) -> None:
         fp = self.data_dir / f"{arxiv_id}.json"
@@ -81,6 +105,24 @@ class JSONPaperStore:
             fp.unlink()
         with self._cache_lock:
             self._metadata_cache.pop(arxiv_id, None)
+
+    def merge_duplicate_versions(self) -> int:
+        """Merge duplicate versions: keep latest per base_id, delete others. Returns count deleted."""
+        deleted = 0
+        by_base: Dict[str, List[str]] = {}
+        for fp in self.data_dir.glob("*.json"):
+            pid = fp.stem
+            base = self._get_base_id(pid)
+            by_base.setdefault(base, []).append(pid)
+        for base, ids in by_base.items():
+            if len(ids) <= 1:
+                continue
+            keep = max(ids, key=lambda x: self._version_number(x))
+            for pid in ids:
+                if pid != keep:
+                    self.delete_paper(pid)
+                    deleted += 1
+        return deleted
 
     def list_papers(self, skip: int, limit: Optional[int]) -> List[Paper]:
         files = sorted(
@@ -149,6 +191,11 @@ class JSONPaperStore:
 
     def _refresh_metadata_cache(self) -> None:
         print("🔄 Refreshing metadata cache...")
+        if not self._merge_done:
+            merged = self.merge_duplicate_versions()
+            if merged:
+                print(f"  Merged {merged} duplicate version(s), kept latest")
+            self._merge_done = True
         files = list(self.data_dir.glob("*.json"))
         new_cache = {}
         for fp in files:
@@ -302,6 +349,25 @@ class SQLitePaperStore:
         self._ensure_fts_contentless(conn)
         conn.commit()
         self._migrate_from_json()
+        self._merge_duplicate_versions_sqlite(conn)
+        conn.commit()
+
+    def _merge_duplicate_versions_sqlite(self, conn) -> None:
+        """Merge duplicate versions in SQLite: keep latest per base_id, delete others."""
+        by_base: Dict[str, List[str]] = {}
+        for (pid,) in conn.execute("SELECT id FROM papers").fetchall():
+            base = self._get_base_id(pid)
+            by_base.setdefault(base, []).append(pid)
+        for base, ids in by_base.items():
+            if len(ids) <= 1:
+                continue
+            keep = max(ids, key=lambda x: self._version_number(x))
+            for pid in ids:
+                if pid != keep:
+                    self._fts_delete(conn, pid)
+                    conn.execute("DELETE FROM papers WHERE id = ?", (pid,))
+                    with self._cache_lock:
+                        self._metadata_cache.pop(pid, None)
 
     def _create_fts_table(self, conn) -> bool:
         """Create FTS table. Returns True if contentless (content='') is used."""
@@ -484,12 +550,20 @@ class SQLitePaperStore:
             self._metadata_cache[paper.id] = meta
         self._write_queue.put(("save", (paper,)))
 
-    def load_paper(self, arxiv_id: str) -> Paper:
+    def load_paper(self, arxiv_id: str, resolve_version: bool = True) -> Paper:
+        """Load paper by id. If resolve_version=True and exact id not found, loads latest version of same base id."""
         row = self._get_conn().execute("SELECT data FROM papers WHERE id = ?", (arxiv_id,)).fetchone()
-        if not row:
-            raise FileNotFoundError(f"Paper {arxiv_id} not found")
-        data = json.loads(_decompress(row[0]).decode("utf-8"))
-        return Paper.from_dict(data)
+        if row:
+            data = json.loads(_decompress(row[0]).decode("utf-8"))
+            return Paper.from_dict(data)
+        if resolve_version:
+            exists, latest_id = self.any_version_exists(arxiv_id)
+            if exists and latest_id:
+                row = self._get_conn().execute("SELECT data FROM papers WHERE id = ?", (latest_id,)).fetchone()
+                if row:
+                    data = json.loads(_decompress(row[0]).decode("utf-8"))
+                    return Paper.from_dict(data)
+        raise FileNotFoundError(f"Paper {arxiv_id} not found")
 
     def paper_exists(self, arxiv_id: str) -> bool:
         r = self._get_conn().execute("SELECT 1 FROM papers WHERE id = ?", (arxiv_id,)).fetchone()
@@ -498,17 +572,27 @@ class SQLitePaperStore:
     def _get_base_id(self, arxiv_id: str) -> str:
         return arxiv_id.rsplit("v", 1)[0] if "v" in arxiv_id else arxiv_id
 
+    def _version_number(self, arxiv_id: str) -> int:
+        """Extract version for comparison. base_id=0, v1=1, v2=2. Higher=newer."""
+        if "v" not in arxiv_id:
+            return 0
+        try:
+            return int(arxiv_id.rsplit("v", 1)[1])
+        except (ValueError, IndexError):
+            return 0
+
     def any_version_exists(self, arxiv_id: str) -> tuple[bool, Optional[str]]:
+        """Returns (exists, latest_version_id). latest_version_id is the one with highest version number."""
         base_id = self._get_base_id(arxiv_id)
-        if self.paper_exists(arxiv_id):
-            return (True, arxiv_id)
         rows = self._get_conn().execute(
             "SELECT id FROM papers WHERE id LIKE ? OR id = ?",
             (f"{base_id}v%", base_id),
         ).fetchall()
-        if rows:
-            return (True, rows[0][0])
-        return (False, None)
+        if not rows:
+            return (False, None)
+        candidates = [r[0] for r in rows]
+        latest = max(candidates, key=lambda x: self._version_number(x))
+        return (True, latest)
 
     def _fts_delete(self, conn, paper_id: str) -> None:
         """Remove paper from FTS. Contentless: use rowid map. Full FTS: WHERE paper_id."""
