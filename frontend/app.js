@@ -14,6 +14,8 @@ let starCategories = ['高效视频生成', 'LLM稀疏注意力', '注意力机�
 let currentPaperList = [];  // Store current paper list for navigation
 let currentPaperIndex = -1;  // Current paper index in the list
 let stage2PollInterval = null;
+let configInitialState = null;  // Snapshot when config modal opened
+let configCloseWarningShown = false;  // For "click again to discard"
 
 // DOM Elements
 const timeline = document.getElementById('timeline');
@@ -23,7 +25,6 @@ const searchInput = document.getElementById('searchInput');
 const sortSelect = document.getElementById('sortSelect');
 const clearKeywordBtn = document.getElementById('clearKeywordBtn');
 const configBtn = document.getElementById('configBtn');
-const fetchBtn = document.getElementById('fetchBtn');
 const configModal = document.getElementById('configModal');
 const paperModal = document.getElementById('paperModal');
 const tabAll = document.getElementById('tabAll');
@@ -133,17 +134,12 @@ function setupEventListeners() {
         configBtn.addEventListener('click', () => openConfigModal());
     }
     
-    // Fetch button (if exists)
-    if (fetchBtn) {
-        fetchBtn.addEventListener('click', () => triggerFetch());
-    }
-    
-    // Config modal (if exists)
-    const configModalClose = configModal?.querySelector('.close');
+    // Config modal close (with unsaved changes check)
+    const configModalClose = document.getElementById('configModalClose');
     if (configModalClose) {
         configModalClose.addEventListener('click', (e) => {
             e.stopPropagation();
-            closeModal(configModal);
+            handleConfigModalClose();
         });
     }
     
@@ -168,14 +164,14 @@ function setupEventListeners() {
         }
     });
     
-    // Close modals on outside click or ESC key
-    [configModal, paperModal].filter(Boolean).forEach(modal => {
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) {
-                closeModal(modal);
+    // Close paper modal on outside click (config modal does NOT close on outside click)
+    if (paperModal) {
+        paperModal.addEventListener('click', (e) => {
+            if (e.target === paperModal) {
+                closeModal(paperModal);
             }
         });
-    });
+    }
     
     // ESC key to close modals and PDF preview
     document.addEventListener('keydown', (e) => {
@@ -186,7 +182,7 @@ function setupEventListeners() {
             } else if (paperModal?.classList.contains('active')) {
                 closeModal(paperModal);
             } else if (configModal?.classList.contains('active')) {
-                closeModal(configModal);
+                handleConfigModalClose();
             }
         }
     });
@@ -1330,6 +1326,57 @@ async function askQuestion(paperId, question, parentQaId = null) {
     }
 }
 
+function getConfigFormState() {
+    const keywords = document.getElementById('filterKeywords')?.value.split(',').map(k => k.trim()).filter(k => k) || [];
+    const negKeywords = document.getElementById('negativeKeywords')?.value.split(',').map(k => k.trim()).filter(k => k) || [];
+    const questions = document.getElementById('presetQuestions')?.value.split('\n').map(q => q.trim()).filter(q => q) || [];
+    const systemPrompt = document.getElementById('systemPrompt')?.value.trim() || '';
+    const model = document.getElementById('model')?.value.trim() || '';
+    const temperature = document.getElementById('temperature')?.value || '';
+    const maxTokens = document.getElementById('maxTokens')?.value || '';
+    const fetchInterval = document.getElementById('fetchInterval')?.value || '';
+    const maxPapersPerFetch = document.getElementById('maxPapersPerFetch')?.value || '';
+    const concurrentPapers = document.getElementById('concurrentPapers')?.value || '';
+    const minRelevanceScoreForStage2 = document.getElementById('minRelevanceScoreForStage2')?.value || '';
+    const starCategoriesEl = document.getElementById('starCategories');
+    const starCategoriesList = starCategoriesEl ? starCategoriesEl.value.split('\n').map(s => s.trim()).filter(s => s) : [];
+    return JSON.stringify({
+        keywords, negKeywords, questions, systemPrompt, model,
+        temperature, maxTokens, fetchInterval, maxPapersPerFetch,
+        concurrentPapers, minRelevanceScoreForStage2, starCategoriesList
+    });
+}
+
+function isConfigDirty() {
+    if (!configInitialState) return false;
+    return getConfigFormState() !== configInitialState;
+}
+
+function resetConfigCloseWarning() {
+    configCloseWarningShown = false;
+    const banner = document.getElementById('configUnsavedBanner');
+    if (banner) banner.style.display = 'none';
+}
+
+function handleConfigModalClose() {
+    if (!configModal?.classList.contains('active')) return;
+    if (configCloseWarningShown) {
+        resetConfigCloseWarning();
+        closeModal(configModal);
+        configInitialState = null;
+        return;
+    }
+    if (isConfigDirty()) {
+        configCloseWarningShown = true;
+        const banner = document.getElementById('configUnsavedBanner');
+        if (banner) banner.style.display = 'flex';
+        return;
+    }
+    resetConfigCloseWarning();
+    closeModal(configModal);
+    configInitialState = null;
+}
+
 // Config Modal
 async function openConfigModal() {
     try {
@@ -1361,6 +1408,9 @@ async function openConfigModal() {
         const sc = config.star_categories || ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
         document.getElementById('starCategories').value = sc.join('\n');
         
+        configInitialState = getConfigFormState();
+        configCloseWarningShown = false;
+        resetConfigCloseWarning();
         configModal.classList.add('active');
         document.body.classList.add('modal-open');
     } catch (error) {
@@ -1459,6 +1509,8 @@ async function saveConfig() {
             renderCategoryTabs();
         }
         
+        configInitialState = getConfigFormState();
+        resetConfigCloseWarning();
         closeModal(configModal);
         showSuccess(result.message || 'Configuration saved');
     } catch (error) {
@@ -1466,32 +1518,6 @@ async function saveConfig() {
         showError('Failed to save configuration');
     }
 }
-
-// Trigger Fetch
-async function triggerFetch() {
-    fetchBtn.disabled = true;
-    fetchBtn.textContent = '⏳ Fetching...';
-    
-    try {
-        await fetch(`${API_BASE}/fetch`, { method: 'POST' });
-        showSuccess('Fetch triggered! Papers will be updated shortly.');
-        
-        // Reload after 10 seconds
-        setTimeout(() => {
-            currentPage = 0;
-            loadPapers();
-        }, 10000);
-    } catch (error) {
-        console.error('Error triggering fetch:', error);
-        showError('Failed to trigger fetch');
-    } finally {
-        setTimeout(() => {
-            fetchBtn.disabled = false;
-            fetchBtn.textContent = '🔄 Fetch Now';
-        }, 2000);
-    }
-}
-
 
 // Utilities
 function closeModal(modal) {
@@ -1510,11 +1536,34 @@ function showLoading(show) {
 }
 
 function showError(message) {
-    alert('❌ ' + message);
+    showToast(message, 'error');
 }
 
 function showSuccess(message) {
-    alert('✅ ' + message);
+    showToast(message, 'success');
+}
+
+function showToast(message, type = 'error') {
+    const container = document.getElementById('toastContainer');
+    if (!container) return;
+    container.classList.add('has-toasts');
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    const icon = type === 'error' ? '✕' : '✓';
+    toast.innerHTML = `
+        <span class="toast-icon">${icon}</span>
+        <span class="toast-message">${escapeHtml(message)}</span>
+    `;
+    toast.addEventListener('click', () => {
+        toast.style.animation = 'none';
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(-10px)';
+        setTimeout(() => {
+            toast.remove();
+            if (container.children.length === 0) container.classList.remove('has-toasts');
+        }, 200);
+    });
+    container.appendChild(toast);
 }
 
 // Filter by keyword
@@ -1700,7 +1749,7 @@ async function updateRelevance(paperId) {
     const score = parseFloat(scoreInput.value);
     
     if (isNaN(score) || score < 0 || score > 10) {
-        alert('请输入0-10之间的评分');
+        showError('Please enter a score between 0 and 10');
         return;
     }
     
