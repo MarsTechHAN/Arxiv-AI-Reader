@@ -510,9 +510,10 @@ Search the paper corpus. Call multiple search tools in parallel if needed. Merge
     "is_relevant": true/false,
     "relevance_score": 0-10的分数（0=完全不相关，10=高度相关），
     "extracted_keywords": ["关键词1", "关键词2", ...],
-    "one_line_summary": "一句话总结（中文）"
+    "one_line_summary": "一句话总结（中文，仅概括论文内容本身，勿提及与关键词的相关性、评分等）"
 }}
-"""
+
+注意：one_line_summary 必须是对论文内容的客观概括，不得包含"与关键词相关性"、"相关性较弱/较强"等表述。"""
         
         # Retry logic: up to 3 attempts
         max_retries = 3
@@ -611,6 +612,7 @@ Search the paper corpus. Call multiple search tools in parallel if needed. Merge
 4. 研究意义和价值
 
 使用 Markdown 格式，让摘要清晰易读。
+摘要必须严格基于论文原文内容进行准确概括，不得出现"与关键词相关性较弱/较强"、"与多数关键词相关性"等与筛选标准相关的表述。
 
 同时，请为这篇论文生成合适的标签（tags）。如果论文中已经存在以下标签，请优先使用这些标签：{existing_tags_str}
 
