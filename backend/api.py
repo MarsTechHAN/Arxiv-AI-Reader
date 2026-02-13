@@ -29,6 +29,7 @@ import json
 
 from models import Paper, Config, QAPair
 from fetcher import ArxivFetcher
+from storage import DATA_ROOT
 from analyzer import DeepSeekAnalyzer
 from default_config import DEFAULT_CONFIG
 
@@ -46,7 +47,7 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown.
     """
     # Startup
-    config_path = Path("data/config.json")
+    config_path = DATA_ROOT / "config.json"
 
     # Create default config if not exists
     if not config_path.exists():
@@ -152,7 +153,7 @@ def _save_paper_cb(paper):
     asyncio.create_task(asyncio.to_thread(_save_paper_sync, paper))
 
 analyzer = DeepSeekAnalyzer(save_paper=_save_paper_cb)
-config_path = Path("data/config.json")
+config_path = DATA_ROOT / "config.json"
 
 # Serve frontend static files FIRST (before other routes)
 # Try frontend_dist first (built assets), fallback to frontend (source)

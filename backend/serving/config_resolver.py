@@ -24,4 +24,5 @@ def get_config_for_user(user_id: Optional[int], config_path: Path) -> Config:
 
 
 def get_config_path() -> Path:
-    return Path("data/config.json")
+    from storage import DATA_ROOT
+    return DATA_ROOT / "config.json"

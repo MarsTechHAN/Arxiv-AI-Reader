@@ -46,7 +46,8 @@ class DeepSeekAnalyzer:
             http_client=http_client,
         )
         
-        self.data_dir = Path("data/papers")
+        from storage import DEFAULT_DATA_DIR
+        self.data_dir = Path(DEFAULT_DATA_DIR)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._save_paper_cb = save_paper
 
@@ -1561,7 +1562,8 @@ async def analyze_new_papers():
     """
     from fetcher import ArxivFetcher
     
-    config = Config.load("data/config.json")
+    from storage import DATA_ROOT
+    config = Config.load(str(DATA_ROOT / "config.json"))
     fetcher = ArxivFetcher()
     analyzer = DeepSeekAnalyzer(save_paper=fetcher.save_paper)
     

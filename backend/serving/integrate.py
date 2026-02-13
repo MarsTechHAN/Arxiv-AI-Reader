@@ -23,7 +23,8 @@ def get_serving_user_id() -> Optional[int]:
     return _current_user_id.get(None)
 
 
-config_path = Path("data/config.json")
+from storage import DATA_ROOT
+config_path = DATA_ROOT / "config.json"
 
 
 def get_user_and_config(request: Request, fallback_config_path: Path = None) -> Tuple[Optional[int], Config]:

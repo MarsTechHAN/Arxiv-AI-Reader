@@ -240,4 +240,4 @@ frontend_dist/
 
 # Dtabase file
 *.db*
-backend/data/fetcher_state.json
+data/*.json

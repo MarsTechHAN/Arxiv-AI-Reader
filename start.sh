@@ -19,7 +19,7 @@ if [ -z "$DEEPSEEK_API_KEY" ]; then
     exit 1
 fi
 
-# Create data directory
+# Create data directory (project_root/data/ - canonical path)
 mkdir -p data/papers
 
 # Build static assets with cache busting

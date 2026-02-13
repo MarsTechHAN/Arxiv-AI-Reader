@@ -18,7 +18,7 @@ from urllib.parse import quote
 import os
 
 from models import Paper
-from storage import get_paper_store
+from storage import get_paper_store, DEFAULT_DATA_DIR, DEFAULT_DB_PATH
 
 ARXIV_API_RATE_DELAY = 3.0  # sec between API calls (arXiv recommends 3s)
 BACKFILL_BATCH_SIZE = 20
@@ -31,11 +31,12 @@ class ArxivFetcher:
     Uses PaperStore (SQLite or JSON) for persistence.
     """
 
-    def __init__(self, data_dir: str = "data/papers", store=None):
-        self.data_dir = Path(data_dir)
+    def __init__(self, data_dir: str = None, store=None):
+        self.data_dir = Path(data_dir or DEFAULT_DATA_DIR)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.data_dir.parent / "fetcher_state.json"
-        self.store = store or get_paper_store(data_dir=str(self.data_dir), db_path=str(self.data_dir.parent / "papers.db"))
+        db_path = str(self.data_dir.parent / "papers.db") if data_dir else DEFAULT_DB_PATH
+        self.store = store or get_paper_store(data_dir=str(self.data_dir), db_path=db_path)
         self._backfill_category_idx = self._load_backfill_idx()
         
         self.categories = [

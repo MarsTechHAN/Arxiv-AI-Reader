@@ -4,8 +4,8 @@ Falls back to JSON files when SQLite/FTS5 unavailable or disabled.
 """
 
 import json
-import zlib
 import os
+import zlib
 from pathlib import Path
 from typing import List, Dict, Optional, Protocol
 from threading import Lock, local
@@ -14,6 +14,12 @@ import queue
 import atexit
 
 from models import Paper
+
+# Single source of truth: project_root/data/ (absolute, cwd-independent)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_ROOT = _PROJECT_ROOT / "data"
+DEFAULT_DATA_DIR = str(DATA_ROOT / "papers")
+DEFAULT_DB_PATH = str(DATA_ROOT / "papers.db")
 
 
 def _compress(data: bytes) -> bytes:
@@ -41,8 +47,8 @@ class PaperStore(Protocol):
 class JSONPaperStore:
     """File-based storage using one JSON file per paper (current implementation)."""
 
-    def __init__(self, data_dir: str = "data/papers"):
-        self.data_dir = Path(data_dir)
+    def __init__(self, data_dir: str = None):
+        self.data_dir = Path(data_dir or DEFAULT_DATA_DIR)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._metadata_cache: Dict[str, dict] = {}
         self._cache_lock = Lock()
@@ -508,18 +514,29 @@ class SQLitePaperStore:
         if not self.json_dir.exists():
             return
         conn = self._get_conn()
-        existing = set(r[0] for r in conn.execute("SELECT id FROM papers").fetchall())
+        existing_ids = set(r[0] for r in conn.execute("SELECT id FROM papers").fetchall())
+        # For each base_id, track best version we have (skip migrating older versions)
+        by_base: Dict[str, int] = {}
+        for pid in existing_ids:
+            base = self._get_base_id(pid)
+            v = self._version_number(pid)
+            by_base[base] = max(by_base.get(base, 0), v)
         migrated = 0
         for fp in self.json_dir.glob("*.json"):
             try:
                 pid = fp.stem
-                if pid in existing:
+                if pid in existing_ids:
                     continue
+                base = self._get_base_id(pid)
+                json_ver = self._version_number(pid)
+                if json_ver <= by_base.get(base, 0):
+                    continue  # Skip: we already have newer/equal version
                 with open(fp) as f:
                     data = json.load(f)
                 paper = Paper.from_dict(data)
                 self._save_internal(paper, conn, commit=False)
-                existing.add(pid)
+                existing_ids.add(pid)
+                by_base[base] = max(by_base.get(base, 0), json_ver)
                 migrated += 1
                 if migrated <= 3 or migrated % 1000 == 0:
                     print(f"  Migrated {migrated} papers to SQLite...")
@@ -832,8 +849,8 @@ class SQLitePaperStore:
 
 
 def get_paper_store(
-    data_dir: str = "data/papers",
-    db_path: str = "data/papers.db",
+    data_dir: str = None,
+    db_path: str = None,
     force_json: bool = None,
 ) -> PaperStore:
     """
@@ -844,12 +861,14 @@ def get_paper_store(
         force_json = os.environ.get("ARXIV_USE_JSON_STORAGE", "").lower() in ("1", "true", "yes")
     if force_json:
         print("📁 Using JSON file storage (forced by ARXIV_USE_JSON_STORAGE)")
-        return JSONPaperStore(data_dir=data_dir)
+        return JSONPaperStore(data_dir=data_dir or DEFAULT_DATA_DIR)
 
+    _data_dir = data_dir or DEFAULT_DATA_DIR
+    _db_path = db_path or DEFAULT_DB_PATH
     try:
-        store = SQLitePaperStore(db_path=db_path, json_fallback_dir=data_dir)
+        store = SQLitePaperStore(db_path=_db_path, json_fallback_dir=_data_dir)
         print("📦 Using SQLite storage (FTS5 + compression)")
         return store
     except Exception as e:
         print(f"⚠️ SQLite unavailable ({e}), falling back to JSON storage")
-        return JSONPaperStore(data_dir=data_dir)
+        return JSONPaperStore(data_dir=_data_dir)

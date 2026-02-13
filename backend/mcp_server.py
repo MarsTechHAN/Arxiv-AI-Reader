@@ -49,9 +49,6 @@ def _paper_in_date_range(meta_or_item, from_date_dt, to_date_dt):
     except Exception:
         return True
 
-# Use backend-relative data path
-BACKEND_DIR = Path(__file__).parent
-DATA_DIR = str(BACKEND_DIR / "data" / "papers")
 
 # Lazy init fetcher
 _fetcher = None
@@ -61,7 +58,7 @@ def _get_fetcher():
     global _fetcher
     if _fetcher is None:
         from fetcher import ArxivFetcher
-        _fetcher = ArxivFetcher(data_dir=DATA_DIR)
+        _fetcher = ArxivFetcher()
     return _fetcher
 
 

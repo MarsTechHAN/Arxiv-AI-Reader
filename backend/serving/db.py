@@ -22,7 +22,8 @@ class ServingDB:
     """SQLite backend for serving-mode business data."""
 
     def __init__(self, db_path: str = None):
-        self.db_path = Path(db_path or "data/serving.db")
+        from storage import DATA_ROOT
+        self.db_path = Path(db_path or str(DATA_ROOT / "serving.db"))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
         self._init_db()
