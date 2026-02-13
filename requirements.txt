@@ -12,4 +12,5 @@ python-dateutil>=2.8.2
 mcp>=1.0.0
 pypdf>=4.0.0
 snowballstemmer>=2.2.0
+pyotp>=2.9.0
 

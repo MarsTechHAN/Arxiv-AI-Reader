@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
     """
     # Startup
     config_path = Path("data/config.json")
-    
+
     # Create default config if not exists
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +75,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="arXiv Paper Fetcher", lifespan=lifespan)
+
+# Serving mode: TOTP auth, multi-user (ARXIV_SERVING_MODE=1)
+try:
+    from serving.integrate import SERVING_MODE
+    if SERVING_MODE:
+        from serving.db import get_serving_db
+        from serving.middleware import ServingAuthMiddleware
+        from serving.views import router as auth_router, get_login_router
+        get_serving_db()
+        app.add_middleware(ServingAuthMiddleware)
+        app.include_router(auth_router)
+        app.include_router(get_login_router())
+        print("✓ Serving mode enabled - TOTP auth, multi-user")
+except ImportError:
+    pass
 
 # CORS for frontend
 app.add_middleware(
@@ -117,7 +132,19 @@ async def selective_gzip_middleware(request: Request, call_next):
 
 # Global instances (analyzer uses fetcher.save_paper so writes go to SQLite when enabled)
 fetcher = ArxivFetcher()
-analyzer = DeepSeekAnalyzer(save_paper=fetcher.save_paper)
+
+def _save_paper_cb(paper):
+    fetcher.save_paper(paper)
+    try:
+        from serving.integrate import SERVING_MODE, get_serving_user_id, save_paper_for_user
+        if SERVING_MODE:
+            uid = get_serving_user_id()
+            if uid is not None:
+                save_paper_for_user(paper, uid)
+    except ImportError:
+        pass
+
+analyzer = DeepSeekAnalyzer(save_paper=_save_paper_cb)
 config_path = Path("data/config.json")
 
 # Serve frontend static files FIRST (before other routes)
@@ -181,7 +208,7 @@ async def health_check():
 
 
 @app.get("/papers", response_model=List[dict])
-async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: str = "false", category: str = None):
+async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: str = "false", category: str = None):
     """
     List papers for timeline.
     sort_by: 'relevance' (default), 'latest'
@@ -193,10 +220,26 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
     PERFORMANCE OPTIMIZATION: Use metadata scanning first, then load only needed papers.
     """
     starred_only_bool = starred_only.lower() == 'true'
-    
+    user_id, config = (None, Config.load(config_path))
+    try:
+        from serving.integrate import get_user_and_config, overlay_paper_for_user, ensure_one_line_tasks
+        user_id, config = get_user_and_config(request, config_path)
+    except ImportError:
+        pass
+
     # Step 1: Scan metadata first (fast - only reads minimal JSON fields)
     max_scan = 10000 if starred_only_bool else 5000
     metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=True)
+    if user_id:
+        try:
+            from serving.db import get_serving_db
+            overlays = get_serving_db().get_user_paper_overlays(user_id)
+            for m in metadata_list:
+                o = overlays.get(m.get("id"), {})
+                if o:
+                    m.update(o)
+        except Exception:
+            pass
     
     # Debug: log metadata stats
     if starred_only_bool:
@@ -277,12 +320,23 @@ async def list_papers(skip: int = 0, limit: int = 20, sort_by: str = "relevance"
     for meta in paginated_metadata:
         try:
             paper = fetcher.load_paper(meta['id'])
+            if user_id:
+                try:
+                    paper = overlay_paper_for_user(paper, user_id)  # noqa: F821
+                except Exception:
+                    pass
             papers.append(paper)
         except Exception as e:
             print(f"Warning: Failed to load paper {meta['id']}: {e}")
             continue
-    
-    config = Config.load(config_path)
+
+    if user_id:
+        try:
+            for t in ensure_one_line_tasks(papers, user_id, config, analyzer, fetcher):
+                asyncio.create_task(t)
+        except (ImportError, NameError):
+            pass
+
     return [
         {
             "id": p.id,
@@ -321,13 +375,20 @@ def _stage2_status(paper: Paper, config: Config) -> tuple:
 
 
 @app.get("/papers/{paper_id}", response_model=dict)
-async def get_paper(paper_id: str):
+async def get_paper(request: Request, paper_id: str):
     """
     Get full paper details including Q&A.
     """
     try:
+        user_id, config = (None, Config.load(config_path))
+        try:
+            from serving.integrate import get_user_and_config, overlay_paper_for_user
+            user_id, config = get_user_and_config(request, config_path)
+        except ImportError:
+            pass
         paper = fetcher.load_paper(paper_id)
-        config = Config.load(config_path)
+        if user_id:
+            paper = overlay_paper_for_user(paper, user_id)
         d = paper.to_dict()
         _, d["stage2_pending"] = _stage2_status(paper, config)
         return d
@@ -335,15 +396,63 @@ async def get_paper(paper_id: str):
         raise HTTPException(status_code=404, detail="Paper not found")
 
 
+@app.post("/papers/{paper_id}/request_full_summary")
+async def request_full_summary(request: Request, paper_id: str):
+    """
+    User clicked to request full summary. Triggers Stage 2 on demand (serving mode).
+    """
+    user_id, config = (None, Config.load(config_path))
+    try:
+        from serving.integrate import get_user_and_config, overlay_paper_for_user, set_serving_user_id
+        user_id, config = get_user_and_config(request, config_path)
+    except ImportError:
+        pass
+    try:
+        paper = fetcher.load_paper(paper_id)
+        if user_id:
+            paper = overlay_paper_for_user(paper, user_id)
+            set_serving_user_id(user_id)
+        if paper.is_relevant is None:
+            paper = await analyzer.stage1_filter(paper, config)
+            if user_id:
+                try:
+                    from serving.paper_overlay import save_paper_user_result_from_paper
+                    save_paper_user_result_from_paper(paper, user_id)
+                except ImportError:
+                    pass
+            fetcher.save_paper(paper)
+        if paper.is_relevant and (not paper.detailed_summary or not paper.detailed_summary.strip()):
+            await analyzer.stage2_qa(paper, config)
+            if user_id:
+                try:
+                    from serving.paper_overlay import save_paper_user_result_from_paper
+                    save_paper_user_result_from_paper(paper, user_id)
+                except ImportError:
+                    pass
+            fetcher.save_paper(paper)
+        return {"ok": True, "paper_id": paper_id}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Paper not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/papers/{paper_id}/ask")
-async def ask_question(paper_id: str, request: AskQuestionRequest):
+async def ask_question(http_request: Request, paper_id: str, request: AskQuestionRequest):
     """
     Ask a custom question about a paper.
     Uses KV cache for efficiency.
     """
     try:
+        user_id, config = (None, Config.load(config_path))
+        try:
+            from serving.integrate import get_user_and_config, overlay_paper_for_user
+            user_id, config = get_user_and_config(http_request, config_path)
+        except ImportError:
+            pass
         paper = fetcher.load_paper(paper_id)
-        config = Config.load(config_path)
+        if user_id:
+            paper = overlay_paper_for_user(paper, user_id)
         
         answer = await analyzer.ask_custom_question(paper, request.question, config, fetcher=fetcher)
         
@@ -360,7 +469,7 @@ async def ask_question(paper_id: str, request: AskQuestionRequest):
 
 
 @app.post("/papers/{paper_id}/ask_stream")
-async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
+async def ask_question_stream(http_request: Request, paper_id: str, request: AskQuestionRequest):
     """
     Ask a custom question about a paper with streaming response.
     Uses Server-Sent Events (SSE) for real-time streaming.
@@ -370,8 +479,15 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
     - Follow-up: provide parent_qa_id to build conversation context
     """
     try:
+        user_id, config = (None, Config.load(config_path))
+        try:
+            from serving.integrate import get_user_and_config, overlay_paper_for_user
+            user_id, config = get_user_and_config(http_request, config_path)
+        except ImportError:
+            pass
         paper = fetcher.load_paper(paper_id)
-        config = Config.load(config_path)
+        if user_id:
+            paper = overlay_paper_for_user(paper, user_id)
         
         async def event_generator():
             """Generate SSE events with streamed answer"""
@@ -429,17 +545,32 @@ async def ask_question_stream(paper_id: str, request: AskQuestionRequest):
 
 
 @app.get("/config")
-async def get_config():
+async def get_config(request: Request):
     """Get current configuration"""
-    config = Config.load(config_path)
+    try:
+        from serving.integrate import get_user_and_config
+        _, config = get_user_and_config(request, config_path)
+    except ImportError:
+        config = Config.load(config_path)
     return config.to_dict()
 
 
 @app.put("/config")
-async def update_config(request: UpdateConfigRequest):
+async def update_config(http_request: Request, request: UpdateConfigRequest):
     """Update configuration - supports all config options"""
-    config = Config.load(config_path)
-    
+    user_id, config = (None, Config.load(config_path))
+    try:
+        from serving.integrate import get_user_and_config
+        from serving.db import get_serving_db
+        user_id, config = get_user_and_config(http_request, config_path)
+    except ImportError:
+        pass
+    if user_id:
+        cfg = get_serving_db().get_user_config(user_id)
+        config = cfg if cfg else Config(**DEFAULT_CONFIG)
+    else:
+        config = Config.load(config_path)
+
     # Update all provided fields
     if request.filter_keywords is not None:
         config.filter_keywords = request.filter_keywords
@@ -471,8 +602,15 @@ async def update_config(request: UpdateConfigRequest):
             asyncio.create_task(reclassify_all_starred_papers(config))
     if request.mcp_search_url is not None:
         config.mcp_search_url = request.mcp_search_url.strip() or None
-    
-    config.save(config_path)
+
+    if user_id:
+        try:
+            from serving.db import get_serving_db
+            get_serving_db().save_user_config(user_id, config)
+        except ImportError:
+            config.save(config_path)
+    else:
+        config.save(config_path)
     return {"message": "Config updated", "config": config.to_dict()}
 
 
@@ -1066,43 +1204,64 @@ async def trigger_fetch():
     return {"message": "Fetch triggered", "status": "running"}
 
 
+def _maybe_save_user_paper(paper, request: Request):
+    try:
+        from serving.integrate import get_user_and_config, save_paper_for_user
+        user_id, _ = get_user_and_config(request, config_path)
+        if user_id:
+            save_paper_for_user(paper, user_id)
+    except ImportError:
+        pass
+
+
 @app.post("/papers/{paper_id}/hide")
-async def hide_paper(paper_id: str):
+async def hide_paper(request: Request, paper_id: str):
     """Hide a paper"""
     try:
         paper = fetcher.load_paper(paper_id)
         paper.is_hidden = True
         fetcher.save_paper(paper)
+        _maybe_save_user_paper(paper, request)
         return {"message": "Paper hidden", "paper_id": paper_id}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
 
 
 @app.post("/papers/{paper_id}/unhide")
-async def unhide_paper(paper_id: str):
+async def unhide_paper(request: Request, paper_id: str):
     """Unhide a paper"""
     try:
         paper = fetcher.load_paper(paper_id)
         paper.is_hidden = False
         fetcher.save_paper(paper)
+        _maybe_save_user_paper(paper, request)
         return {"message": "Paper unhidden", "paper_id": paper_id}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
 
 
 @app.post("/papers/{paper_id}/star")
-async def star_paper(paper_id: str):
+async def star_paper(request: Request, paper_id: str):
     """Star a paper and classify it (or unstar)"""
     try:
+        user_id, config = (None, Config.load(config_path))
+        try:
+            from serving.integrate import get_user_and_config
+            user_id, config = get_user_and_config(request, config_path)
+        except ImportError:
+            pass
         paper = fetcher.load_paper(paper_id)
+        if user_id:
+            from serving.paper_overlay import overlay_paper
+            paper = overlay_paper(paper, user_id)
         paper.is_starred = not paper.is_starred
         if paper.is_starred:
-            config = Config.load(config_path)
             paper.star_category = await analyzer.classify_starred_paper(paper, config)
             print(f"[DEBUG] Starred {paper_id} -> category: {paper.star_category}")
         else:
             paper.star_category = "Other"
         fetcher.save_paper(paper)
+        _maybe_save_user_paper(paper, request)
         return {
             "message": "论文已收藏" if paper.is_starred else "取消收藏",
             "is_starred": paper.is_starred,
@@ -1113,14 +1272,15 @@ async def star_paper(paper_id: str):
 
 
 @app.post("/papers/{paper_id}/update_relevance")
-async def update_relevance(paper_id: str, request: UpdateRelevanceRequest):
+async def update_relevance(http_request: Request, paper_id: str, body: UpdateRelevanceRequest):
     """Update paper relevance status and score manually"""
     try:
         paper = fetcher.load_paper(paper_id)
-        paper.is_relevant = request.is_relevant
-        paper.relevance_score = max(0, min(10, request.relevance_score))  # Clamp 0-10
+        paper.is_relevant = body.is_relevant
+        paper.relevance_score = max(0, min(10, body.relevance_score))  # Clamp 0-10
         paper.updated_at = datetime.now().isoformat()
         fetcher.save_paper(paper)
+        _maybe_save_user_paper(paper, http_request)
         return {
             "message": "论文相关性已更新",
             "is_relevant": paper.is_relevant,
@@ -1241,22 +1401,33 @@ async def analyze_papers_task(papers: List[Paper], config: Config):
 async def background_fetcher():
     """
     Background task: check pending analysis first, then fetch + analyze loop.
-    Everything runs asynchronously (non-blocking).
+    In serving mode: only fetch (no global analysis; analysis is on-demand per user).
     """
-    # First run: check for pending deep analysis (non-blocking)
-    asyncio.create_task(check_pending_deep_analysis())
-    
-    # Main fetch loop (streaming pipeline: fetch streams to stage1, stage1 to stage2)
+    try:
+        from serving.integrate import SERVING_MODE
+        serving = SERVING_MODE
+    except ImportError:
+        serving = False
+
+    if not serving:
+        asyncio.create_task(check_pending_deep_analysis())
+    else:
+        print("📡 Serving mode: skipping background analysis (on-demand per user)")
+
     while True:
         try:
             config = Config.load(config_path)
             print(f"\n📡 Fetching papers... [{datetime.now().strftime('%H:%M:%S')}]")
-            # run_streaming_fetch_and_analyze: stage1 starts before fetch completes
-            n = await analyzer.run_streaming_fetch_and_analyze(
-                fetcher, config, config.max_papers_per_fetch
-            )
+            if serving:
+                per_cat = max(10, config.max_papers_per_fetch // max(1, len(fetcher.categories)))
+                papers = await fetcher.fetch_latest(max_papers_per_category=per_cat)
+                n = len(papers)
+            else:
+                n = await analyzer.run_streaming_fetch_and_analyze(
+                    fetcher, config, config.max_papers_per_fetch
+                )
             if n == 0:
-                print(f"✓ No new papers to analyze")
+                print(f"✓ No new papers" + (" to analyze" if not serving else ""))
             await asyncio.sleep(config.fetch_interval)
         
         except Exception as e:

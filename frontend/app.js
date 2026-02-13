@@ -1051,6 +1051,11 @@ function updateModalPaperContent(paper) {
             <div class="detail-section">
                 <h3>AI 总结</h3>
                 <div class="markdown-content" style="font-size: 16px;">${renderMarkdown(paper.one_line_summary)}</div>
+                ${(!paper.detailed_summary || !paper.detailed_summary.trim()) ? `
+                <button class="btn btn-secondary btn-compact" style="margin-top: 8px;" onclick="requestFullSummary('${escapeHtml(paper.id)}')">
+                    📝 生成全文详细摘要
+                </button>
+                ` : ''}
             </div>
         ` : `
             <div class="detail-section">
@@ -1114,6 +1119,31 @@ function updateModalPaperContent(paper) {
 }
 
 // Ask Question (with streaming, reasoning, and follow-up support)
+async function requestFullSummary(paperId) {
+    try {
+        const r = await fetch(`${API_BASE}/papers/${paperId}/request_full_summary`, { method: 'POST', credentials: 'include' });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.ok) {
+            showSuccess('正在生成全文摘要...');
+            if (stage2PollInterval) clearInterval(stage2PollInterval);
+            stage2PollInterval = setInterval(async () => {
+                if (currentPaperId !== paperId) return;
+                const pr = await fetch(`${API_BASE}/papers/${paperId}`);
+                const p = await pr.json();
+                if (!p.stage2_pending) {
+                    clearInterval(stage2PollInterval);
+                    stage2PollInterval = null;
+                    updateModalPaperContent(p);
+                }
+            }, 2000);
+        } else {
+            showError(d.error || '请求失败');
+        }
+    } catch (e) {
+        showError('请求失败: ' + (e.message || 'Unknown'));
+    }
+}
+
 async function askQuestion(paperId, question, parentQaId = null) {
     const askInput = document.getElementById('askInput');
     const askLoading = document.getElementById('askLoading');
@@ -1554,7 +1584,9 @@ function showToast(message, type = 'error') {
         <span class="toast-icon">${icon}</span>
         <span class="toast-message">${escapeHtml(message)}</span>
     `;
-    toast.addEventListener('click', () => {
+    const dismiss = () => {
+        if (toast.dataset.dismissed) return;
+        toast.dataset.dismissed = '1';
         toast.style.animation = 'none';
         toast.style.opacity = '0';
         toast.style.transform = 'translateY(-10px)';
@@ -1562,7 +1594,9 @@ function showToast(message, type = 'error') {
             toast.remove();
             if (container.children.length === 0) container.classList.remove('has-toasts');
         }, 200);
-    });
+    };
+    toast.addEventListener('click', dismiss);
+    setTimeout(dismiss, 3500);
     container.appendChild(toast);
 }
 
