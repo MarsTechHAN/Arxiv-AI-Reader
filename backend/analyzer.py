@@ -251,12 +251,16 @@ Candidates:
                 "type": "function",
                 "function": {
                     "name": "search_papers",
-                    "description": "Search by keyword in title, abstract, authors, tags, and AI summaries. Fast, uses metadata cache. Use for: author names, broad topics, arXiv ID lookup. limit 15-25.",
+                    "description": "Search by keyword in title, abstract, authors, tags, and AI summaries. Fast. Use for: author names, broad topics, arXiv ID lookup. limit 15-25. from_date/to_date: ISO date (2024-01-01) to filter. sort_by: relevance or latest.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {"type": "string", "description": "Search terms, author name, or arXiv ID (e.g. 2401.12345)"},
                             "limit": {"type": "integer", "default": 20},
+                            "skip": {"type": "integer", "default": 0, "description": "Skip first N for pagination (e.g. 30 for next page)"},
+                            "from_date": {"type": "string", "description": "Filter: papers published on or after (YYYY-MM-DD)"},
+                            "to_date": {"type": "string", "description": "Filter: papers published on or before (YYYY-MM-DD)"},
+                            "sort_by": {"type": "string", "enum": ["relevance", "latest"], "default": "relevance"},
                         },
                         "required": ["query"],
                     },
@@ -266,12 +270,16 @@ Candidates:
                 "type": "function",
                 "function": {
                     "name": "search_generated_content",
-                    "description": "Search ONLY in AI-generated content: one_line_summary, detailed_summary, tags, extracted_keywords. Best for semantic/conceptual queries like 'methods for X', 'papers about Y'. Use when query is about research concepts, not raw keywords. limit 15-25.",
+                    "description": "Search ONLY in AI-generated content. Best for semantic queries. from_date/to_date: ISO date. sort_by: relevance or latest.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {"type": "string"},
                             "limit": {"type": "integer", "default": 20},
+                            "skip": {"type": "integer", "default": 0, "description": "Skip N for pagination"},
+                            "from_date": {"type": "string", "description": "Filter: YYYY-MM-DD"},
+                            "to_date": {"type": "string", "description": "Filter: YYYY-MM-DD"},
+                            "sort_by": {"type": "string", "enum": ["relevance", "latest"], "default": "relevance"},
                         },
                         "required": ["query"],
                     },
@@ -281,13 +289,17 @@ Candidates:
                 "type": "function",
                 "function": {
                     "name": "search_full_text",
-                    "description": "Search within FULL paper text (html_content). Slower but finds in-body mentions. Use when: query is a specific technique name, formula, dataset name, or phrase that may appear only in paper body. limit 15-20, max_scan 1500.",
+                    "description": "Search within FULL paper text. Slower. Use for specific techniques/formulas/datasets. from_date/to_date: YYYY-MM-DD. sort_by: relevance or latest.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {"type": "string"},
                             "limit": {"type": "integer", "default": 15},
-                            "max_scan": {"type": "integer", "default": 1500, "description": "Max papers to scan"},
+                            "skip": {"type": "integer", "default": 0},
+                            "max_scan": {"type": "integer", "default": 1500},
+                            "from_date": {"type": "string", "description": "Filter: YYYY-MM-DD"},
+                            "to_date": {"type": "string", "description": "Filter: YYYY-MM-DD"},
+                            "sort_by": {"type": "string", "enum": ["relevance", "latest"], "default": "relevance"},
                         },
                         "required": ["query"],
                     },
@@ -297,12 +309,16 @@ Candidates:
                 "type": "function",
                 "function": {
                     "name": "get_paper_ids_by_query",
-                    "description": "Get arXiv IDs only (no content). Fast. Use to quickly check IDs for a query before get_paper, or to merge/intersect result sets. limit 30.",
+                    "description": "Get arXiv IDs only. Fast. from_date/to_date: YYYY-MM-DD. sort_by: relevance or latest.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {"type": "string"},
                             "limit": {"type": "integer", "default": 30},
+                            "skip": {"type": "integer", "default": 0},
+                            "from_date": {"type": "string"},
+                            "to_date": {"type": "string"},
+                            "sort_by": {"type": "string", "enum": ["relevance", "latest"], "default": "relevance"},
                         },
                         "required": ["query"],
                     },
@@ -312,11 +328,13 @@ Candidates:
                 "type": "function",
                 "function": {
                     "name": "submit_ranking",
-                    "description": "REQUIRED. You MUST call this when done. Submit final ranked paper_ids (arXiv IDs) in relevance order, best first. Never end without calling this. Merge and deduplicate from search results, put most relevant first. 15-30 papers typical.",
+                    "description": "REQUIRED. Call when done. Submit ranked paper_ids (best first). return_count: 5-20 papers to return. skip: for pagination, skip first N (e.g. 30 for page 2).",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "paper_ids": {"type": "array", "items": {"type": "string"}},
+                            "paper_ids": {"type": "array", "items": {"type": "string"}, "description": "Ranked arXiv IDs, best first"},
+                            "return_count": {"type": "integer", "default": 10, "minimum": 5, "maximum": 20, "description": "Number of papers to return (5-20)"},
+                            "skip": {"type": "integer", "default": 0, "minimum": 0, "description": "Skip first N for pagination (e.g. 30 for next page)"},
                         },
                         "required": ["paper_ids"],
                     },
@@ -326,30 +344,39 @@ Candidates:
 
         sys_msg = """You are a paper search assistant for an arXiv corpus. Your goal: return the most relevant papers for the user query.
 
-## TOOL USAGE STRATEGY
+## TURN LIMIT (CRITICAL)
+- You have at most 3 rounds of function calls. Ideally complete in 1 round.
+- Prefer calling multiple search tools in parallel (same round) rather than sequential rounds.
+- If you need several queries, call them ALL in one batch, then submit_ranking.
+
+## PARALLEL TOOL USE (STRONGLY PREFERRED)
+- Call multiple search tools at once when query has multiple aspects (e.g. search_papers("video generation") AND search_generated_content("diffusion models") in one round).
+- Call multiple queries in parallel: search_papers("X"), search_papers("Y") together. Merge results, deduplicate, rank, submit_ranking.
+- Do NOT do: round1 search A → round2 search B → round3 submit. Instead: round1 search A + search B → round2 submit_ranking.
+
+## TOOL STRATEGY
 
 1. **Choose search type by query:**
-   - Conceptual/semantic ("methods for X", "papers about Y", "survey on Z") → search_generated_content
-   - Author name, arXiv ID, broad keyword → search_papers
-   - Specific phrase/technique/dataset likely in paper body → search_full_text
-   - Combine: e.g. search_generated_content + search_full_text for "transformers in vision" to get both concept and in-body matches
+   - Conceptual/semantic → search_generated_content
+   - Author, arXiv ID, broad keyword → search_papers
+   - Specific technique/formula/dataset → search_full_text
+   - Use skip for pagination (e.g. skip=30 for next page). return_count 5-20 in submit_ranking.
 
-2. **Multi-step when helpful:**
-   - Run 1-2 search tools with different queries or types (e.g. main query + synonym)
-   - Use get_paper_ids_by_query for quick ID list when merging result sets
-   - Merge, deduplicate, rank by relevance → submit_ranking
+2. **Date and sort:** from_date/to_date (YYYY-MM-DD), sort_by="relevance" or "latest".
 
-3. **Output: MUST CALL submit_ranking(paper_ids).** This is REQUIRED. Never finish with text only. You MUST invoke submit_ranking with ranked arXiv IDs before ending.
+3. **Output: MUST call submit_ranking(paper_ids, return_count=5-20, skip=0).** return_count: how many to return. skip: for pagination.
 
-4. **Reply briefly in Chinese before tool calls about what you are thinking and reason** (e.g. "我觉得我应该更关注XXX，搜索AI相关内容...").
+4. **Reply briefly in Chinese before tool calls.**
 """
         user_msg = f"""User query: {query}
 
-Search the paper corpus and return the most relevant papers. Use appropriate tools, merge/deduplicate if multiple searches, then **you MUST call submit_ranking(paper_ids)** with the ranked arXiv IDs. Do NOT end with text only—submit_ranking is mandatory."""
+Search the paper corpus. Call multiple search tools in parallel if needed. Merge, deduplicate, rank. Then call submit_ranking(paper_ids, return_count=5-20, skip=0). Complete in 1 round if possible."""
 
         messages = [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}]
-        max_rounds = 5
+        max_rounds = 3
         final_ids = None
+        return_count = 10
+        skip_count = 0
         fallback_ids = []  # IDs from search tools, used when submit_ranking is missing/empty
         SUBMIT_RETRY_MAX = 3
 
@@ -366,7 +393,7 @@ Search the paper corpus and return the most relevant papers. Use appropriate too
                     fallback_ids.append(pid)
 
         async def do_round(tool_choice="auto"):
-            nonlocal final_ids
+            nonlocal final_ids, return_count, skip_count
             resp = await self.client.chat.completions.create(
                 model=config.model,
                 messages=messages,
@@ -400,6 +427,8 @@ Search the paper corpus and return the most relevant papers. Use appropriate too
                 args = json.loads(tc.function.arguments or "{}")
                 if name == "submit_ranking":
                     final_ids = args.get("paper_ids", []) or []
+                    return_count = min(max(int(args.get("return_count", 10)), 5), 20)
+                    skip_count = max(0, int(args.get("skip", 0)))
                     return "submit_ok"
                 q = args.get("query", "")
                 if on_progress:
@@ -431,9 +460,9 @@ Search the paper corpus and return the most relevant papers. Use appropriate too
         # Retry: force submit_ranking when model ended without it (or submitted empty)
         if not final_ids and fallback_ids:
             force_prompts = [
-                "You MUST call submit_ranking(paper_ids) now. Use the paper IDs from the search results above. Do NOT reply with text only—you MUST invoke submit_ranking with the ranked IDs.",
-                "CRITICAL: Call submit_ranking immediately. Pass paper_ids from the search results (non-empty). Text-only or empty list is invalid.",
-                "Final attempt: submit_ranking(paper_ids) is mandatory. Use the IDs from tool results. No other response accepted.",
+                "You MUST call submit_ranking(paper_ids, return_count=10) now. Use IDs from search results. Non-empty list required.",
+                "CRITICAL: Call submit_ranking(paper_ids, return_count=10) immediately. Use IDs from tool results.",
+                "Final attempt: submit_ranking(paper_ids) mandatory. return_count 5-20.",
             ]
             for retry_i in range(SUBMIT_RETRY_MAX):
                 if final_ids:
@@ -451,10 +480,11 @@ Search the paper corpus and return the most relevant papers. Use appropriate too
                     raise
 
         if final_ids:
-            return final_ids[:limit]
+            sliced = final_ids[skip_count:skip_count + return_count]
+            return (sliced, return_count, skip_count)
         if fallback_ids:
-            return fallback_ids[:limit]
-        return []
+            return (fallback_ids[:return_count], return_count, 0)
+        return ([], 10, 0)
 
     async def stage1_filter(self, paper: Paper, config: Config) -> Paper:
         """

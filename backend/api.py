@@ -578,24 +578,33 @@ def _mcp_format_search_result(p: dict, include_all: bool = True) -> dict:
     }
 
 
-async def _mcp_tool_executor(fetcher, name: str, args: dict) -> dict | list:
+async def _mcp_tool_executor(fetcher, name: str, args: dict,
+                            from_date: str = None, to_date: str = None, sort_by: str = "relevance") -> dict | list:
     """Execute MCP search tools. Returns minimal format for AI, or full dict for get_paper."""
     from mcp_server import _do_search, _do_search_full_text
 
     q = args.get("query", "")
     limit = min(int(args.get("limit", 25)), 30)
+    skip_val = max(0, int(args.get("skip", 0)))
+    fd = args.get("from_date") or from_date
+    td = args.get("to_date") or to_date
+    sb = args.get("sort_by") or sort_by
+
     if name == "search_papers":
-        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=True, search_generated_only=False)
+        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=True, search_generated_only=False,
+                        from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
         return [_mcp_format_search_result(p) for p in raw]
     elif name == "search_generated_content":
-        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=False, search_generated_only=True)
+        raw = _do_search(q, fetcher, limit=limit, ids_only=False, search_full_text=False, search_generated_only=True,
+                        from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
         return [_mcp_format_search_result(p) for p in raw]
     elif name == "search_full_text":
         max_scan = min(int(args.get("max_scan", 1500)), 2000)
-        raw = _do_search_full_text(q, fetcher, limit=limit, ids_only=False, max_scan=max_scan)
+        raw = _do_search_full_text(q, fetcher, limit=limit, ids_only=False, max_scan=max_scan,
+                                  from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
         return [_mcp_format_search_result(p) for p in raw]
     elif name == "get_paper_ids_by_query":
-        raw = _do_search(q, fetcher, limit=min(limit, 30), ids_only=True)
+        raw = _do_search(q, fetcher, limit=min(limit, 30), ids_only=True, from_date=fd, to_date=td, sort_by=sb, skip=skip_val)
         return [r["id"] for r in raw]
     elif name == "get_paper":
         arxiv_id = (args.get("arxiv_id", "") or "").strip()
@@ -622,10 +631,9 @@ async def _mcp_tool_executor(fetcher, name: str, args: dict) -> dict | list:
 
 
 @app.get("/search/ai/stream")
-async def search_ai_stream(q: str, limit: int = 50):
+async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance"):
     """
-    AI search with streaming progress. Use "ai: query" or just "query".
-    Returns SSE: progress messages, then done with results.
+    AI search with streaming progress. from_date/to_date: ISO date (YYYY-MM-DD). sort_by: relevance or latest.
     """
     config = Config.load(config_path)
     inner_q = q.strip()
@@ -640,7 +648,7 @@ async def search_ai_stream(q: str, limit: int = 50):
         return StreamingResponse(empty_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     async def tool_executor(name, args):
-        return await _mcp_tool_executor(fetcher, name, args)
+        return await _mcp_tool_executor(fetcher, name, args, from_date=from_date, to_date=to_date, sort_by=sort_by)
 
     async def event_gen():
         try:
@@ -673,12 +681,16 @@ async def search_ai_stream(q: str, limit: int = 50):
                     yield f"data: {json.dumps(to_event(msg))}\n\n"
                 except asyncio.QueueEmpty:
                     break
-            final_ids = await task
+            task_result = await task
+            if isinstance(task_result, tuple):
+                final_ids, _, _ = task_result
+            else:
+                final_ids = task_result or []
 
             yield f"data: {json.dumps({'type': 'progress', 'message': '加载结果中...'})}\n\n"
 
             results = []
-            for pid in (final_ids or [])[:limit]:
+            for pid in final_ids:
                 try:
                     full = fetcher.load_paper(pid)
                     results.append({
@@ -703,7 +715,10 @@ async def search_ai_stream(q: str, limit: int = 50):
                     })
                 except Exception:
                     continue
-
+            if sort_by == "latest":
+                results.sort(key=lambda x: (_parse_sort_date(x.get("published_date", "")) or datetime.fromtimestamp(0, tz=timezone.utc),), reverse=True)
+            else:
+                results.sort(key=lambda x: (x.get("is_relevant") is True, x.get("search_score", 0)), reverse=True)
             yield f"data: {json.dumps({'type': 'done', 'results': results})}\n\n"
         except Exception as e:
             import traceback
@@ -717,17 +732,21 @@ async def search_ai_stream(q: str, limit: int = 50):
     )
 
 
-async def _run_ai_search(inner_q: str, limit: int, config, fetcher):
+async def _run_ai_search(inner_q: str, limit: int, config, fetcher, from_date: str = None, to_date: str = None, sort_by: str = "relevance"):
     """Core AI search logic. Returns list of paper dicts."""
 
     async def tool_executor_sync(name, args):
-        return await _mcp_tool_executor(fetcher, name, args)
+        return await _mcp_tool_executor(fetcher, name, args, from_date=from_date, to_date=to_date, sort_by=sort_by)
 
-    final_ids = await analyzer.ai_search_with_mcp_tools(
+    task_result = await analyzer.ai_search_with_mcp_tools(
         inner_q, tool_executor_sync, config, limit=limit, on_progress=None
     )
+    if isinstance(task_result, tuple):
+        final_ids, _, _ = task_result
+    else:
+        final_ids = task_result or []
     results = []
-    for pid in (final_ids or [])[:limit]:
+    for pid in final_ids:
         try:
             full = fetcher.load_paper(pid)
             results.append({
@@ -752,14 +771,17 @@ async def _run_ai_search(inner_q: str, limit: int, config, fetcher):
             })
         except Exception:
             continue
+    if sort_by == "latest":
+        results.sort(key=lambda x: (_parse_sort_date(x.get("published_date", "")) or datetime.fromtimestamp(0, tz=timezone.utc),), reverse=True)
+    else:
+        results.sort(key=lambda x: (x.get("is_relevant") is True, x.get("search_score", 0)), reverse=True)
     return results
 
 
 @app.get("/search/ai")
-async def search_ai_nostream(q: str, limit: int = 50):
+async def search_ai_nostream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance"):
     """
-    Non-streaming AI search. Use when stream is aborted (e.g. tab backgrounded).
-    Returns JSON directly. Same logic as /search/ai/stream.
+    Non-streaming AI search. from_date/to_date: YYYY-MM-DD. sort_by: relevance or latest.
     """
     config = Config.load(config_path)
     inner_q = q.strip()
@@ -769,7 +791,7 @@ async def search_ai_nostream(q: str, limit: int = 50):
             break
     if not inner_q:
         return []
-    results = await _run_ai_search(inner_q, limit, config, fetcher)
+    results = await _run_ai_search(inner_q, limit, config, fetcher, from_date=from_date, to_date=to_date, sort_by=sort_by)
     return results
 
 
@@ -888,7 +910,8 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
                     return d or _parse_sort_date(r.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
                 results.sort(key=_get_result_date, reverse=True)
             else:
-                results.sort(key=lambda x: x.get("search_score", 0), reverse=True)
+                # Relevance first (is_relevant=True), then by search match score
+                results.sort(key=lambda x: (x.get("is_relevant") is True, x.get("search_score", 0)), reverse=True)
             return results
 
     # Fallback: metadata scan (JSON store or FTS returned empty)
@@ -1012,7 +1035,8 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance"):
             return d or _parse_sort_date(r.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
         results.sort(key=_get_result_date, reverse=True)
     else:
-        results.sort(key=lambda x: x["search_score"], reverse=True)
+        # Relevance first (is_relevant=True), then by search match score
+        results.sort(key=lambda x: (x.get("is_relevant") is True, x.get("search_score", 0)), reverse=True)
     
     return results[:limit]
 

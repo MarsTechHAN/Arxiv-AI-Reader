@@ -583,6 +583,7 @@ class SQLitePaperStore:
                     "url": paper.url,
                     "one_line_summary": paper.one_line_summary,
                     "detailed_summary": (paper.detailed_summary or "")[:500],
+                    "published_date": getattr(paper, "published_date", "") or "",
                 })
             except Exception:
                 continue

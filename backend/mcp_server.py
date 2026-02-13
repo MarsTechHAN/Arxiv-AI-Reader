@@ -9,6 +9,46 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+# Optional date parser for date range filter
+def _parse_date(s):
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        from dateutil import parser as date_parser
+        from datetime import timezone
+        dt = date_parser.parse(s.strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _paper_in_date_range(meta_or_item, from_date_dt, to_date_dt):
+    """Check if paper's published_date is within [from_date, to_date]."""
+    if from_date_dt is None and to_date_dt is None:
+        return True
+    pd = meta_or_item.get("published_date", "") or ""
+    if not pd:
+        return True
+    try:
+        from dateutil import parser as date_parser
+        from datetime import timezone
+        dt = date_parser.parse(pd)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        if from_date_dt and dt < from_date_dt:
+            return False
+        if to_date_dt and dt > to_date_dt:
+            return False
+        return True
+    except Exception:
+        return True
+
 # Use backend-relative data path
 BACKEND_DIR = Path(__file__).parent
 DATA_DIR = str(BACKEND_DIR / "data" / "papers")
@@ -32,15 +72,46 @@ def _calculate_similarity(query: str, text: str) -> float:
 
 
 def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
-               search_full_text: bool = True, search_generated_only: bool = False) -> list:
+               search_full_text: bool = True, search_generated_only: bool = False,
+               from_date: Optional[str] = None, to_date: Optional[str] = None,
+               sort_by: str = "relevance", skip: int = 0) -> list:
     """Core search logic. Uses store FTS when available (SQLite), else in-memory scan."""
+    from_date_dt = _parse_date(from_date) if from_date else None
+    to_date_dt = _parse_date(to_date) if to_date else None
+
+    fetch_limit = limit + skip
     store = getattr(fetcher, "store", None)
     if store and hasattr(store, "search") and not search_generated_only:
-        fts_results = store.search(q.strip(), limit=limit, search_full_text=search_full_text)
+        fts_results = store.search(q.strip(), limit=fetch_limit * 3 if (from_date_dt or to_date_dt) else fetch_limit, search_full_text=search_full_text)
         if fts_results:
+            filtered = [r for r in fts_results if _paper_in_date_range(r, from_date_dt, to_date_dt)]
+            if from_date_dt or to_date_dt:
+                for r in filtered:
+                    if "published_date" not in r:
+                        try:
+                            p = fetcher.load_paper(r["id"])
+                            r["published_date"] = getattr(p, "published_date", "") or ""
+                        except Exception:
+                            r["published_date"] = ""
+            if sort_by == "latest":
+                def _sort_key(r):
+                    pd = r.get("published_date", "") or ""
+                    try:
+                        from dateutil import parser as date_parser
+                        from datetime import timezone
+                        dt = date_parser.parse(pd) if pd else None
+                        if dt and dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt or __import__("datetime").datetime.fromtimestamp(0, tz=timezone.utc)
+                    except Exception:
+                        return __import__("datetime").datetime.fromtimestamp(0, tz=__import__("datetime").timezone.utc)
+                filtered.sort(key=_sort_key, reverse=True)
+            else:
+                filtered.sort(key=lambda x: x.get("search_score", 0), reverse=True)
+            filtered = filtered[skip:skip + limit]
             if ids_only:
-                return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in fts_results]
-            return fts_results
+                return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in filtered]
+            return filtered
 
     metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
     results = []
@@ -74,6 +145,8 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
 
     for meta in metadata_list:
         if meta.get('is_hidden', False):
+            continue
+        if not _paper_in_date_range(meta, from_date_dt, to_date_dt):
             continue
         paper_id = meta.get('id', '')
         title = meta.get('title', '')
@@ -112,7 +185,7 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
 
         try:
             paper = fetcher.load_paper(paper_id)
-            item = {"id": paper.id, "search_score": total_score}
+            item = {"id": paper.id, "search_score": total_score, "published_date": getattr(paper, "published_date", "") or ""}
             if not ids_only:
                 item.update({
                     "title": paper.title,
@@ -126,8 +199,14 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
         except Exception:
             continue
 
-    results.sort(key=lambda x: x["search_score"], reverse=True)
-    return results[:limit]
+    if sort_by == "latest":
+        from datetime import datetime, timezone
+        def _dt_key(x):
+            return _parse_date(x.get("published_date", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
+        results.sort(key=_dt_key, reverse=True)
+    else:
+        results.sort(key=lambda x: x["search_score"], reverse=True)
+    return results[skip:skip + limit]
 
 
 mcp = FastMCP("arXiv AI Reader", json_response=True)
@@ -139,38 +218,70 @@ def search_papers(
     limit: int = 50,
     ids_only: bool = False,
     search_full_text: bool = True,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    sort_by: str = "relevance",
+    skip: int = 0,
 ) -> list:
     """
     Search papers by keyword, arXiv ID, title, author, abstract, or AI summaries.
     Uses metadata cache (fast). search_full_text=True uses preview (~2k chars); for
     real full-text search use search_full_text tool.
+    from_date, to_date: optional ISO date (e.g. 2024-01-01) to filter by published_date.
+    sort_by: "relevance" (default) or "latest".
     """
     fetcher = _get_fetcher()
-    return _do_search(query, fetcher, limit=limit, ids_only=ids_only, search_full_text=search_full_text, search_generated_only=False)
+    return _do_search(query, fetcher, limit=limit, ids_only=ids_only, search_full_text=search_full_text,
+                     search_generated_only=False, from_date=from_date, to_date=to_date, sort_by=sort_by, skip=skip)
 
 
 @mcp.tool()
-def search_generated_content(query: str, limit: int = 50, ids_only: bool = False) -> list:
+def search_generated_content(
+    query: str,
+    limit: int = 50,
+    ids_only: bool = False,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    sort_by: str = "relevance",
+    skip: int = 0,
+) -> list:
     """
     Search only within AI-generated content: one_line_summary, detailed_summary, tags, extracted_keywords.
     Use when you want to find papers by AI analysis, not original text.
+    from_date, to_date: optional ISO date. sort_by: "relevance" or "latest".
     """
     fetcher = _get_fetcher()
-    return _do_search(query, fetcher, limit=limit, ids_only=ids_only, search_full_text=False, search_generated_only=True)
+    return _do_search(query, fetcher, limit=limit, ids_only=ids_only, search_full_text=False,
+                     search_generated_only=True, from_date=from_date, to_date=to_date, sort_by=sort_by, skip=skip)
 
 
-def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = False, max_scan: int = 2000) -> list:
+def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = False, max_scan: int = 2000,
+                         from_date: Optional[str] = None, to_date: Optional[str] = None,
+                         sort_by: str = "relevance", skip: int = 0) -> list:
     """
     Search within actual full paper html_content.
     Uses store FTS when available (SQLite), else loads each paper from disk.
     """
+    from_date_dt = _parse_date(from_date) if from_date else None
+    to_date_dt = _parse_date(to_date) if to_date else None
+
+    fetch_limit = limit + skip
     store = getattr(fetcher, "store", None)
     if store and hasattr(store, "search"):
-        fts_results = store.search(q.strip(), limit=limit, search_full_text=True)
+        fts_results = store.search(q.strip(), limit=fetch_limit * 3 if (from_date_dt or to_date_dt) else fetch_limit, search_full_text=True)
         if fts_results:
+            filtered = [r for r in fts_results if _paper_in_date_range(r, from_date_dt, to_date_dt)]
+            if sort_by == "latest":
+                from datetime import datetime, timezone
+                def _dt_key(r):
+                    return _parse_date(r.get("published_date", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
+                filtered.sort(key=_dt_key, reverse=True)
+            else:
+                filtered.sort(key=lambda x: x.get("search_score", 0), reverse=True)
+            filtered = filtered[skip:skip + limit]
             if ids_only:
-                return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in fts_results]
-            return fts_results
+                return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in filtered]
+            return filtered
 
     q_lower = q.lower()
     metadata_list = fetcher.list_papers_metadata(max_files=max_scan, check_stale=True)
@@ -178,6 +289,8 @@ def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = Fals
 
     for meta in metadata_list[:max_scan]:
         if meta.get('is_hidden', False):
+            continue
+        if not _paper_in_date_range(meta, from_date_dt, to_date_dt):
             continue
         paper_id = meta.get('id', '')
         try:
@@ -191,7 +304,7 @@ def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = Fals
             if score <= 0:
                 continue
 
-            item = {"id": paper.id, "search_score": score}
+            item = {"id": paper.id, "search_score": score, "published_date": getattr(paper, "published_date", "") or ""}
             if not ids_only:
                 item.update({
                     "title": paper.title,
@@ -203,18 +316,35 @@ def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = Fals
         except Exception:
             continue
 
-    results.sort(key=lambda x: x["search_score"], reverse=True)
-    return results[:limit]
+    if sort_by == "latest":
+        from datetime import datetime, timezone
+        def _dt_key(x):
+            return _parse_date(x.get("published_date", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
+        results.sort(key=_dt_key, reverse=True)
+    else:
+        results.sort(key=lambda x: x["search_score"], reverse=True)
+    return results[skip:skip + limit]
 
 
 @mcp.tool()
-def search_full_text(query: str, limit: int = 50, ids_only: bool = False, max_scan: int = 2000) -> list:
+def search_full_text(
+    query: str,
+    limit: int = 50,
+    ids_only: bool = False,
+    max_scan: int = 2000,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    sort_by: str = "relevance",
+    skip: int = 0,
+) -> list:
     """
     Search within ACTUAL full paper text (html_content + abstract).
-    Loads papers from disk - slower but searches entire content. Use max_scan to limit papers scanned.
+    Loads papers from disk - slower but searches entire content.
+    from_date, to_date: optional ISO date. sort_by: "relevance" or "latest".
     """
     fetcher = _get_fetcher()
-    return _do_search_full_text(query, fetcher, limit=limit, ids_only=ids_only, max_scan=max_scan)
+    return _do_search_full_text(query, fetcher, limit=limit, ids_only=ids_only, max_scan=max_scan,
+                               from_date=from_date, to_date=to_date, sort_by=sort_by, skip=skip)
 
 
 @mcp.tool()
@@ -306,12 +436,21 @@ async def get_paper_full_text(arxiv_id: str) -> dict:
 
 
 @mcp.tool()
-def get_paper_ids_by_query(query: str, limit: int = 50) -> list:
+def get_paper_ids_by_query(
+    query: str,
+    limit: int = 50,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    sort_by: str = "relevance",
+    skip: int = 0,
+) -> list:
     """
-    Search papers and return only arXiv IDs. Fast way to get IDs for follow-up get_paper calls.
+    Search papers and return only arXiv IDs.
+    from_date, to_date: optional ISO date. sort_by: "relevance" or "latest".
     """
     fetcher = _get_fetcher()
-    results = _do_search(query, fetcher, limit=limit, ids_only=True)
+    results = _do_search(query, fetcher, limit=limit, ids_only=True,
+                        from_date=from_date, to_date=to_date, sort_by=sort_by, skip=skip)
     return [r["id"] for r in results]
 
 

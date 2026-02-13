@@ -200,6 +200,13 @@ body.modal-open {
     border-color: var(--primary);
 }
 
+.search-filters {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-shrink: 0;
+}
+
 /* Timeline */
 .timeline {
     margin-top: 40px;
@@ -993,6 +1000,10 @@ body.modal-open {
     /* Search bar adjustments */
     .search-bar-wrapper {
         flex-direction: column;
+    }
+
+    .search-filters {
+        width: 100%;
     }
     
     .search-input {

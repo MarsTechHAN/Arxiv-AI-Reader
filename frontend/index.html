@@ -59,10 +59,12 @@
                     class="search-input" 
                     placeholder="搜索论文、ai: 语义搜索，或拖入 PDF 文件..."
                 >
-                <select id="sortSelect" class="sort-select">
-                    <option value="relevance">按相关性排序</option>
-                    <option value="latest">按最新排序</option>
-                </select>
+                <div class="search-filters" id="searchFilters">
+                    <select id="sortSelect" class="sort-select">
+                        <option value="relevance">按相关性排序</option>
+                        <option value="latest">按最新排序</option>
+                    </select>
+                </div>
                 <button id="clearKeywordBtn" class="btn btn-secondary" style="display: none;">清除筛选</button>
             </div>
         </div>

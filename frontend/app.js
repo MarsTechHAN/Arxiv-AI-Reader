@@ -696,7 +696,8 @@ async function searchPapersAiStream(query) {
     };
 
     const doStreamSearch = async () => {
-        const response = await fetch(`${API_BASE}/search/ai/stream?q=${encodeURIComponent(query)}&limit=50`);
+        const params = new URLSearchParams({ q: query, limit: '50', sort_by: (currentSortBy || 'relevance') });
+        const response = await fetch(`${API_BASE}/search/ai/stream?${params}`);
         if (!response.ok) throw new Error(response.statusText);
         if (!response.body) throw new Error('No stream');
         const reader = response.body.getReader();
@@ -746,7 +747,8 @@ async function searchPapersAiStream(query) {
 
     const doNonStreamSearch = async () => {
         addThinking('正在使用备用模式搜索（适合后台标签页）...');
-        const response = await fetch(`${API_BASE}/search/ai?q=${encodeURIComponent(query)}&limit=50`);
+        const params = new URLSearchParams({ q: query, limit: '50', sort_by: (currentSortBy || 'relevance') });
+        const response = await fetch(`${API_BASE}/search/ai?${params}`);
         if (!response.ok) throw new Error(response.statusText);
         return await response.json();
     };
