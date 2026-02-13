@@ -79,8 +79,7 @@ function setupEventListeners() {
             if (query) {
                 searchPapers(query);
             } else {
-                currentPage = 0;
-                loadPapers();
+                resetToDefaultState();
             }
         }
     });
@@ -252,22 +251,10 @@ function setupEventListeners() {
         loadPapers(currentPage);
     });
     
-    // Header title click - clear search and refresh
+    // Header title click - reset to default state
     const headerTitle = document.getElementById('headerTitle');
     if (headerTitle) {
-        headerTitle.addEventListener('click', () => {
-            // Clear search input
-            searchInput.value = '';
-            // Clear keyword filter
-            currentKeyword = null;
-            clearKeywordBtn.style.display = 'none';
-            // Clear search state
-            clearSearchState();
-            // Reset to first page
-            currentPage = 0;
-            // Reload papers
-            loadPapers();
-        });
+        headerTitle.addEventListener('click', () => resetToDefaultState());
     }
     
     // Tab switching
@@ -554,6 +541,7 @@ async function uploadAndParsePdf(file) {
 // Search Papers
 async function searchPapers(query) {
     const isAiSearch = /^ai[:：]\s*/i.test(query);
+    clearSearchState();  // Invalidate stale cache before new search
     showLoading(true);
     currentPage = 0;
     hasMorePapers = false;
@@ -1944,6 +1932,19 @@ function clearSearchState() {
     try {
         sessionStorage.removeItem(_searchStateKey(currentTab));
     } catch (_) {}
+}
+
+// Reset to default state: no search, no keyword filter, clear cache, reload papers
+function resetToDefaultState() {
+    if (searchInput) searchInput.value = '';
+    currentKeyword = null;
+    if (clearKeywordBtn) clearKeywordBtn.style.display = 'none';
+    clearSearchState();
+    const statusContainer = document.getElementById('searchStatusContainer');
+    if (statusContainer) statusContainer.style.display = 'none';
+    currentPage = 0;
+    hasMorePapers = true;
+    loadPapers(0, true);
 }
 
 // Restore search state on page load for current tab. Returns true if results were restored.
