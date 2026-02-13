@@ -17,6 +17,10 @@ import httpx
 from models import Paper, QAPair, Config
 from typing import Callable
 
+# Prevent duplicate Stage 2 for same paper when triggered from multiple places (search, startup, etc)
+_stage2_in_flight: set = set()
+_stage2_lock: asyncio.Lock = asyncio.Lock()
+
 
 class DeepSeekAnalyzer:
     """
@@ -567,7 +571,18 @@ Search the paper corpus. Call multiple search tools in parallel if needed. Merge
         """
         if not paper.is_relevant:
             return paper
-        
+
+        async with _stage2_lock:
+            if paper.id in _stage2_in_flight:
+                return paper  # Skip: another task is processing this paper
+            _stage2_in_flight.add(paper.id)
+        try:
+            return await self._stage2_qa_impl(paper, config)
+        finally:
+            _stage2_in_flight.discard(paper.id)
+
+    async def _stage2_qa_impl(self, paper: Paper, config: Config) -> Paper:
+        """Internal Stage 2 implementation (called by stage2_qa with in-flight guard)."""
         # Build cache prefix (system prompt + paper content)
         # This stays the same for all questions -> KV cache hit
         # Limit content to fit within model's token limit
