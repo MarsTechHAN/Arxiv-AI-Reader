@@ -32,6 +32,8 @@ from fetcher import ArxivFetcher
 from analyzer import DeepSeekAnalyzer
 from default_config import DEFAULT_CONFIG
 
+# Scan all papers (no limit)
+SCAN_ALL = 999999
 
 # Background task reference
 background_task = None
@@ -233,9 +235,8 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
     except ImportError:
         user_id, config = None, await asyncio.to_thread(Config.load, config_path)
 
-    # Step 1: Scan metadata first (fast - only reads minimal JSON fields)
-    max_scan = 10000 if starred_only_bool else 5000
-    metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, max_scan, True)
+    # Step 1: Scan all metadata (no limit)
+    metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, SCAN_ALL, True)
     overlays = {}
     if user_id:
         try:
@@ -255,7 +256,7 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
         print(f"[DEBUG] Total metadata: {len(metadata_list)}, starred: {total_starred}, hidden: {total_hidden}")
         if total_starred == 0 and len(metadata_list) > 0:
             await asyncio.to_thread(fetcher._refresh_metadata_cache)
-            metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, max_scan, False)
+            metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, SCAN_ALL, False)
             total_starred = sum(1 for m in metadata_list if m.get('is_starred', False))
             print(f"[DEBUG] After refresh: {len(metadata_list)} total, {total_starred} starred")
     
@@ -269,12 +270,20 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
         # Main list: show ALL papers (starred + non-starred), only exclude hidden
         filtered_metadata = [m for m in metadata_list if not m.get('is_hidden', False)]
     
-    # Step 3: Filter by keyword if provided (still using metadata)
+    # Step 3: Filter by keyword if provided (match title, abstract, keywords, etc.)
     if keyword:
-        filtered_metadata = [
-            m for m in filtered_metadata 
-            if keyword.lower() in ' '.join(m.get('extracted_keywords', [])).lower()
-        ]
+        kw_lower = keyword.lower()
+        def _keyword_match(m):
+            searchable = ' '.join([
+                m.get('title', ''),
+                m.get('abstract', ''),
+                m.get('one_line_summary', ''),
+                m.get('detailed_summary', ''),
+                ' '.join(m.get('extracted_keywords', [])),
+                ' '.join(m.get('tags', [])),
+            ]).lower()
+            return kw_lower in searchable
+        filtered_metadata = [m for m in filtered_metadata if _keyword_match(m)]
     
     # Step 4: Sort by relevance or latest (using metadata)
     if sort_by == "relevance":
@@ -738,7 +747,7 @@ async def _mcp_tool_executor(fetcher, name: str, args: dict,
         )
         return [_mcp_format_search_result(p) for p in raw]
     elif name == "search_full_text":
-        max_scan = min(int(args.get("max_scan", 1500)), 2000)
+        max_scan = min(max(0, int(args.get("max_scan", SCAN_ALL))), SCAN_ALL)
         raw = await asyncio.to_thread(
             _do_search_full_text, q, fetcher, limit, False, max_scan, fd, td, sb, skip_val,
             category=category, starred_only=starred_only
@@ -1047,18 +1056,48 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
     # Try store FTS first (SQLite), else fall back to metadata scan
     store = getattr(fetcher, "store", None)
     if store and hasattr(store, "search"):
-        fts_limit = limit * 5 if tab_filter else limit
+        # Request more FTS results; boost title matches (FTS bm25 underweights title)
+        fts_limit = max(limit * 50, 500)
         fts_results = await asyncio.to_thread(store.search, q, fts_limit, True)
         if fts_results:
             config = await asyncio.to_thread(Config.load, config_path)
-            results = []
-            for r in fts_results:
+            q_lower = q.strip().lower()
+            # Use metadata for title boost and sort key (avoid loading all papers)
+            metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, SCAN_ALL, False)
+            id_to_meta = {m.get("id"): m for m in metadata_list}
+            # Prioritize title matches (FTS bm25 underweights title)
+            def _parse_dt(s):
+                if not s:
+                    return datetime.fromtimestamp(0, tz=timezone.utc)
                 try:
-                    paper = await asyncio.to_thread(fetcher.load_paper, r["id"])
-                    if tab_filter and not _paper_matches_tab_filter(paper, category, starred_only_bool):
+                    dt = date_parser.parse(s)
+                    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+                except Exception:
+                    return datetime.fromtimestamp(0, tz=timezone.utc)
+            scored = []
+            for r in fts_results:
+                if tab_filter:
+                    meta = id_to_meta.get(r["id"], {})
+                    if not _paper_matches_tab_filter(meta, category, starred_only_bool):
                         continue
-                    if len(results) >= limit:
-                        break
+                meta = id_to_meta.get(r["id"], {})
+                score = r.get("search_score", 0)
+                title_match = bool(q_lower and q_lower in (meta.get("title") or "").lower())
+                if title_match:
+                    score += 10.0
+                pub_dt = _parse_dt(meta.get("published_date", ""))
+                # Sort: title matches first; within title matches: by date (newest) or score
+                if sort_by == "latest":
+                    sort_key = (0 if title_match else 1, -pub_dt.timestamp(), -score)
+                else:
+                    sort_key = (0 if title_match else 1, -pub_dt.timestamp(), -score)
+                scored.append((sort_key, score, r["id"]))
+            scored.sort(key=lambda x: x[0])
+            # Load only top papers for response
+            results = []
+            for _sort_key, score, pid in scored[:limit]:
+                try:
+                    paper = await asyncio.to_thread(fetcher.load_paper, pid)
                     results.append({
                         "id": paper.id,
                         "title": paper.title,
@@ -1077,25 +1116,24 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
                         "detailed_summary": paper.detailed_summary,
                         "tags": getattr(paper, "tags", []),
                         "stage2_pending": _stage2_status(paper, config)[1],
-                        "search_score": r.get("search_score", 0),
+                        "search_score": score,
                     })
                 except Exception as e:
-                    print(f"Warning: Failed to load paper {r.get('id', '')}: {e}")
+                    print(f"Warning: Failed to load paper {pid}: {e}")
+            # Results already sorted by (title_match, date/score); for latest, re-sort by date
             if sort_by == "latest":
                 def _get_result_date(r):
                     d = _parse_sort_date(r.get("published_date", ""))
                     return d or _parse_sort_date(r.get("created_at", "")) or datetime.fromtimestamp(0, tz=timezone.utc)
                 results.sort(key=_get_result_date, reverse=True)
-            else:
-                # Relevance first (is_relevant=True), then by search match score
-                results.sort(key=lambda x: (x.get("is_relevant") is True, x.get("search_score", 0)), reverse=True)
             return results
 
     # Fallback: metadata scan (JSON store or FTS returned empty)
+    # Default search must match at least: title, authors, original abstract, AI-generated summaries
     config = await asyncio.to_thread(Config.load, config_path)
     from search_utils import tokenize_query
     query_token_set = set(tokenize_query(q))
-    metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, 5000, True)
+    metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, SCAN_ALL, True)
     if tab_filter:
         metadata_list = [m for m in metadata_list if _paper_matches_tab_filter(m, category, starred_only_bool)]
 
@@ -1108,15 +1146,15 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
         # Get cached data
         paper_id = meta.get('id', '')
         title = meta.get('title', '')  # May not be in cache, will load if needed
-        abstract = meta.get('abstract', '')
-        detailed_summary = meta.get('detailed_summary', '')
-        one_line_summary = meta.get('one_line_summary', '')
+        abstract = meta.get('abstract', '')  # Original abstract
+        detailed_summary = meta.get('detailed_summary', '')  # AI-generated detailed summary
+        one_line_summary = meta.get('one_line_summary', '')  # AI-generated one-line summary
         preview_text = meta.get('preview_text', '')
         authors = meta.get('authors', [])
         tags = meta.get('tags', [])
         extracted_keywords = meta.get('extracted_keywords', [])
         
-        # Calculate similarity scores
+        # Core search fields: title, authors, abstract, AI summaries
         title_score = 0.0
         abstract_score = 0.0
         summary_score = 0.0
@@ -1125,43 +1163,35 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
         author_score = 0.0
         tag_score = 0.0
         
-        # Title matching (highest weight)
+        # 1. Title
         if title:
-            title_score = _calculate_similarity(q, title) * 2.0  # Double weight for title
+            title_score = _calculate_similarity(q, title) * 2.0
         else:
-            # Load paper to get title if not cached
             try:
                 paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
                 title = paper.title
                 title_score = _calculate_similarity(q, title) * 2.0
-            except:
+            except Exception:
                 pass
         
-        # Abstract matching
+        # 2. Original abstract
         if abstract:
             abstract_score = _calculate_similarity(q, abstract)
         
-        # Detailed summary matching (AI-generated)
+        # 3. AI-generated summaries (detailed + one-line)
         if detailed_summary:
-            summary_score = _calculate_similarity(q, detailed_summary) * 1.5  # Higher weight
-        
-        # One-line summary matching (AI-generated)
+            summary_score = _calculate_similarity(q, detailed_summary) * 1.5
         if one_line_summary:
             one_line_score = _calculate_similarity(q, one_line_summary) * 1.2
         
-        # Full-text matching (preview: abstract + first ~2000 chars of paper)
+        # 4. Authors
+        authors_text = ' '.join(authors or [])
+        if authors_text:
+            author_score = _calculate_similarity(q, authors_text) * 1.2
+        
+        # Extended: full-text preview, tags
         if preview_text:
             fulltext_score = _calculate_similarity(q, preview_text) * 0.8
-        
-        # Author matching
-        authors_text = ' '.join(authors).lower()
-        if authors_text:
-            author_match = any(
-                any(word in author.lower() for word in query_token_set)
-                for author in authors
-            )
-            if author_match:
-                author_score = 0.8  # Fixed high score for author match
         
         # Tag matching
         tags_text = ' '.join(tags + extracted_keywords).lower()
@@ -1169,6 +1199,20 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
             tag_score = _calculate_similarity(q, tags_text) * 1.2
         
         # Combined score
+        # Substring fallback: ensure substring match in title/abstract is never missed
+        substring_bonus = 0.0
+        q_lower = q.lower()
+        if q_lower and not title:
+            try:
+                p = await asyncio.to_thread(fetcher.load_paper, paper_id)
+                title = p.title or ''
+            except Exception:
+                pass
+        if title and q_lower in title.lower():
+            substring_bonus = 1.5
+        elif abstract and q_lower in abstract.lower():
+            substring_bonus = 0.8
+
         total_score = (
             title_score +
             abstract_score +
@@ -1176,9 +1220,10 @@ async def search_papers(q: str, limit: int = 50, sort_by: str = "relevance", cat
             one_line_score +
             fulltext_score +
             author_score +
-            tag_score
+            tag_score +
+            substring_bonus
         )
-        
+
         # Only include papers with non-zero score
         if total_score > 0:
             # Load full paper for response (only if needed)
@@ -1344,7 +1389,7 @@ async def reprocess_negative_keyword_blocked_endpoint(background_tasks: Backgrou
 async def reclassify_all_starred_papers(config: Config):
     """Re-classify all starred papers when categories change. DB/IO runs in thread pool."""
     try:
-        metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, 10000, True)
+        metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, SCAN_ALL, True)
         starred = [m for m in metadata_list if m.get('is_starred', False)]
         if not starred:
             print("✓ No starred papers to reclassify")
@@ -1372,7 +1417,7 @@ async def reprocess_negative_keyword_blocked():
     """Re-run Stage 1 for papers auto-blocked by old negative keyword strategy."""
     try:
         config = await asyncio.to_thread(Config.load, config_path)
-        all_papers = await asyncio.to_thread(fetcher.list_papers, 0, 10000)
+        all_papers = await asyncio.to_thread(fetcher.list_papers, 0, SCAN_ALL)
         blocked = [p for p in all_papers if NEGATIVE_KEYWORD_BLOCK_PATTERN in (p.one_line_summary or "")]
         if not blocked:
             print("✓ No papers to reprocess (none were auto-blocked by negative keywords)")
@@ -1393,8 +1438,8 @@ async def check_pending_deep_analysis():
     """Check for papers needing Stage 2. Process with priority on startup."""
     try:
         config = await asyncio.to_thread(Config.load, config_path)
-        all_papers = await asyncio.to_thread(fetcher.list_papers, 0, 10000)
-        
+        all_papers = await asyncio.to_thread(fetcher.list_papers, 0, SCAN_ALL)
+
         # Find papers needing Stage 2 (no summary or incomplete preset Q&As)
         pending_papers = [
             p for p in all_papers 

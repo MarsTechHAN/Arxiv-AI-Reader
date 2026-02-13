@@ -418,14 +418,15 @@ class SQLitePaperStore:
             print(f"✓ Migration complete: {migrated} papers")
 
     def _fts_content(self, paper: Paper) -> str:
+        """FTS index: title, authors, original abstract, AI summaries (required); plus preview, html, tags, keywords."""
         parts = [
             paper.title or "",
             paper.abstract or "",
-            paper.preview_text or "",
-            paper.html_content or "",
+            " ".join(paper.authors or []),
             paper.one_line_summary or "",
             paper.detailed_summary or "",
-            " ".join(paper.authors or []),
+            paper.preview_text or "",
+            paper.html_content or "",
             " ".join(getattr(paper, "tags", []) or []),
             " ".join(paper.extracted_keywords or []),
         ]
@@ -596,10 +597,11 @@ class SQLitePaperStore:
                 "SELECT 1 FROM sqlite_master WHERE name='papers_fts_content'"
             ).fetchone()
             if use_contentless:
+                # FTS5 bm25 returns negative scores; best matches are closest to 0
                 rows = conn.execute(
                     """SELECT rowid, bm25(papers_fts) as score
                        FROM papers_fts WHERE papers_fts MATCH ?
-                       ORDER BY score LIMIT ?""",
+                       ORDER BY score DESC LIMIT ?""",
                     (q_clean, limit),
                 ).fetchall()
                 pid_list = []
@@ -613,7 +615,7 @@ class SQLitePaperStore:
                 rows = conn.execute(
                     """SELECT paper_id, bm25(papers_fts) as score
                        FROM papers_fts WHERE papers_fts MATCH ?
-                       ORDER BY score LIMIT ?""",
+                       ORDER BY score DESC LIMIT ?""",
                     (q_clean, limit),
                 ).fetchall()
         except sqlite3.OperationalError as e:

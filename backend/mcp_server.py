@@ -99,7 +99,7 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
         if fts_results:
             filtered = [r for r in fts_results if _paper_in_date_range(r, from_date_dt, to_date_dt)]
             if tab_filter:
-                meta_list = fetcher.list_papers_metadata(max_files=5000, check_stale=False)
+                meta_list = fetcher.list_papers_metadata(max_files=999999, check_stale=False)
                 id_to_meta = {m["id"]: m for m in meta_list}
                 filtered = [r for r in filtered if _meta_matches_tab(id_to_meta.get(r["id"], {}), category, starred_only)]
             if from_date_dt or to_date_dt:
@@ -130,13 +130,11 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
                 return [{"id": r["id"], "search_score": r.get("search_score", 0)} for r in filtered]
             return filtered
 
-    metadata_list = fetcher.list_papers_metadata(max_files=5000, check_stale=True)
+    metadata_list = fetcher.list_papers_metadata(max_files=999999, check_stale=True)
     if tab_filter:
         metadata_list = [m for m in metadata_list if _meta_matches_tab(m, category, starred_only)]
     results = []
     arxiv_id_pattern = r'^\d{4}\.\d{4,5}(v\d+)?$'
-    from search_utils import tokenize_query
-    query_token_set = set(tokenize_query(q))
 
     if re.match(arxiv_id_pattern, q.strip()):
         arxiv_id = q.strip()
@@ -186,15 +184,14 @@ def _do_search(q: str, fetcher, limit: int = 50, ids_only: bool = False,
             if not _calculate_similarity(q, searchable):
                 continue
 
+        # Core fields: title, authors, abstract, AI summaries
         title_score = _calculate_similarity(q, title) * 2.0 if title else 0.0
         abstract_score = _calculate_similarity(q, abstract) if abstract else 0.0
         summary_score = _calculate_similarity(q, detailed_summary) * 1.5 if detailed_summary else 0.0
         one_line_score = _calculate_similarity(q, one_line_summary) * 1.2 if one_line_summary else 0.0
+        authors_text = ' '.join(authors or [])
+        author_score = _calculate_similarity(q, authors_text) * 1.2 if authors_text else 0.0
         fulltext_score = _calculate_similarity(q, preview_text) * 0.8 if preview_text and search_full_text else 0.0
-        author_score = 0.8 if any(
-            any(w in a.lower() for w in query_token_set)
-            for a in authors
-        ) else 0.0
         tags_text = ' '.join(tags + extracted_keywords).lower()
         tag_score = _calculate_similarity(q, tags_text) * 1.2 if tags_text else 0.0
 
@@ -274,7 +271,7 @@ def search_generated_content(
                      search_generated_only=True, from_date=from_date, to_date=to_date, sort_by=sort_by, skip=skip)
 
 
-def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = False, max_scan: int = 2000,
+def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = False, max_scan: int = 999999,
                          from_date: Optional[str] = None, to_date: Optional[str] = None,
                          sort_by: str = "relevance", skip: int = 0,
                          category: Optional[str] = None, starred_only: bool = False) -> list:
@@ -294,7 +291,7 @@ def _do_search_full_text(q: str, fetcher, limit: int = 50, ids_only: bool = Fals
         if fts_results:
             filtered = [r for r in fts_results if _paper_in_date_range(r, from_date_dt, to_date_dt)]
             if tab_filter:
-                meta_list = fetcher.list_papers_metadata(max_files=5000, check_stale=False)
+                meta_list = fetcher.list_papers_metadata(max_files=999999, check_stale=False)
                 id_to_meta = {m["id"]: m for m in meta_list}
                 filtered = [r for r in filtered if _meta_matches_tab(id_to_meta.get(r["id"], {}), category, starred_only)]
             if sort_by == "latest":
@@ -359,7 +356,7 @@ def search_full_text(
     query: str,
     limit: int = 50,
     ids_only: bool = False,
-    max_scan: int = 2000,
+    max_scan: int = 999999,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     sort_by: str = "relevance",
