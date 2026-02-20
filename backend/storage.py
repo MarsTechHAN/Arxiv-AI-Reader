@@ -22,6 +22,40 @@ DEFAULT_DATA_DIR = str(DATA_ROOT / "papers")
 DEFAULT_DB_PATH = str(DATA_ROOT / "papers.db")
 
 
+def _merge_analysis_into(keep_paper: Paper, from_paper: Paper) -> bool:
+    """Copy analysis fields from from_paper into keep_paper when keep lacks them."""
+    changed = False
+    if keep_paper.is_relevant is None and from_paper.is_relevant is not None:
+        keep_paper.is_relevant = from_paper.is_relevant
+        changed = True
+    if (keep_paper.relevance_score or 0) == 0 and (from_paper.relevance_score or 0) > 0:
+        keep_paper.relevance_score = from_paper.relevance_score or 0.0
+        changed = True
+    if not (keep_paper.one_line_summary or "").strip() and (from_paper.one_line_summary or "").strip():
+        keep_paper.one_line_summary = from_paper.one_line_summary or ""
+        changed = True
+    if not (keep_paper.detailed_summary or "").strip() and (from_paper.detailed_summary or "").strip():
+        keep_paper.detailed_summary = from_paper.detailed_summary or ""
+        changed = True
+    if not (keep_paper.extracted_keywords or []) and (from_paper.extracted_keywords or []):
+        keep_paper.extracted_keywords = from_paper.extracted_keywords or []
+        changed = True
+    if not (keep_paper.qa_pairs or []) and (from_paper.qa_pairs or []):
+        keep_paper.qa_pairs = from_paper.qa_pairs or []
+        changed = True
+    if not (getattr(keep_paper, "tags", []) or []) and (getattr(from_paper, "tags", []) or []):
+        keep_paper.tags = getattr(from_paper, "tags", []) or []
+        changed = True
+    if not keep_paper.is_starred and from_paper.is_starred:
+        keep_paper.is_starred = True
+        keep_paper.star_category = getattr(from_paper, "star_category", "Other")
+        changed = True
+    if not keep_paper.is_hidden and from_paper.is_hidden:
+        keep_paper.is_hidden = True
+        changed = True
+    return changed
+
+
 def _compress(data: bytes) -> bytes:
     return zlib.compress(data, level=6)
 
@@ -113,7 +147,7 @@ class JSONPaperStore:
             self._metadata_cache.pop(arxiv_id, None)
 
     def merge_duplicate_versions(self) -> int:
-        """Merge duplicate versions: keep latest per base_id, delete others. Returns count deleted."""
+        """Merge duplicate versions: keep latest per base_id, delete others. Preserves analysis from deleted into kept."""
         deleted = 0
         by_base: Dict[str, List[str]] = {}
         for fp in self.data_dir.glob("*.json"):
@@ -124,8 +158,22 @@ class JSONPaperStore:
             if len(ids) <= 1:
                 continue
             keep = max(ids, key=lambda x: self._version_number(x))
+            keep_paper = None
             for pid in ids:
-                if pid != keep:
+                if pid == keep:
+                    try:
+                        keep_paper = Paper.from_dict(json.loads((self.data_dir / f"{pid}.json").read_text()))
+                    except Exception:
+                        pass
+                    break
+            for pid in ids:
+                if pid != keep and keep_paper is not None:
+                    try:
+                        other = Paper.from_dict(json.loads((self.data_dir / f"{pid}.json").read_text()))
+                        if _merge_analysis_into(keep_paper, other):
+                            self.save_paper(keep_paper)
+                    except Exception:
+                        pass
                     self.delete_paper(pid)
                     deleted += 1
         return deleted
@@ -178,6 +226,7 @@ class JSONPaperStore:
             "file_path": file_path,
             "mtime": mtime,
             "title": paper.title,
+            "is_relevant": paper.is_relevant,
             "is_starred": paper.is_starred,
             "is_hidden": paper.is_hidden,
             "star_category": getattr(paper, "star_category", "Other"),
@@ -363,7 +412,7 @@ class SQLitePaperStore:
         conn.commit()
 
     def _merge_duplicate_versions_sqlite(self, conn) -> None:
-        """Merge duplicate versions in SQLite: keep latest per base_id, delete others."""
+        """Merge duplicate versions in SQLite: keep latest per base_id, delete others. Preserves analysis."""
         by_base: Dict[str, List[str]] = {}
         for (pid,) in conn.execute("SELECT id FROM papers").fetchall():
             base = self._get_base_id(pid)
@@ -372,12 +421,38 @@ class SQLitePaperStore:
             if len(ids) <= 1:
                 continue
             keep = max(ids, key=lambda x: self._version_number(x))
-            for pid in ids:
-                if pid != keep:
-                    self._fts_delete(conn, pid)
-                    conn.execute("DELETE FROM papers WHERE id = ?", (pid,))
-                    with self._cache_lock:
-                        self._metadata_cache.pop(pid, None)
+            keep_row = conn.execute("SELECT data FROM papers WHERE id = ?", (keep,)).fetchone()
+            if keep_row:
+                try:
+                    keep_paper = Paper.from_dict(json.loads(_decompress(keep_row[0]).decode("utf-8")))
+                    for pid in ids:
+                        if pid != keep:
+                            row = conn.execute("SELECT data FROM papers WHERE id = ?", (pid,)).fetchone()
+                            if row:
+                                try:
+                                    other = Paper.from_dict(json.loads(_decompress(row[0]).decode("utf-8")))
+                                    if _merge_analysis_into(keep_paper, other):
+                                        self._save_internal(keep_paper, conn=conn, commit=False)
+                                except Exception:
+                                    pass
+                            self._fts_delete(conn, pid)
+                            conn.execute("DELETE FROM papers WHERE id = ?", (pid,))
+                            with self._cache_lock:
+                                self._metadata_cache.pop(pid, None)
+                except Exception:
+                    for pid in ids:
+                        if pid != keep:
+                            self._fts_delete(conn, pid)
+                            conn.execute("DELETE FROM papers WHERE id = ?", (pid,))
+                            with self._cache_lock:
+                                self._metadata_cache.pop(pid, None)
+            else:
+                for pid in ids:
+                    if pid != keep:
+                        self._fts_delete(conn, pid)
+                        conn.execute("DELETE FROM papers WHERE id = ?", (pid,))
+                        with self._cache_lock:
+                            self._metadata_cache.pop(pid, None)
 
     def _create_fts_table(self, conn) -> bool:
         """Create FTS table. Returns True if contentless (content='') is used."""
@@ -609,6 +684,7 @@ class SQLitePaperStore:
             "file_path": self.db_path,
             "mtime": updated,
             "title": paper.title,
+            "is_relevant": paper.is_relevant,
             "is_starred": paper.is_starred,
             "is_hidden": paper.is_hidden,
             "star_category": getattr(paper, "star_category", "Other"),

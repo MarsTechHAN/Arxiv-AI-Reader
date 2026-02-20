@@ -205,6 +205,7 @@ class ArxivFetcher:
             print(f"     Got {len(entries)} entries")
             
             for entry in entries:
+                existing = None
                 if not hasattr(entry, "id"):
                     continue
                 arxiv_id = (
@@ -226,8 +227,12 @@ class ArxivFetcher:
                         except Exception:
                             pass
                         if pv > ev:
+                            try:
+                                existing = self.store.load_paper(existing_id, resolve_version=False)
+                            except Exception:
+                                existing = None
                             self.store.delete_paper(existing_id)
-                            print(f"     🔄 Replaced {existing_id} with {arxiv_id}")
+                            print(f"     🔄 Replaced {existing_id} with {arxiv_id} (preserving analysis)")
                         else:
                             continue
                     else:
@@ -250,6 +255,17 @@ class ArxivFetcher:
                     published_date=published_date,
                     is_backfill=is_backfill,
                 )
+                if existing is not None:
+                    paper.is_relevant = existing.is_relevant
+                    paper.relevance_score = existing.relevance_score or 0.0
+                    paper.extracted_keywords = existing.extracted_keywords or []
+                    paper.one_line_summary = existing.one_line_summary or ""
+                    paper.detailed_summary = existing.detailed_summary or ""
+                    paper.qa_pairs = existing.qa_pairs or []
+                    paper.tags = getattr(existing, "tags", []) or []
+                    paper.is_starred = existing.is_starred
+                    paper.star_category = getattr(existing, "star_category", "Other")
+                    paper.is_hidden = existing.is_hidden
                 self.store.save_paper(paper)
                 papers.append(paper)
                 print(f"     ✓ {arxiv_id} - {paper.title[:60]}...")

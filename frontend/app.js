@@ -328,11 +328,14 @@ function setupEventListeners() {
     }
 }
 
+let minRelevanceScoreForStage2 = 6;
+
 async function loadConfigAndRenderTabs() {
     try {
         const response = await fetch(`${API_BASE}/config`);
         const config = await response.json();
         starCategories = config.star_categories || ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
+        minRelevanceScoreForStage2 = config.min_relevance_score_for_stage2 ?? 6;
         renderCategoryTabs();
     } catch (e) {
         console.warn('Failed to load config for tabs:', e);
@@ -467,6 +470,7 @@ function applyFilterSettings() {
 }
 
 function buildFilterParams() {
+    advancedFilterSettings = { ...advancedFilterSettings, ...getFilterSettings() };
     const p = [];
     if (advancedFilterSettings.hideIrrelevant) p.push('hide_irrelevant=true');
     if (advancedFilterSettings.hideStarred) p.push('hide_starred=true');
@@ -850,6 +854,12 @@ async function searchPapersAiStream(query) {
             params.set('starred_only', 'true');
             params.set('category', currentTab);
         }
+        if (advancedFilterSettings.hideIrrelevant) params.set('hide_irrelevant', 'true');
+        if (advancedFilterSettings.hideStarred) params.set('hide_starred', 'true');
+        if (advancedFilterSettings.fromDate) params.set('from_date', advancedFilterSettings.fromDate);
+        if (advancedFilterSettings.toDate) params.set('to_date', advancedFilterSettings.toDate);
+        if (advancedFilterSettings.scoreMin !== '') params.set('relevance_min', advancedFilterSettings.scoreMin);
+        if (advancedFilterSettings.scoreMax !== '') params.set('relevance_max', advancedFilterSettings.scoreMax);
         const response = await fetch(`${API_BASE}/search/ai/stream?${params}`);
         if (!response.ok) throw new Error(response.statusText);
         if (!response.body) throw new Error('No stream');
@@ -905,6 +915,12 @@ async function searchPapersAiStream(query) {
             params.set('starred_only', 'true');
             params.set('category', currentTab);
         }
+        if (advancedFilterSettings.hideIrrelevant) params.set('hide_irrelevant', 'true');
+        if (advancedFilterSettings.hideStarred) params.set('hide_starred', 'true');
+        if (advancedFilterSettings.fromDate) params.set('from_date', advancedFilterSettings.fromDate);
+        if (advancedFilterSettings.toDate) params.set('to_date', advancedFilterSettings.toDate);
+        if (advancedFilterSettings.scoreMin !== '') params.set('relevance_min', advancedFilterSettings.scoreMin);
+        if (advancedFilterSettings.scoreMax !== '') params.set('relevance_max', advancedFilterSettings.scoreMax);
         const response = await fetch(`${API_BASE}/search/ai?${params}`);
         if (!response.ok) throw new Error(response.statusText);
         return await response.json();
@@ -982,17 +998,15 @@ function createPaperCard(paper) {
         scoreBadge = `<span class="relevance-badge ${scoreClass}">${paper.relevance_score}/10</span>`;
     }
     
-    // Only show status for non-relevant or pending papers
     let statusBadge = '';
-    if (paper.is_relevant === null) {
-        statusBadge = '<span class="paper-status status-pending">⏳ 待分析</span>';
-    } else if (paper.is_relevant === false) {
+    let stage2Badge = '';
+    if (paper.is_relevant === false) {
         statusBadge = '<span class="paper-status status-not-relevant">✗ 不相关</span>';
+    } else if (paper.is_relevant === null) {
+        statusBadge = '<span class="paper-status status-pending">⏳ 待分析</span>';
+    } else if (paper.stage2_pending ?? (paper.is_relevant && !(paper.detailed_summary && paper.detailed_summary.trim()))) {
+        stage2Badge = '<span class="stage-badge stage-pending">⏳ 待深度分析</span>';
     }
-    // Don't show "✓ 相关" for relevant papers
-    
-    const stage2Badge = (paper.stage2_pending ?? (paper.is_relevant && !(paper.detailed_summary && paper.detailed_summary.trim()))) ? 
-        '<span class="stage-badge stage-pending">⏳ 待深度分析</span>' : '';
     
     // Safe authors handling
     const authors = paper.authors || [];
@@ -1147,7 +1161,7 @@ async function openPaperModal(paperId) {
         
         if (paper.is_relevant === false) {
             relevanceEditor.style.display = 'block';
-            currentRelevanceScore.textContent = paper.relevance_score || 0;
+            currentRelevanceScore.textContent = paper.relevance_score ?? 0;
             relevanceScoreInput.value = paper.relevance_score || 5;
         } else {
             relevanceEditor.style.display = 'none';
@@ -1597,7 +1611,9 @@ async function openConfigModal() {
         
         // Analysis settings
         document.getElementById('concurrentPapers').value = config.concurrent_papers || 10;
-        document.getElementById('minRelevanceScoreForStage2').value = config.min_relevance_score_for_stage2 || 6;
+        const minScore = config.min_relevance_score_for_stage2 ?? 6;
+        document.getElementById('minRelevanceScoreForStage2').value = minScore;
+        minRelevanceScoreForStage2 = minScore;
         
         // Star categories
         const sc = config.star_categories || ['高效视频生成', 'LLM稀疏注意力', '注意力机制', 'Roll-out方法'];
@@ -1707,6 +1723,8 @@ async function saveConfig() {
         configInitialState = getConfigFormState();
         resetConfigCloseWarning();
         closeModal(configModal);
+        const minVal = parseFloat(document.getElementById('minRelevanceScoreForStage2')?.value);
+        if (!isNaN(minVal)) minRelevanceScoreForStage2 = minVal;
         showSuccess(result.message || 'Configuration saved');
     } catch (error) {
         console.error('Error saving config:', error);

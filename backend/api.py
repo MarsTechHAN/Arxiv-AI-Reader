@@ -292,7 +292,17 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
     
     # Step 3b: Advanced filters (from cookie settings)
     if hide_irrelevant and hide_irrelevant.lower() == 'true':
-        filtered_metadata = [m for m in filtered_metadata if m.get('is_relevant') is not False]
+        min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+        def _is_relevant_enough(m):
+            if m.get('is_relevant') is False:
+                return False
+            if m.get('is_relevant') is None:
+                return False
+            score = m.get('relevance_score') or 0
+            if score < min_score:
+                return False
+            return True
+        filtered_metadata = [m for m in filtered_metadata if _is_relevant_enough(m)]
     if hide_starred and hide_starred.lower() == 'true':
         filtered_metadata = [m for m in filtered_metadata if not m.get('is_starred', False)]
     if from_date or to_date:
@@ -398,6 +408,11 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
                 asyncio.create_task(t)
         except (ImportError, NameError):
             pass
+    else:
+        unanalyzed = [p for p in papers if p.is_relevant is None]
+        if unanalyzed:
+            batch = unanalyzed[:5]
+            asyncio.create_task(analyzer.process_papers(batch, config))
 
     return [
         {
@@ -890,7 +905,8 @@ async def _mcp_tool_executor(fetcher, name: str, args: dict,
 
 @app.get("/search/ai/stream")
 async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance",
-                           category: str = None, starred_only: str = "false"):
+                           category: str = None, starred_only: str = "false",
+                           hide_irrelevant: str = None, hide_starred: str = None, relevance_min: str = None, relevance_max: str = None):
     """AI search with streaming progress. category+starred_only restrict to tab content."""
     config = await asyncio.to_thread(Config.load, config_path)
     inner_q = q.strip()
@@ -948,6 +964,7 @@ async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_da
 
             yield f"data: {json.dumps({'type': 'progress', 'message': '加载结果中...'})}\n\n"
 
+            min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
             results = []
             _tab_filter = category or starred_only_bool
             for pid in final_ids:
@@ -955,7 +972,7 @@ async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_da
                     full = await asyncio.to_thread(fetcher.load_paper, pid)
                     if _tab_filter and not _paper_matches_tab_filter(full, category, starred_only_bool):
                         continue
-                    results.append({
+                    paper_dict = {
                         "id": full.id,
                         "title": full.title,
                         "authors": full.authors,
@@ -974,7 +991,10 @@ async def search_ai_stream(q: str, limit: int = 50, from_date: str = None, to_da
                         "tags": getattr(full, "tags", []),
                         "search_score": len(final_ids) - final_ids.index(pid) if pid in final_ids else 0,
                         "stage2_pending": _stage2_status(full, config)[1],
-                    })
+                    }
+                    if not _matches_advanced_filter(paper_dict, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max, min_score):
+                        continue
+                    results.append(paper_dict)
                 except Exception:
                     continue
             if sort_by == "latest":
@@ -1047,7 +1067,8 @@ async def _run_ai_search(inner_q: str, limit: int, config, fetcher, from_date: s
 
 @app.get("/search/ai")
 async def search_ai_nostream(q: str, limit: int = 50, from_date: str = None, to_date: str = None, sort_by: str = "relevance",
-                             category: str = None, starred_only: str = "false"):
+                             category: str = None, starred_only: str = "false",
+                             hide_irrelevant: str = None, hide_starred: str = None, relevance_min: str = None, relevance_max: str = None):
     """Non-streaming AI search. category+starred_only restrict to tab content."""
     config = await asyncio.to_thread(Config.load, config_path)
     inner_q = q.strip()
@@ -1059,6 +1080,9 @@ async def search_ai_nostream(q: str, limit: int = 50, from_date: str = None, to_
         return []
     results = await _run_ai_search(inner_q, limit, config, fetcher, from_date=from_date, to_date=to_date, sort_by=sort_by,
                                    category=category, starred_only=starred_only.lower() == "true")
+    min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
+    if hide_irrelevant or hide_starred or relevance_min or relevance_max:
+        results = [r for r in results if _matches_advanced_filter(r, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max, min_score)]
     return results
 
 
@@ -1096,10 +1120,15 @@ def _paper_matches_tab_filter(paper_or_meta, category: str = None, starred_only:
     return True
 
 
-def _matches_advanced_filter(item, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max) -> bool:
+def _matches_advanced_filter(item, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max, min_relevance_for_stage2: float = 6.0) -> bool:
     """Check if paper/meta passes advanced filters. item is dict with is_relevant, is_starred, published_date, created_at, relevance_score."""
     if hide_irrelevant and hide_irrelevant.lower() == 'true':
         if item.get('is_relevant') is False:
+            return False
+        if item.get('is_relevant') is None:
+            return False
+        score = item.get('relevance_score') or 0
+        if score < min_relevance_for_stage2:
             return False
     if hide_starred and hide_starred.lower() == 'true':
         if item.get('is_starred', False):
@@ -1142,6 +1171,7 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
                        hide_irrelevant: str = None, hide_starred: str = None, from_date: str = None, to_date: str = None, relevance_min: str = None, relevance_max: str = None):
     """Search papers by keyword. Searches ALL papers. Returns [skip:skip+limit]. category+starred_only restrict to tab content."""
     config = await asyncio.to_thread(Config.load, config_path)
+    min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
     q = q.strip()
 
     # Check if query is an arXiv ID (format: YYMM.NNNNN or YYMM.NNNNNvN)
@@ -1195,7 +1225,7 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
                 "stage2_pending": _stage2_status(paper, config)[1],
                 "search_score": 1000.0,
             }
-            if not _matches_advanced_filter(paper_dict, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max):
+            if not _matches_advanced_filter(paper_dict, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max, min_score):
                 return []
             return [paper_dict]
         
@@ -1235,7 +1265,7 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
                     if not _paper_matches_tab_filter(meta, category, starred_only_bool):
                         continue
                 meta = id_to_meta.get(r["id"], {})
-                if not _matches_advanced_filter(meta, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max):
+                if not _matches_advanced_filter(meta, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max, min_score):
                     continue
                 score = r.get("search_score", 0)
                 title_match = bool(q_lower and q_lower in (meta.get("title") or "").lower())
@@ -1319,7 +1349,7 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
             substring_bonus = 1.5 if (title and q_lower in title.lower()) else (0.8 if (abstract and q_lower in abstract.lower()) else 0.0)
             total_score = title_score + abstract_score + summary_score + one_line_score + author_score + tag_score + substring_bonus
 
-        if total_score > 0 and _matches_advanced_filter(meta, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max):
+        if total_score > 0 and _matches_advanced_filter(meta, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max, min_score):
             pub_dt = _parse_sort_date(meta.get('published_date', '')) or _parse_sort_date(meta.get('created_at', '')) or datetime.fromtimestamp(0, tz=timezone.utc)
             scored.append((paper_id, total_score, meta.get('is_relevant'), pub_dt))
 
@@ -1533,6 +1563,32 @@ async def reprocess_negative_keyword_blocked():
         traceback.print_exc()
 
 
+async def check_pending_stage1_analysis():
+    """Process papers with is_relevant is None (待分析). Run on startup to clear backlog."""
+    try:
+        config = await asyncio.to_thread(Config.load, config_path)
+        metadata_list = await asyncio.to_thread(fetcher.list_papers_metadata, SCAN_ALL, False)
+        unanalyzed_ids = [m["id"] for m in metadata_list if m.get("is_relevant") is None]
+        if not unanalyzed_ids:
+            print("✓ No papers pending Stage 1 analysis (待分析)")
+            return
+        print(f"\n📊 Found {len(unanalyzed_ids)} papers pending Stage 1 analysis (待分析)...")
+        papers = []
+        for pid in unanalyzed_ids:
+            try:
+                p = await asyncio.to_thread(fetcher.load_paper, pid)
+                papers.append(p)
+            except Exception as e:
+                print(f"  ✗ Failed to load {pid}: {e}")
+        if papers:
+            await analyzer.process_papers(papers, config)
+            print(f"✓ Completed Stage 1 for {len(papers)} papers")
+    except Exception as e:
+        print(f"✗ Error in check_pending_stage1_analysis: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 async def check_pending_deep_analysis():
     """Check for papers needing Stage 2. Process with priority on startup."""
     try:
@@ -1589,6 +1645,7 @@ async def background_fetcher():
         serving = False
 
     if not serving:
+        asyncio.create_task(check_pending_stage1_analysis())
         asyncio.create_task(check_pending_deep_analysis())
     else:
         print("📡 Serving mode: skipping background analysis (on-demand per user)")
