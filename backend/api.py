@@ -30,7 +30,7 @@ import json
 from models import Paper, Config, QAPair
 from fetcher import ArxivFetcher
 from storage import DATA_ROOT
-from analyzer import DeepSeekAnalyzer
+from analyzer import DeepSeekAnalyzer, _is_paper_from_today
 from default_config import DEFAULT_CONFIG
 
 # Scan all papers (no limit)
@@ -1452,10 +1452,10 @@ async def check_pending_deep_analysis():
         config = await asyncio.to_thread(Config.load, config_path)
         all_papers = await asyncio.to_thread(fetcher.list_papers, 0, SCAN_ALL)
 
-        # Find papers needing Stage 2 (exclude backfill - those get full summary on user open only)
+        # Only process today's papers; historical papers get full summary on user open
         pending_papers = [
             p for p in all_papers
-            if _stage2_status(p, config)[0] and not getattr(p, "is_backfill", False)
+            if _stage2_status(p, config)[0] and _is_paper_from_today(p)
         ]
         
         if pending_papers:

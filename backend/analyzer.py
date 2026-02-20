@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import time
 import httpx
+from datetime import datetime, timezone
 
 from models import Paper, QAPair, Config
 from typing import Callable, Tuple
@@ -20,6 +21,24 @@ from typing import Callable, Tuple
 # Prevent duplicate Stage 2 for same paper when triggered from multiple places (search, startup, etc)
 _stage2_in_flight: set = set()
 _stage2_lock: asyncio.Lock = asyncio.Lock()
+
+
+def _is_paper_from_today(paper: Paper) -> bool:
+    """True if paper's published_date is today (UTC). New papers get full analysis."""
+    pd = getattr(paper, "published_date", "") or ""
+    if not pd:
+        return False
+    try:
+        from dateutil import parser as date_parser
+        dt = date_parser.parse(pd)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        today = datetime.now(timezone.utc).date()
+        return dt.date() == today
+    except (ValueError, TypeError):
+        return False
 
 
 class DeepSeekAnalyzer:
@@ -1490,8 +1509,9 @@ Respond with JSON only: {{"category": "exact_category_name"}}"""
                 try:
                     async with sem1:
                         await self.stage1_filter(paper, config)
-                    # Backfill papers: stage1 only; full summary on user click (request_full_summary)
-                    if paper.is_relevant and paper.relevance_score >= min_score and not getattr(paper, "is_backfill", False):
+                    # New papers (from today): full analysis if score >= threshold
+                    # Historical: stage1 only; full summary on user click
+                    if paper.is_relevant and paper.relevance_score >= min_score and _is_paper_from_today(paper):
                         await stage2_queue.put(paper)
                 except Exception as e:
                     print(f"  Stage 1 error for {paper.id}: {e}")
