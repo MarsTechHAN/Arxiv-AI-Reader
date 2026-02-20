@@ -248,6 +248,7 @@ class ArxivFetcher:
                     html_content=html_content,
                     preview_text=preview_text,
                     published_date=published_date,
+                    is_backfill=is_backfill,
                 )
                 self.store.save_paper(paper)
                 papers.append(paper)

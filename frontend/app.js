@@ -986,6 +986,11 @@ async function openPaperModal(paperId) {
         `;
         
         document.getElementById('paperDetails').innerHTML = detailsHtml;
+
+        // Auto-trigger full summary when user opens paper that needs it (e.g. backfill = stage1 only)
+        if (paper.stage2_pending) {
+            requestFullSummary(paperId);
+        }
         
         // Load Q&A (with Markdown rendering, thinking support, and follow-up buttons)
         const qaHtml = paper.qa_pairs && paper.qa_pairs.length > 0 ? 

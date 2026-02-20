@@ -36,14 +36,6 @@ if [ "$1" == "docker" ]; then
 else
     echo "✅ Starting backend server..."
     echo "📍 URL: http://localhost:8000"
-    echo "📖 Features:"
-    echo "   - Markdown 渲染 Q&A"
-    echo "   - 中文回答"
-    echo "   - 相关性打分 (0-10)"
-    echo "   - 按相关性/最新/收藏排序"
-    echo "   - Hide/Star 功能"
-    echo "   - Keyword 筛选"
-    echo ""
     cd backend && python api.py
 fi
 

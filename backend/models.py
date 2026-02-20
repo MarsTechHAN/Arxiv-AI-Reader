@@ -59,6 +59,7 @@ class Paper:
     published_date: str = ""  # arXiv submission date
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    is_backfill: bool = False  # From historical fetch; skip stage2 until user opens
     
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization"""

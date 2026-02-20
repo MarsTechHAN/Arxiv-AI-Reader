@@ -386,6 +386,8 @@ def _stage2_status(paper: Paper, config: Config) -> tuple:
     """Returns (needs_stage2, stage2_pending)."""
     min_score = getattr(config, 'min_relevance_score_for_stage2', 6.0)
     preset = getattr(config, 'preset_questions', []) or []
+    if paper.is_relevant is None:
+        return True, True
     if not paper.is_relevant or paper.relevance_score < min_score:
         return False, False
     has_summary = bool(paper.detailed_summary and paper.detailed_summary.strip())
@@ -414,43 +416,64 @@ async def get_paper(request: Request, paper_id: str):
         raise HTTPException(status_code=404, detail="Paper not found")
 
 
+async def _run_stage2_for_paper(paper_id: str, user_id: Optional[int] = None):
+    """Background task: run stage1+stage2 (avoids HTTP timeout). user_id for serving mode."""
+    try:
+        if user_id is not None:
+            try:
+                from serving.config_resolver import get_config_for_user
+                config = get_config_for_user(user_id, config_path)
+            except ImportError:
+                config = await asyncio.to_thread(Config.load, config_path)
+        else:
+            config = await asyncio.to_thread(Config.load, config_path)
+        paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
+        if paper.is_relevant is None:
+            paper = await analyzer.stage1_filter(paper, config)
+            await asyncio.to_thread(fetcher.save_paper, paper)
+            if user_id is not None:
+                try:
+                    from serving.paper_overlay import save_paper_user_result_from_paper
+                    await asyncio.to_thread(save_paper_user_result_from_paper, paper, user_id)
+                except ImportError:
+                    pass
+        if paper.is_relevant and (not paper.detailed_summary or not paper.detailed_summary.strip()):
+            await analyzer.stage2_qa(paper, config)
+            await asyncio.to_thread(fetcher.save_paper, paper)
+            if user_id is not None:
+                try:
+                    from serving.paper_overlay import save_paper_user_result_from_paper
+                    await asyncio.to_thread(save_paper_user_result_from_paper, paper, user_id)
+                except ImportError:
+                    pass
+        print(f"  ✓ Background stage2 completed for {paper_id}")
+    except Exception as e:
+        print(f"  ✗ Background stage2 failed for {paper_id}: {e}")
+
+
 @app.post("/papers/{paper_id}/request_full_summary")
-async def request_full_summary(request: Request, paper_id: str):
-    """User clicked to request full summary. Triggers Stage 2 on demand (serving mode)."""
-    user_id, config = None, None
+async def request_full_summary(request: Request, paper_id: str, background_tasks: BackgroundTasks):
+    """User clicked to request full summary. Triggers Stage 2 in background (avoid timeout)."""
+    user_id = None
     try:
-        from serving.integrate import get_user_and_config_async, overlay_paper_for_user, set_serving_user_id
-        user_id, config = await get_user_and_config_async(request, config_path)
-    except ImportError:
-        config = await asyncio.to_thread(Config.load, config_path)
-    try:
+        try:
+            from serving.integrate import get_user_and_config_async, overlay_paper_for_user
+            user_id, config = await get_user_and_config_async(request, config_path)
+        except ImportError:
+            config = await asyncio.to_thread(Config.load, config_path)
         paper = await asyncio.to_thread(fetcher.load_paper, paper_id)
         if user_id:
             paper = overlay_paper_for_user(paper, user_id)
-            set_serving_user_id(user_id)
-        if paper.is_relevant is None:
-            paper = await analyzer.stage1_filter(paper, config)
-            if user_id:
-                try:
-                    from serving.paper_overlay import save_paper_user_result_from_paper
-                    await asyncio.to_thread(save_paper_user_result_from_paper, paper, user_id)
-                except ImportError:
-                    pass
-            await asyncio.to_thread(fetcher.save_paper, paper)
-        if paper.is_relevant and (not paper.detailed_summary or not paper.detailed_summary.strip()):
-            await analyzer.stage2_qa(paper, config)
-            if user_id:
-                try:
-                    from serving.paper_overlay import save_paper_user_result_from_paper
-                    await asyncio.to_thread(save_paper_user_result_from_paper, paper, user_id)
-                except ImportError:
-                    pass
-            await asyncio.to_thread(fetcher.save_paper, paper)
-        return {"ok": True, "paper_id": paper_id}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Paper not found")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    # If needs stage2, run in background and return immediately (no HTTP timeout)
+    needs_stage2 = paper.is_relevant and (not paper.detailed_summary or not paper.detailed_summary.strip())
+    if paper.is_relevant is None:
+        needs_stage2 = True
+    if needs_stage2:
+        background_tasks.add_task(_run_stage2_for_paper, paper_id, user_id)
+    return {"ok": True, "paper_id": paper_id}
 
 
 @app.post("/papers/{paper_id}/ask")
@@ -1429,10 +1452,10 @@ async def check_pending_deep_analysis():
         config = await asyncio.to_thread(Config.load, config_path)
         all_papers = await asyncio.to_thread(fetcher.list_papers, 0, SCAN_ALL)
 
-        # Find papers needing Stage 2 (no summary or incomplete preset Q&As)
+        # Find papers needing Stage 2 (exclude backfill - those get full summary on user open only)
         pending_papers = [
-            p for p in all_papers 
-            if _stage2_status(p, config)[0]
+            p for p in all_papers
+            if _stage2_status(p, config)[0] and not getattr(p, "is_backfill", False)
         ]
         
         if pending_papers:

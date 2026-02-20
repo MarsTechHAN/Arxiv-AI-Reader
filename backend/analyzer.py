@@ -15,7 +15,7 @@ import time
 import httpx
 
 from models import Paper, QAPair, Config
-from typing import Callable
+from typing import Callable, Tuple
 
 # Prevent duplicate Stage 2 for same paper when triggered from multiple places (search, startup, etc)
 _stage2_in_flight: set = set()
@@ -501,7 +501,11 @@ Search the paper corpus. Call multiple search tools in parallel if needed. Merge
         """
         neg_hint = ""
         if config.negative_keywords:
-            neg_hint = f"\n负面关键词（出现则倾向低分，但由你综合判断）：{', '.join(config.negative_keywords)}\n"
+            neg_hint = f"""\n负面关键词（仅在论文**主要研究主题**是以下关键词时才倾向低分；若只是文中顺带提及、论文核心贡献是其他方面则不应扣分）：
+{', '.join(config.negative_keywords)}
+
+例如：论文主要实现新方法、仅用benchmark做验证 -> 不算以benchmark为主，不扣分；论文以benchmark对比/测评为核心贡献 -> 扣分。
+"""
         prompt = f"""分析这篇论文预览，判断它与以下关键词的相关性：
 
 关键词：{', '.join(config.filter_keywords)}
@@ -518,7 +522,7 @@ Search the paper corpus. Call multiple search tools in parallel if needed. Merge
     "one_line_summary": "一句话总结（中文，仅概括论文内容本身，勿提及与关键词的相关性、评分等）"
 }}
 
-注意：one_line_summary 必须是对论文内容的客观概括，不得包含"与关键词相关性"、"相关性较弱/较强"等表述。"""
+注意：one_line_summary 必须只包含对论文内容的客观概括，不得包含"与关键词相关性"、"相关性较弱/较强"等表述。"""
         
         # Retry logic: up to 3 attempts
         max_retries = 3
@@ -685,19 +689,21 @@ Paper Content:
 {content}
 """
         
-        # 1. Generate summary only if not already present (resume support)
+        # 1. Generate summary first (prefill). MUST complete before preset Qs for KV cache consistency.
         if not paper.detailed_summary or not paper.detailed_summary.strip():
-            summary_response = await self._ask_question_with_retry(
+            summary_response, effective_cache_prefix = await self._ask_question_with_retry(
                 cache_prefix=cache_prefix,
                 question=detailed_summary_question,
                 config=config,
                 cache_id=paper.id
             )
-            
+            # Use effective prefix for preset Qs (may be truncated on retry - must stay consistent)
+            cache_prefix = effective_cache_prefix
+
             if summary_response is None:
                 print(f"  Stage 2 FAILED to generate summary for {paper.id}")
                 return paper
-            
+
             try:
                 summary_data = json.loads(summary_response)
                 paper.detailed_summary = summary_data.get("summary", summary_response)
@@ -718,15 +724,15 @@ Paper Content:
             self._save_paper(paper)  # Incremental save
         else:
             print(f"  Stage 2: Resuming for {paper.id} (summary exists)")
-        
-        # 2. Preset questions: summary above was first (pre-fill KV cache); all preset Qs concurrent
+
+        # 2. Preset questions: prefill (summary) completed; now concurrent (same cache_prefix for KV reuse)
         already_answered = {qa.question for qa in paper.qa_pairs}
         pending = [q for q in config.preset_questions if q not in already_answered]
         if not pending:
             return paper
 
         async def ask_one(q: str) -> tuple[str, Optional[str]]:
-            ans = await self._ask_question_with_retry(
+            ans, _ = await self._ask_question_with_retry(
                 cache_prefix=cache_prefix, question=q, config=config, cache_id=paper.id
             )
             return (q, ans)
@@ -1341,17 +1347,19 @@ Paper Content:
         config: Config,
         cache_id: str,
         max_retries: int = 3
-    ) -> Optional[str]:
+    ) -> Tuple[Optional[str], str]:
         """
         Ask a question with retry logic and dynamic token truncation.
         When token limit error occurs, truncate cache_prefix and retry.
-        Returns None if all retries fail.
+        Returns (answer, effective_cache_prefix). Use effective_cache_prefix for
+        subsequent calls to preserve KV cache consistency (truncation must propagate).
         """
         current_cache_prefix = cache_prefix
-        
+
         for attempt in range(max_retries):
             try:
-                return await self._ask_question(current_cache_prefix, question, config, cache_id)
+                answer = await self._ask_question(current_cache_prefix, question, config, cache_id)
+                return (answer, current_cache_prefix)
             except Exception as e:
                 error_str = str(e)
                 
@@ -1371,11 +1379,11 @@ Paper Content:
                             continue  # Retry with truncated content
                         else:
                             print(f"  FAILED after {max_retries} attempts with truncation: {e}")
-                            return None
+                            return (None, current_cache_prefix)
                     else:
                         # Content too small to truncate further
                         print(f"  FAILED: Content too small to truncate further: {e}")
-                        return None
+                        return (None, current_cache_prefix)
                 else:
                     # Not a token limit error, use normal retry logic
                     if attempt < max_retries - 1:
@@ -1384,9 +1392,9 @@ Paper Content:
                         await asyncio.sleep(wait_time)
                     else:
                         print(f"  FAILED after {max_retries} attempts: {e}")
-                        return None
-        
-        return None
+                        return (None, current_cache_prefix)
+
+        return (None, current_cache_prefix)
     
     async def classify_starred_paper(self, paper: Paper, config: Config) -> str:
         """
@@ -1482,7 +1490,8 @@ Respond with JSON only: {{"category": "exact_category_name"}}"""
                 try:
                     async with sem1:
                         await self.stage1_filter(paper, config)
-                    if paper.is_relevant and paper.relevance_score >= min_score:
+                    # Backfill papers: stage1 only; full summary on user click (request_full_summary)
+                    if paper.is_relevant and paper.relevance_score >= min_score and not getattr(paper, "is_backfill", False):
                         await stage2_queue.put(paper)
                 except Exception as e:
                     print(f"  Stage 1 error for {paper.id}: {e}")
