@@ -69,6 +69,47 @@
                         <option value="relevance">按相关性排序</option>
                         <option value="latest">按最新排序</option>
                     </select>
+                    <div class="filter-settings-wrapper">
+                        <button id="filterSettingsBtn" class="filter-settings-btn" title="Advanced filter settings">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                        </button>
+                        <div id="filterSettingsPopover" class="filter-settings-popover">
+                            <div class="filter-settings-content">
+                                <h4 class="filter-settings-title">Advanced Filters</h4>
+                                <div class="filter-settings-body">
+                                    <label class="filter-settings-option">
+                                        <input type="checkbox" id="filterHideIrrelevant" />
+                                        <span class="checkbox-custom"></span>
+                                        <span>Hide irrelevant articles</span>
+                                    </label>
+                                    <label class="filter-settings-option">
+                                        <input type="checkbox" id="filterHideStarred" />
+                                        <span class="checkbox-custom"></span>
+                                        <span>Hide Starred articles</span>
+                                    </label>
+                                    <div class="filter-settings-row">
+                                        <label>Date range</label>
+                                        <div class="filter-settings-daterange">
+                                            <input type="date" id="filterFromDate" />
+                                            <span>–</span>
+                                            <input type="date" id="filterToDate" />
+                                        </div>
+                                    </div>
+                                    <div class="filter-settings-row">
+                                        <label>Relevance score (0–10)</label>
+                                        <div class="filter-settings-score">
+                                            <input type="number" id="filterScoreMin" min="0" max="10" step="0.5" placeholder="Min" />
+                                            <span>–</span>
+                                            <input type="number" id="filterScoreMax" min="0" max="10" step="0.5" placeholder="Max" />
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="filter-settings-footer">
+                                    <button id="filterSettingsApply" class="btn-apply">Apply</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
                 <button id="clearKeywordBtn" class="btn btn-secondary" style="display: none;">清除筛选</button>
             </div>

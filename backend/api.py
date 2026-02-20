@@ -216,14 +216,18 @@ async def health_check():
 
 
 @app.get("/papers", response_model=List[dict])
-async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: str = "false", category: str = None):
+async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by: str = "relevance", keyword: str = None, starred_only: str = "false", category: str = None,
+                      hide_irrelevant: str = "false", hide_starred: str = "false", from_date: str = None, to_date: str = None, relevance_min: str = None, relevance_max: str = None):
     """
     List papers for timeline.
     sort_by: 'relevance' (default), 'latest'
     keyword: filter by keyword
     starred_only: 'true' to return only starred papers (optionally filtered by category)
     category: when starred_only=true, filter by star_category (e.g. '高效视频生成', 'Other')
-    When starred_only=false: show ALL papers (star is just categorization, starred papers remain in main list)
+    hide_irrelevant: 'true' to exclude papers marked not relevant
+    hide_starred: 'true' to exclude starred papers
+    from_date, to_date: ISO date (YYYY-MM-DD) to filter by published_date
+    relevance_min, relevance_max: filter by relevance_score (0-10)
     
     PERFORMANCE OPTIMIZATION: Use metadata scanning first, then load only needed papers.
     All sync I/O runs in thread pool to avoid blocking event loop.
@@ -285,6 +289,44 @@ async def list_papers(request: Request, skip: int = 0, limit: int = 20, sort_by:
             ]).lower()
             return kw_lower in searchable
         filtered_metadata = [m for m in filtered_metadata if _keyword_match(m)]
+    
+    # Step 3b: Advanced filters (from cookie settings)
+    if hide_irrelevant and hide_irrelevant.lower() == 'true':
+        filtered_metadata = [m for m in filtered_metadata if m.get('is_relevant') is not False]
+    if hide_starred and hide_starred.lower() == 'true':
+        filtered_metadata = [m for m in filtered_metadata if not m.get('is_starred', False)]
+    if from_date or to_date:
+        def _parse_date_for_filter(s):
+            if not s or not isinstance(s, str):
+                return None
+            try:
+                return date_parser.parse(s.strip()[:10])
+            except (ValueError, TypeError):
+                return None
+        from_dt = _parse_date_for_filter(from_date) if from_date else None
+        to_dt = _parse_date_for_filter(to_date) if to_date else None
+        def _date_in_range(m):
+            pd = _parse_date_for_filter(m.get('published_date', '') or m.get('created_at', ''))
+            if pd is None:
+                return True
+            if from_dt and pd < from_dt:
+                return False
+            if to_dt and pd > to_dt:
+                return False
+            return True
+        filtered_metadata = [m for m in filtered_metadata if _date_in_range(m)]
+    if relevance_min is not None and relevance_min != '':
+        try:
+            rmin = float(relevance_min)
+            filtered_metadata = [m for m in filtered_metadata if (m.get('relevance_score') or 0) >= rmin]
+        except (ValueError, TypeError):
+            pass
+    if relevance_max is not None and relevance_max != '':
+        try:
+            rmax = float(relevance_max)
+            filtered_metadata = [m for m in filtered_metadata if (m.get('relevance_score') or 0) <= rmax]
+        except (ValueError, TypeError):
+            pass
     
     # Step 4: Sort by relevance or latest (using metadata)
     if sort_by == "relevance":
@@ -1054,8 +1096,50 @@ def _paper_matches_tab_filter(paper_or_meta, category: str = None, starred_only:
     return True
 
 
+def _matches_advanced_filter(item, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max) -> bool:
+    """Check if paper/meta passes advanced filters. item is dict with is_relevant, is_starred, published_date, created_at, relevance_score."""
+    if hide_irrelevant and hide_irrelevant.lower() == 'true':
+        if item.get('is_relevant') is False:
+            return False
+    if hide_starred and hide_starred.lower() == 'true':
+        if item.get('is_starred', False):
+            return False
+    pd_str = item.get('published_date', '') or item.get('created_at', '') or ''
+    if from_date or to_date:
+        try:
+            pd = date_parser.parse(pd_str.strip()[:10]) if pd_str else None
+            if pd:
+                if from_date:
+                    fd = date_parser.parse(from_date.strip()[:10])
+                    if fd and pd < fd:
+                        return False
+                if to_date:
+                    td = date_parser.parse(to_date.strip()[:10])
+                    if td and pd > td:
+                        return False
+        except (ValueError, TypeError, AttributeError):
+            pass
+    score = item.get('relevance_score')
+    if score is None:
+        score = 0
+    if relevance_min not in (None, ''):
+        try:
+            if score < float(relevance_min):
+                return False
+        except (ValueError, TypeError):
+            pass
+    if relevance_max not in (None, ''):
+        try:
+            if score > float(relevance_max):
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
+
+
 @app.get("/search")
-async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "relevance", category: str = None, starred_only: str = "false"):
+async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "relevance", category: str = None, starred_only: str = "false",
+                       hide_irrelevant: str = None, hide_starred: str = None, from_date: str = None, to_date: str = None, relevance_min: str = None, relevance_max: str = None):
     """Search papers by keyword. Searches ALL papers. Returns [skip:skip+limit]. category+starred_only restrict to tab content."""
     config = await asyncio.to_thread(Config.load, config_path)
     q = q.strip()
@@ -1092,9 +1176,7 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
             if category or starred_only.lower() == "true":
                 if not _paper_matches_tab_filter(paper, category, starred_only.lower() == "true"):
                     return []
-
-            # Return the paper
-            return [{
+            paper_dict = {
                 "id": paper.id,
                 "title": paper.title,
                 "authors": paper.authors,
@@ -1111,8 +1193,11 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
                 "has_qa": len(paper.qa_pairs) > 0,
                 "detailed_summary": paper.detailed_summary,
                 "stage2_pending": _stage2_status(paper, config)[1],
-                "search_score": 1000.0,  # High score for direct ID match
-            }]
+                "search_score": 1000.0,
+            }
+            if not _matches_advanced_filter(paper_dict, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max):
+                return []
+            return [paper_dict]
         
         except Exception as e:
             print(f"✗ Failed to fetch arXiv paper {arxiv_id}: {e}")
@@ -1150,6 +1235,8 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
                     if not _paper_matches_tab_filter(meta, category, starred_only_bool):
                         continue
                 meta = id_to_meta.get(r["id"], {})
+                if not _matches_advanced_filter(meta, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max):
+                    continue
                 score = r.get("search_score", 0)
                 title_match = bool(q_lower and q_lower in (meta.get("title") or "").lower())
                 if title_match:
@@ -1232,7 +1319,7 @@ async def search_papers(q: str, limit: int = 50, skip: int = 0, sort_by: str = "
             substring_bonus = 1.5 if (title and q_lower in title.lower()) else (0.8 if (abstract and q_lower in abstract.lower()) else 0.0)
             total_score = title_score + abstract_score + summary_score + one_line_score + author_score + tag_score + substring_bonus
 
-        if total_score > 0:
+        if total_score > 0 and _matches_advanced_filter(meta, hide_irrelevant, hide_starred, from_date, to_date, relevance_min, relevance_max):
             pub_dt = _parse_sort_date(meta.get('published_date', '')) or _parse_sort_date(meta.get('created_at', '')) or datetime.fromtimestamp(0, tz=timezone.utc)
             scored.append((paper_id, total_score, meta.get('is_relevant'), pub_dt))
 

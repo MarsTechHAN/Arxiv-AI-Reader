@@ -191,6 +191,7 @@ body.modal-open {
 .search-input {
     flex: 1;
     padding: 12px 20px;
+    min-height: 46px;
     background: var(--bg-lighter);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -207,6 +208,7 @@ body.modal-open {
 
 .sort-select {
     padding: 12px 16px;
+    min-height: 46px;
     background: var(--bg-lighter);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -226,6 +228,175 @@ body.modal-open {
     gap: 8px;
     align-items: center;
     flex-shrink: 0;
+}
+
+.filter-settings-wrapper {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+}
+.filter-settings-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 46px;
+    height: 46px;
+    min-width: 46px;
+    min-height: 46px;
+    padding: 0;
+    background: var(--bg-lighter);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.2s;
+}
+.filter-settings-btn:hover {
+    color: var(--primary);
+    border-color: var(--primary);
+}
+.filter-settings-wrapper.active .filter-settings-btn {
+    color: var(--primary);
+    border-color: var(--primary);
+    background: rgba(59, 130, 246, 0.08);
+}
+
+.filter-settings-popover {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 8px;
+    z-index: 1000;
+    min-width: 280px;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-8px) scale(0.96);
+    transform-origin: top right;
+    transition: opacity 0.2s ease, transform 0.2s ease, visibility 0.2s;
+}
+.filter-settings-popover.active {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0) scale(1);
+}
+.filter-settings-content {
+    background: var(--bg-light);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px var(--shadow);
+    padding: 16px;
+}
+.filter-settings-title {
+    margin: 0 0 12px 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+}
+.filter-settings-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.filter-settings-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    color: var(--text);
+    cursor: pointer;
+}
+.filter-settings-option input {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+    pointer-events: none;
+}
+.filter-settings-option .checkbox-custom {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-lighter);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+.filter-settings-option .checkbox-custom::after {
+    content: '';
+    width: 6px;
+    height: 10px;
+    border: solid white;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg) scale(0);
+    margin-bottom: 3px;
+    transition: transform 0.15s ease;
+}
+.filter-settings-option input:checked + .checkbox-custom {
+    background: var(--primary);
+    border-color: var(--primary);
+}
+.filter-settings-option input:checked + .checkbox-custom::after {
+    transform: rotate(45deg) scale(1);
+}
+.filter-settings-option:hover .checkbox-custom {
+    border-color: var(--primary);
+}
+.filter-settings-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.filter-settings-row label {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+.filter-settings-daterange,
+.filter-settings-score {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.filter-settings-daterange input,
+.filter-settings-score input {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 10px;
+    font-size: 13px;
+    background: var(--bg-lighter);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+}
+.filter-settings-daterange input[type="date"] {
+    cursor: pointer;
+}
+.filter-settings-daterange input[type="date"]::-webkit-calendar-picker-indicator {
+    cursor: pointer;
+    opacity: 0.6;
+}
+.filter-settings-footer {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+.filter-settings-footer .btn-apply {
+    background: var(--primary);
+    color: white;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.filter-settings-footer .btn-apply:hover {
+    background: var(--primary-dark);
 }
 
 /* Timeline */

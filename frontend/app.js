@@ -1,6 +1,30 @@
 // API Base URL
 const API_BASE = window.location.origin;
 
+const FILTER_SETTINGS_COOKIE = 'arxiv_filter_settings';
+
+function getFilterSettings() {
+    try {
+        const match = document.cookie.match(new RegExp('(^| )' + FILTER_SETTINGS_COOKIE + '=([^;]+)'));
+        if (match) {
+            return JSON.parse(decodeURIComponent(match[2]));
+        }
+    } catch (_) {}
+    return {
+        hideIrrelevant: false,
+        hideStarred: false,
+        fromDate: '',
+        toDate: '',
+        scoreMin: '',
+        scoreMax: ''
+    };
+}
+
+function setFilterSettings(settings) {
+    const s = JSON.stringify(settings);
+    document.cookie = FILTER_SETTINGS_COOKIE + '=' + encodeURIComponent(s) + '; path=/; max-age=31536000';
+}
+
 // State
 let currentPage = 0;
 let currentPaperId = null;
@@ -17,6 +41,7 @@ let currentPaperIndex = -1;  // Current paper index in the list
 let stage2PollInterval = null;
 let configInitialState = null;  // Snapshot when config modal opened
 let configCloseWarningShown = false;  // For "click again to discard"
+let advancedFilterSettings = getFilterSettings();
 
 // DOM Elements
 const timeline = document.getElementById('timeline');
@@ -122,6 +147,28 @@ function setupEventListeners() {
         loadPapers();
     });
     
+    // Advanced filter settings
+    const filterSettingsBtn = document.getElementById('filterSettingsBtn');
+    const filterSettingsPopover = document.getElementById('filterSettingsPopover');
+    const filterSettingsWrapper = filterSettingsPopover?.closest('.filter-settings-wrapper');
+    const filterSettingsApply = document.getElementById('filterSettingsApply');
+    if (filterSettingsBtn && filterSettingsPopover) {
+        filterSettingsBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isActive = filterSettingsPopover.classList.toggle('active');
+            filterSettingsWrapper?.classList.toggle('active', isActive);
+            if (isActive) {
+                populateFilterSettingsForm();
+                document.addEventListener('click', _closeFilterPopoverOnOutside);
+            } else {
+                document.removeEventListener('click', _closeFilterPopoverOnOutside);
+            }
+        });
+    }
+    if (filterSettingsApply) {
+        filterSettingsApply.addEventListener('click', () => applyFilterSettings());
+    }
+    
     // Clear keyword filter
     clearKeywordBtn.addEventListener('click', () => {
         currentKeyword = null;
@@ -177,6 +224,13 @@ function setupEventListeners() {
     // ESC key to close modals and PDF preview
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
+            const filterPopover = document.getElementById('filterSettingsPopover');
+            if (filterPopover?.classList.contains('active')) {
+                filterPopover.classList.remove('active');
+                filterPopover.closest('.filter-settings-wrapper')?.classList.remove('active');
+                document.removeEventListener('click', _closeFilterPopoverOnOutside);
+                return;
+            }
             const fullscreenViewer = document.getElementById('fullscreenPdfViewer');
             if (fullscreenViewer && fullscreenViewer.style.display !== 'none') {
                 closeFullscreenPdf();
@@ -367,6 +421,62 @@ function setupPullToRefresh() {
     });
 }
 
+function populateFilterSettingsForm() {
+    const el = id => document.getElementById(id);
+    if (el('filterHideIrrelevant')) el('filterHideIrrelevant').checked = advancedFilterSettings.hideIrrelevant;
+    if (el('filterHideStarred')) el('filterHideStarred').checked = advancedFilterSettings.hideStarred;
+    if (el('filterFromDate')) el('filterFromDate').value = advancedFilterSettings.fromDate || '';
+    if (el('filterToDate')) el('filterToDate').value = advancedFilterSettings.toDate || '';
+    if (el('filterScoreMin')) el('filterScoreMin').value = advancedFilterSettings.scoreMin !== '' ? advancedFilterSettings.scoreMin : '';
+    if (el('filterScoreMax')) el('filterScoreMax').value = advancedFilterSettings.scoreMax !== '' ? advancedFilterSettings.scoreMax : '';
+}
+
+function _closeFilterPopoverOnOutside(e) {
+    const popover = document.getElementById('filterSettingsPopover');
+    const btn = document.getElementById('filterSettingsBtn');
+    const wrapper = popover?.closest('.filter-settings-wrapper');
+    if (popover && btn && !popover.contains(e.target) && !btn.contains(e.target)) {
+        popover.classList.remove('active');
+        wrapper?.classList.remove('active');
+        document.removeEventListener('click', _closeFilterPopoverOnOutside);
+    }
+}
+
+function applyFilterSettings() {
+    const el = id => document.getElementById(id);
+    advancedFilterSettings = {
+        hideIrrelevant: el('filterHideIrrelevant')?.checked ?? false,
+        hideStarred: el('filterHideStarred')?.checked ?? false,
+        fromDate: (el('filterFromDate')?.value || '').trim(),
+        toDate: (el('filterToDate')?.value || '').trim(),
+        scoreMin: (el('filterScoreMin')?.value || '').trim(),
+        scoreMax: (el('filterScoreMax')?.value || '').trim()
+    };
+    setFilterSettings(advancedFilterSettings);
+    const popover = document.getElementById('filterSettingsPopover');
+    const wrapper = popover?.closest('.filter-settings-wrapper');
+    if (popover) popover.classList.remove('active');
+    wrapper?.classList.remove('active');
+    document.removeEventListener('click', _closeFilterPopoverOnOutside);
+    currentPage = 0;
+    if (currentSearchQuery) {
+        searchPapers(currentSearchQuery);
+    } else {
+        loadPapers();
+    }
+}
+
+function buildFilterParams() {
+    const p = [];
+    if (advancedFilterSettings.hideIrrelevant) p.push('hide_irrelevant=true');
+    if (advancedFilterSettings.hideStarred) p.push('hide_starred=true');
+    if (advancedFilterSettings.fromDate) p.push('from_date=' + encodeURIComponent(advancedFilterSettings.fromDate));
+    if (advancedFilterSettings.toDate) p.push('to_date=' + encodeURIComponent(advancedFilterSettings.toDate));
+    if (advancedFilterSettings.scoreMin !== '') p.push('relevance_min=' + encodeURIComponent(advancedFilterSettings.scoreMin));
+    if (advancedFilterSettings.scoreMax !== '') p.push('relevance_max=' + encodeURIComponent(advancedFilterSettings.scoreMax));
+    return p.length ? '&' + p.join('&') : '';
+}
+
 // Infinite scroll
 function setupInfiniteScroll() {
     window.addEventListener('scroll', async () => {
@@ -443,6 +553,7 @@ async function loadPapers(page = 0, shouldScroll = true) {
         if (currentKeyword) {
             url += `&keyword=${encodeURIComponent(currentKeyword)}`;
         }
+        url += buildFilterParams();
         
         const response = await fetch(url);
         const papers = await response.json();
@@ -585,6 +696,7 @@ async function fetchSearchPage(query, skip) {
     if (isCategoryTab) {
         url += `&starred_only=true&category=${encodeURIComponent(currentTab)}`;
     }
+    url += buildFilterParams();
     const response = await fetch(url);
     return response.json();
 }
