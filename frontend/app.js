@@ -214,6 +214,15 @@ function setupEventListeners() {
             exportPaperToMarkdown(currentPaperId);
         });
     }
+
+    // Screenshot export button for paper modal
+    const exportScreenshotBtn = document.getElementById('exportScreenshotBtn');
+    if (exportScreenshotBtn && paperModal) {
+        exportScreenshotBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            exportPaperToScreenshot(currentPaperId);
+        });
+    }
     
     // Fullscreen toggle for paper modal
     const fullscreenBtn = document.getElementById('fullscreenBtn');
@@ -1036,10 +1045,8 @@ async function openPaperModal(paperId) {
         const starModalBtn = document.getElementById('starModalBtn');
         if (starModalBtn) {
             if (paper.is_starred) {
-                starModalBtn.textContent = '★';
                 starModalBtn.classList.add('starred');
             } else {
-                starModalBtn.textContent = '☆';
                 starModalBtn.classList.remove('starred');
             }
         }
@@ -1693,10 +1700,8 @@ async function toggleStar(paperId) {
             const starModalBtn = document.getElementById('starModalBtn');
             if (starModalBtn) {
                 if (isStarred) {
-                    starModalBtn.textContent = '★';
                     starModalBtn.classList.add('starred');
                 } else {
-                    starModalBtn.textContent = '☆';
                     starModalBtn.classList.remove('starred');
                 }
             }
@@ -2187,6 +2192,81 @@ async function exportPaperToMarkdown(paperId) {
     } catch (error) {
         console.error('Error exporting paper:', error);
         showError('导出失败');
+    }
+}
+
+// Export paper as full-length rendered screenshot (no buttons, inputs)
+async function exportPaperToScreenshot(paperId) {
+    if (!paperId) return;
+    if (typeof html2canvas === 'undefined') {
+        showError('Screenshot library not loaded');
+        return;
+    }
+
+    try {
+        showSuccess('正在生成截图...');
+        const wrapper = document.createElement('div');
+        wrapper.className = 'screenshot-export-wrapper';
+        document.body.appendChild(wrapper);
+
+        const title = document.getElementById('paperTitle')?.textContent || '';
+        const titleEl = document.createElement('h2');
+        titleEl.textContent = title;
+        titleEl.style.cssText = 'font-size:24px;font-weight:600;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border);color:var(--text);';
+        wrapper.appendChild(titleEl);
+
+        const paperDetails = document.getElementById('paperDetails');
+        const detailsClone = paperDetails.cloneNode(true);
+        detailsClone.querySelectorAll('button').forEach(b => b.remove());
+        detailsClone.querySelectorAll('.paper-links a').forEach(a => {
+            const span = document.createElement('span');
+            span.textContent = a.textContent.trim();
+            span.className = 'pdf-download-link';
+            span.style.color = 'var(--primary)';
+            a.replaceWith(span);
+        });
+        detailsClone.querySelectorAll('.keyword').forEach(kw => {
+            kw.removeAttribute('onclick');
+            kw.style.cursor = 'default';
+        });
+        wrapper.appendChild(detailsClone);
+
+        const qaSection = document.querySelector('.qa-section');
+        const qaClone = qaSection.cloneNode(true);
+        qaClone.querySelector('.ask-input-container')?.remove();
+        qaClone.querySelectorAll('button').forEach(b => b.remove());
+        qaClone.querySelectorAll('.qa-actions').forEach(el => el.remove());
+        qaClone.querySelectorAll('details').forEach(d => { d.setAttribute('open', ''); });
+        wrapper.appendChild(qaClone);
+
+        const canvas = await html2canvas(wrapper, {
+            useCORS: true,
+            scale: 2,
+            backgroundColor: '#1e293b',
+            windowWidth: wrapper.scrollWidth,
+            windowHeight: wrapper.scrollHeight,
+            scrollX: 0,
+            scrollY: 0,
+        });
+
+        wrapper.remove();
+
+        try {
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+            await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+            showSuccess('截图已复制到剪贴板');
+        } catch (clipErr) {
+            const a = document.createElement('a');
+            a.download = `${title.replace(/[^a-z0-9\u4e00-\u9fa5]/gi, '_').substring(0, 50)}_${paperId}_screenshot.png`;
+            a.href = canvas.toDataURL('image/png');
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            showSuccess('截图已导出');
+        }
+    } catch (error) {
+        console.error('Error exporting screenshot:', error);
+        showError('截图导出失败');
     }
 }
 

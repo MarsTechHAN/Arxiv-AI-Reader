@@ -519,7 +519,6 @@ body.modal-open {
 .icon-btn, .close {
     background: none;
     border: none;
-    font-size: 24px;
     color: var(--text-muted);
     cursor: pointer;
     padding: 0;
@@ -534,18 +533,29 @@ body.modal-open {
     line-height: 1;
 }
 
-/* Ensure all icon buttons have consistent size */
-#shareBtn {
-    font-size: 24px;
+.icon-btn svg, .close svg {
+    width: var(--icon-size, 20px);
+    height: var(--icon-size, 20px);
+    flex-shrink: 0;
 }
 
-/* Star button in modal */
+#starModalBtn { --icon-size: 20px; }
+#exportBtn { --icon-size: 20px; }
+#exportScreenshotBtn { --icon-size: 20px; }
+#shareBtn { --icon-size: 20px; }
+#fullscreenBtn { --icon-size: 20px; }
+.modal-header-actions .close { --icon-size: 20px; }
+
 #starModalBtn.starred {
     color: #fbbf24;
 }
 
+#starModalBtn.starred svg polygon {
+    fill: currentColor;
+}
+
 .close {
-    font-size: 28px;
+    --icon-size: 20px;
 }
 
 .icon-btn:hover, .close:hover {
@@ -1843,5 +1853,17 @@ body.pdf-preview-open {
 .config-unsaved-hint {
     font-size: 12px;
     color: var(--text-muted);
+}
+
+/* Screenshot export: content-only layout, no scroll */
+.screenshot-export-wrapper {
+    position: fixed;
+    left: -9999px;
+    top: 0;
+    width: 852px;
+    max-width: 90vw;
+    background: var(--bg-light);
+    padding: 24px;
+    color: var(--text);
 }
 
